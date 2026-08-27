@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Repro.Core/Repro.Core.csproj" />
+    <Project Path="src/Repro.LoadGen/Repro.LoadGen.csproj" />
+    <Project Path="src/Repro.Replay/Repro.Replay.csproj" />
+    <Project Path="src/Repro.Starter/Repro.Starter.csproj" />
+    <Project Path="src/Repro.Worker/Repro.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Repro.Tests/Repro.Tests.csproj" />
+  </Folder>
+</Solution>

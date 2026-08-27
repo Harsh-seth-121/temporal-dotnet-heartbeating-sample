@@ -1,0 +1,256 @@
+# Temporal sandbox: server 1.31.2 + PostgreSQL + Web UI, Prometheus metrics enabled.
+#
+# The .NET worker, loadgen, starter and replay processes run on the HOST, not here --
+# same topology as the Go original. Prometheus reaches them over host.docker.internal.
+# That is why there is no app service and no stop_grace_period tuning in this file:
+# worker drain is governed by TemporalWorkerOptions.GracefulShutdownTimeout, in-process.
+# Eight services: Postgres, two one-shot admin-tools jobs, the server, the Web UI,
+# Prometheus, Pushgateway, Grafana.
+#
+# Every published port binds 127.0.0.1, not 0.0.0.0. Grafana here runs with anonymous
+# Admin and Prometheus with --web.enable-lifecycle, so a 0.0.0.0 bind would hand
+# anyone on the LAN an admin console and an unauthenticated shutdown endpoint. It also
+# keeps 5432 from colliding with a local Postgres. Container-to-container traffic is
+# unaffected: that goes over the compose network by service name.
+#
+# All images verified multi-arch (linux/amd64 + linux/arm64) -- no platform overrides.
+# No top-level `version:` key: obsolete in Compose v2+.
+#
+# Run these from this directory, or from the repo root -- ../compose.yml `include`s
+# this file and pins the same project name, so both resolve to one stack.
+#
+#   docker compose up -d
+#   docker compose down       # keep data
+#   docker compose down -v    # wipe everything (REQUIRED if NUM_HISTORY_SHARDS changes)
+
+name: temporal-dotnet-sandbox
+
+services:
+  postgresql:
+    image: postgres:${POSTGRESQL_VERSION}
+    container_name: dotnet-temporal-postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - temporal-pgdata:/var/lib/postgresql/data
+    networks: [temporal-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 20s
+
+  temporal-schema-setup:
+    image: temporalio/admin-tools:${TEMPORAL_ADMINTOOLS_VERSION}
+    container_name: dotnet-temporal-schema-setup
+    restart: "on-failure:5"
+    depends_on:
+      postgresql:
+        condition: service_healthy
+    environment:
+      - POSTGRES_SEEDS=postgresql
+      - POSTGRES_USER=${POSTGRES_USER}
+      - DB_PORT=5432
+      # temporal-sql-tool reads the password from SQL_PASSWORD, not POSTGRES_PWD.
+      - SQL_PASSWORD=${POSTGRES_PASSWORD}
+    networks: [temporal-network]
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/setup-postgres.sh"]
+
+  temporal:
+    image: temporalio/server:${TEMPORAL_VERSION}
+    container_name: dotnet-temporal
+    restart: unless-stopped
+    depends_on:
+      temporal-schema-setup:
+        condition: service_completed_successfully
+    environment:
+      - DB=postgres12
+      - DB_PORT=5432
+      - POSTGRES_SEEDS=postgresql
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD}
+      # Immutable after first schema init. `docker compose down -v` to change.
+      - NUM_HISTORY_SHARDS=4
+      # Without this the config template binds services to 127.0.0.1 and the
+      # published ports are unreachable from the host.
+      - BIND_ON_IP=0.0.0.0
+      # THIS single var turns on the server's Prometheus listener. It renders
+      # global.metrics.prometheus.listenAddress in the embedded config template.
+      # Do NOT set PROMETHEUS_TIMER_TYPE: deprecated and ignored in 1.31
+      # (timers are always histograms).
+      - PROMETHEUS_ENDPOINT=0.0.0.0:8000
+      # REQUIRED -- see the dynamicconfig file header for why.
+      - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/config/dynamicconfig/development-sql.yaml
+      - LOG_LEVEL=info
+    networks: [temporal-network]
+    ports:
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:7243:7243"
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "7233"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 30s
+
+  temporal-create-namespace:
+    image: temporalio/admin-tools:${TEMPORAL_ADMINTOOLS_VERSION}
+    container_name: dotnet-temporal-create-namespace
+    restart: "on-failure:5"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - DEFAULT_NAMESPACE=default
+      # 7d, not the 1d the Go original used. Retention caps how long a CLOSED
+      # workflow's history survives, and this repo's whole replay workflow depends on
+      # `temporal workflow show` still finding it. At 1d, a history captured on Friday
+      # is gone on Monday and the README's capture-and-replay recipe fails with a
+      # not-found error that looks like a bug in the replayer.
+      - DEFAULT_NAMESPACE_RETENTION=7d
+    networks: [temporal-network]
+    volumes:
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh"]
+    command: ["/scripts/create-namespace.sh"]
+
+  temporal-ui:
+    image: temporalio/ui:${TEMPORAL_UI_VERSION}
+    container_name: dotnet-temporal-ui
+    restart: unless-stopped
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_UI_PORT=8080
+      - TEMPORAL_CORS_ORIGINS=http://localhost:8080
+      - TEMPORAL_NOTIFY_ON_NEW_VERSION=false
+      - TEMPORAL_SHOW_TEMPORAL_SYSTEM_NAMESPACE=true
+    networks: [temporal-network]
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    container_name: dotnet-sandbox-prometheus
+    restart: unless-stopped
+    command:
+      # `command:` overrides the image CMD wholesale, so the defaults must be repeated.
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # MEASURED: a 1s scrape over this topology writes ~11 GB/day (945 MB in the
+      # first 2h, ~24k active series). The Go original's 7d would be ~78 GB, which is
+      # not a thing to leave running on a laptop. A repro session is hours, not days.
+      - --storage.tsdb.retention.time=2d
+      # Hard ceiling regardless of the time window -- whichever limit is hit first
+      # wins. This is the one that actually protects the disk.
+      - --storage.tsdb.retention.size=8GB
+      # enables: curl -XPOST localhost:9090/-/reload
+      #
+      # It ALSO enables an unauthenticated POST /-/quit that shuts Prometheus down.
+      # Verified: it returns 200 and the process exits. That is acceptable only
+      # because every port in this file is published on 127.0.0.1 -- do not widen
+      # any of them without dropping this flag first.
+      - --web.enable-lifecycle
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    extra_hosts:
+      # Required on Linux Docker Engine. On Docker Desktop for Mac the embedded DNS
+      # already resolves host.docker.internal -- redundant but harmless, keeps this
+      # file portable.
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    networks: [temporal-network]
+
+  pushgateway:
+    image: prom/pushgateway:v1.11.3
+    container_name: dotnet-sandbox-pushgateway
+    restart: unless-stopped
+    # NO --persistence.file, deliberately, and this is a change from the Go original.
+    #
+    # Persistence makes a pushed group outlive `docker compose down`, and the
+    # Pushgateway then keeps SERVING it: Prometheus scrapes a fresh sample every 5s
+    # for a starter that is not running, so the series looks perpetually live. Worse
+    # for this repo specifically, a group pushed before a HistogramBucketOverrides
+    # change keeps its old `le` layout, and `sum by (le, operation)` silently merges
+    # two incompatible bucket sets.
+    #
+    # The Go original's justification -- "so a starter run from minutes ago is still
+    # visible" -- does not need persistence: Prometheus already scraped those samples
+    # and keeps them for its own 7d retention. Dropping the group just lets the series
+    # go stale, which is the truthful outcome when nothing is pushing.
+    #
+    # Clear a group without restarting:
+    #   dotnet run --project src/Repro.Starter -- --delete-push-group
+    ports:
+      - "127.0.0.1:9091:9091"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9091/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks: [temporal-network]
+
+  grafana:
+    image: grafana/grafana:13.1.4
+    container_name: dotnet-sandbox-grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_ANONYMOUS_ORG_NAME: "Main Org."
+      # Login form deliberately left enabled as an admin escape hatch.
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_USERS_DEFAULT_THEME: "dark"
+      # Quieter first-run experience in a sandbox.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks: [temporal-network]
+
+networks:
+  # SERVICE names (temporal, prometheus, pushgateway, grafana) are what compose DNS
+  # resolves, and they are deliberately unchanged -- TEMPORAL_ADDRESS=temporal:7233
+  # and the prometheus target temporal:8000 still work. Only the container_name and
+  # network `name:` values are prefixed, because THOSE are global to the Docker
+  # daemon and would collide with the Go sandbox.
+  temporal-network:
+    driver: bridge
+    name: dotnet-temporal-network
+
+volumes:
+  temporal-pgdata:
+  prometheus-data:
+  grafana-data:

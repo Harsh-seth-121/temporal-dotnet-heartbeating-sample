@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>loadgen</AssemblyName>
+    <RootNamespace>Repro.LoadGen</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Repro.Core\Repro.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Logging.Console" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- So `dotnet run —project src/Repro.LoadGen` works with no —config flag, exactly
+         like `go run ./cmd/loadgen` did from the repo root. -->
+    <None Include="..\..\config.yaml" Link="config.yaml" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

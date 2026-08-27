@@ -36,8 +36,18 @@ ScaffoldingReadMe.txt
 # NuGet Symbol Packages
 *.snupkg
 
-# dotenv environment variables file
-.env
+# dotenv environment variables file.
+#
+# SCOPED TO THE REPO ROOT ON PURPOSE. The stock Dotnet.gitignore ships a bare
+# `.env`, which silently excludes observability/.env -- a file that
+# observability/compose.yml REQUIRES via `env_file:` and that is committed on
+# purpose (it holds image pins and sandbox-only Postgres credentials).
+#
+# With a bare `.env` the stack still "works" right up until every ${...} in the
+# compose file interpolates to a blank string and you get `image: postgres:`.
+# Verify with:  git check-ignore -v observability/.env   (must print nothing)
+/.env
+!observability/.env
 
 # Others
 ~$*
@@ -55,3 +65,12 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# --- sandbox additions -------------------------------------------------------
+
+# Secrets belong here, not in the committed config.yaml. Pass it explicitly:
+#   dotnet run --project src/Repro.Worker -- --config config.local.yaml
+config.local.yaml
+
+# Container state lives in named volumes; nothing container-owned belongs in git.
+observability/**/data/

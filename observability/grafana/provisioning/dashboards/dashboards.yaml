@@ -1,0 +1,17 @@
+# The PROVIDER file. Dashboard JSON lives at observability/grafana/dashboards/**,
+# mounted at /var/lib/grafana/dashboards. Grafana folder name == directory name.
+
+apiVersion: 1
+
+providers:
+  - name: repo-dashboards
+    orgId: 1
+    type: file
+    # `folder` and `folderUid` MUST stay unset when foldersFromFilesStructure is true.
+    disableDeletion: false
+    # <=10s makes Grafana watch the filesystem instead of polling.
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: true

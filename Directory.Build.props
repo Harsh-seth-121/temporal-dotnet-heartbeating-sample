@@ -1,0 +1,34 @@
+<Project>
+
+  <PropertyGroup>
+    <!-- .NET 10 is the current LTS (GA 2025-11-11, EOL 2028-11-14). .NET 8 and 9
+         both go EOL 2026-11-10, so neither is a sane floor for a new sandbox.
+
+         The Temporalio package itself targets netstandard2.0, so it loads here
+         without a net10.0-specific asset. If anything in the native bridge ever
+         misbehaves under the net10 host, THIS LINE plus global.json are the only
+         two places to change — nothing in this repo depends on a net9/net10
+         language or BCL feature. -->
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <InvariantGlobalization>true</InvariantGlobalization>
+
+    <!-- Warnings are errors because the failure modes this repo exists to
+         document are mostly silent. A stale obsolete-API warning (YamlDotNet's
+         naming-convention constructors, for one) is exactly the kind of thing
+         that should stop the build rather than scroll past. -->
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+
+    <!-- Recommended, not AllEnabledByDefault. This is a repro sandbox whose code
+         is meant to be read and edited fast; StyleCop-grade enforcement would add
+         friction to every `repro/<name>` branch for no diagnostic value. -->
+    <AnalysisMode>Recommended</AnalysisMode>
+
+    <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+  </PropertyGroup>
+
+</Project>

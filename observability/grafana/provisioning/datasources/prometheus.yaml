@@ -1,0 +1,30 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # Stable uid so authored dashboard JSON can hardcode it.
+    uid: sandbox-prometheus
+    access: proxy
+    url: http://prometheus:9090
+    # REQUIRED. temporalio/dashboards server-general.json has "datasource": null on
+    # every panel, and sdk/temporal-core-sdks-otel.json has it on many of its own.
+    # "datasource": null resolves to the DEFAULT datasource, so without isDefault the
+    # imported-as-is boards render empty.
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      # Match global.scrape_interval so $__rate_interval and auto step sizing behave.
+      #
+      # Load-bearing, not cosmetic. Grafana computes
+      #   $__rate_interval = max($__interval + timeInterval, 4 * timeInterval)
+      # so with timeInterval: 1s the floor is 4s. Any scrape job slower than 2s puts
+      # fewer than two samples in that window and rate() returns NOTHING -- not an
+      # error, just an empty panel. That is why every job feeding a panel is left on
+      # the global 1s interval in prometheus.yml.
+      timeInterval: 1s
+      prometheusType: Prometheus
+      prometheusVersion: 3.14.0
+      cacheLevel: Low
+      manageAlerts: false
