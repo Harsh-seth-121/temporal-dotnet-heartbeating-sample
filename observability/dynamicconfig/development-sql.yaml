@@ -1,0 +1,28 @@
+# MOUNTING THIS FILE IS MANDATORY for temporalio/server:1.31.x. The image ships no
+# default dynamicconfig file, but the embedded config template always populates
+# dynamicConfigClient.filepath, and FileBasedClient.init() returns a fatal error if
+# the path cannot be stat'd. No mount => the server exits on startup.
+#
+# Re-read on a fixed 60s poll, so edits apply without a restart but not instantly.
+
+limit.maxIDLength:
+  - value: 255
+    constraints: {}
+
+system.forceSearchAttributesCacheRefreshOnRead:
+  - value: true
+    constraints: {}
+
+# Code default is 4. With a single .NET worker, 4 partitions split poller and backlog
+# metrics into 4 thin series and make the matching panels look broken. 1 gives clean
+# sync-match rate, backlog count, and backlog age.
+matching.numTaskqueueReadPartitions:
+  - value: 1
+    constraints: {}
+matching.numTaskqueueWritePartitions:
+  - value: 1
+    constraints: {}
+
+# NOT SET ON PURPOSE: frontend.enableUpdateWorkflowExecution and
+# metrics.breakdownByTaskQueue/byPartition all already default to true in 1.31.
+# Older sandbox guides tell you to flip them; that advice is obsolete.

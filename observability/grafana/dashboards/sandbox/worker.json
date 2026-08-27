@@ -1,0 +1,853 @@
+{
+  "uid": "sandbox-worker",
+  "title": "Repro / Worker Health",
+  "description": "SDK-sourced worker health: slots, pollers, schedule-to-start, execution latency, and client RPCs. Every panel comes from the .NET SDK's Core Prometheus exporter on :8077/:8078. Latency units are MILLISECONDS.",
+  "tags": [
+    "sandbox",
+    "sdk"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "SDK namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "sandbox-prometheus"
+        },
+        "query": "label_values(temporal_request, namespace)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "default",
+          "value": "default",
+          "selected": true
+        },
+        "description": "Values are NOT sanitized by the .NET SDK; dashes survive."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Workflow completions /s",
+      "description": "SDK view. Should track the server's workflow_success rate on the Server board. Counter names lost their _total suffix in the port: Core's exporter defaults HasCounterTotalSuffix to false.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (workflow_type) (rate(temporal_workflow_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{workflow_type}} completed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (workflow_type) (rate(temporal_workflow_failed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{workflow_type}} failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Free workflow task slots",
+      "description": "Hits 0 when the worker is saturated -- the first thing to check when schedule-to-start latency climbs. worker_type is PascalCase in Core: WorkflowWorker, ActivityWorker, LocalActivityWorker, NexusWorker.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "min by (worker_type) (temporal_worker_task_slots_available{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{worker_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Live pollers",
+      "description": "Zero here with a queued workflow means no worker is polling. poller_type values in Core are workflow_task, sticky_workflow_task, activity_task, nexus_task. Note 'sticky_workflow_task' -- Go spells it 'workflow_sticky_task' and docs.temporal.io documents the Go spelling, which is wrong for every Core SDK including .NET.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (poller_type) (temporal_num_pollers{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{poller_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Workflow task schedule-to-start p99",
+      "description": "Time a workflow task waited for a free worker. The single most useful saturation signal.\n\nREQUIRES a HistogramBucketOverrides entry. Core's default buckets for this metric are [100, 500, 1000, 5000, 10000, 100000, 1000000] ms; a healthy sandbox sits at 1-15 ms, so every observation lands in the first bucket and histogram_quantile interpolates to a flat ~99 ms forever. That reads as a real number, not as no-data, which is the worst kind of broken panel.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, task_queue) (rate(temporal_workflow_task_schedule_to_start_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{task_queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Activity schedule-to-start p99",
+      "description": "Same metric family and the same default-bucket problem as the panel to its left. Needs the same override.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le, task_queue) (rate(temporal_activity_schedule_to_start_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{task_queue}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Workflow task execution latency",
+      "description": "How long the worker spent running workflow code. One of the few latency panels that needs NO bucket override: Core's defaults here are [1, 10, 20, 50, 100, 200, 500, 1000] ms, which resolves a laptop workload properly.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(temporal_workflow_task_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_workflow_task_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95"
+        },
+        {
+          "refId": "C",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(temporal_workflow_task_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Activity execution latency p95",
+      "description": "Raise fault.latency in config.yaml and watch this move.\n\nREQUIRES a HistogramBucketOverrides entry. Core's default top bucket for this metric is 60 s, and the seed heartbeating activity is designed to run longer than that -- without an override every long attempt falls into +Inf and p95 is unresolvable.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, activity_type) (rate(temporal_activity_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{activity_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Workflow end-to-end latency p95",
+      "description": "No override needed: Core's defaults for this metric span 100 ms to 24 hours, with points at 30 s, 60 s and 120 s that bracket the seed workflow nicely.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, workflow_type) (rate(temporal_workflow_endtoend_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{workflow_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Task slot saturation",
+      "description": "used / (used + available). Sustained 100% means add slots or workers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum by (worker_type) (temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) / clamp_min(sum by (worker_type) (temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) + sum by (worker_type) (temporal_worker_task_slots_available{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}), 1)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{worker_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Client RPC rate by operation",
+      "description": "Client-side gRPC calls. Emitted by worker, loadgen, and (via Pushgateway) the one-shot starter.\n\nTwo families, not one. Core splits long-poll RPCs (PollWorkflowTaskQueue, PollActivityTaskQueue, and the blocking GetWorkflowExecutionHistory the starter uses to await a result) into temporal_long_request. Go+tally counted them all in temporal_request_total, so a Go reader saw polls on this panel and a .NET reader would not. Both are plotted.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation) (rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{operation}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (operation) (rate(temporal_long_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{operation}} (long)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Client RPC latency p95",
+      "description": "Idle operations read NaN -- no observations in the rate window. That is normal, not a fault.\n\nREQUIRES a HistogramBucketOverrides entry. Core's default first bucket is 50 ms and loopback gRPC is 0-5 ms, so p95 pins at a flat ~47 ms. Also note Core records INTEGER milliseconds: a 400us call is recorded as 0. No bucket set fixes that; only UseSecondsForDuration=true does, and that blanks the imported core-sdk-otel board.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, operation) (rate(temporal_request_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{operation}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Client RPC failures",
+      "description": "Empty when healthy. Populates on server errors or throttling.\n\nstatus_code is SCREAMING_SNAKE in Core -- NOT_FOUND, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED, UNAVAILABLE -- plus one synthetic value, TRANSPORT_ERROR, which is not a gRPC status at all: Core emits it when the connection itself failed before a status came back. If you copied a selector from a Go dashboard or from docs that say status_code=\"not_found\", it will match nothing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (operation, status_code) (rate(temporal_request_failure{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{operation}} {{status_code}}"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (operation, status_code) (rate(temporal_long_request_failure{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{operation}} {{status_code}} (long)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Poll outcomes",
+      "description": "REPLACES the Go board's \"gRPC attempts per logical call\". That panel read temporal_request_attempt_total, which exists in NO Core SDK -- not .NET, not Python, not TypeScript, not Rust. Rather than ship a permanently blank panel, this answers the same question (is the transport layer doing useful work or spinning) from metrics Core actually has.\n\nsucceed vs empty is poll efficiency. All-empty with a queued workflow means a task queue name mismatch. temporal_activity_task_received also carries Core's `eager` label, which Go has no equivalent for -- eager=\"true\" means the activity was handed back on the workflow task response and never touched matching.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (task_queue) (rate(temporal_workflow_task_queue_poll_succeed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{task_queue}} WFT poll succeed"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (task_queue) (rate(temporal_workflow_task_queue_poll_empty{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{task_queue}} WFT poll empty"
+        },
+        {
+          "refId": "C",
+          "expr": "sum by (task_queue, eager) (rate(temporal_activity_task_received{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{task_queue}} activity received eager={{eager}}"
+        },
+        {
+          "refId": "D",
+          "expr": "sum by (task_queue) (rate(temporal_activity_poll_no_task{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{task_queue}} activity poll empty"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

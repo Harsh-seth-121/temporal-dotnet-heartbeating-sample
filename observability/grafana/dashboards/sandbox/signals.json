@@ -1,0 +1,871 @@
+{
+  "uid": "sandbox-signals",
+  "title": "Repro / Bug Signals",
+  "description": "The bug-hunting board. Mixes SDK and server metrics to surface non-determinism, workflow task retries, sticky cache behaviour, replay pressure, and injected faults. This is the one with no upstream equivalent.",
+  "tags": [
+    "sandbox",
+    "signals"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "SDK namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "sandbox-prometheus"
+        },
+        "query": "label_values(temporal_request, namespace)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "default",
+          "value": "default",
+          "selected": true
+        },
+        "description": "Values are NOT sanitized by the .NET SDK; dashes survive."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Non-determinism failures (dashboard range)",
+      "description": "The number to look at first when a repro involves changed workflow code. Uses increase() over the range, not rate(), so short runs still register. failure_reason=\"NonDeterminismError\" is the identical string in Core and Go -- verified in sdk-core's FailureReason Display impl, not assumed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(temporal_workflow_task_execution_failed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",failure_reason=\"NonDeterminismError\"}[$__range])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "non-determinism"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Server-side non-determinism /s",
+      "description": "The server's independent count. Should move with the SDK's.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(service_errors_nondeterministic[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "server view"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Workflow task attempt p99",
+      "description": "Above 1 means workflow tasks are being retried -- a stuck workflow rather than a slow one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(workflow_task_attempt_bucket[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p99 attempt"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Schedule-to-start: SDK view vs server view",
+      "description": "Two independent measurements of the same quantity. They should track each other closely; sustained divergence means clock skew or dispatch loss.\n\nTHE * 1000 IS NOT DECORATION. Core records milliseconds; the server's tally timers record seconds. Plotting them raw puts a 1000x gap on the panel that looks exactly like the dispatch loss this panel exists to detect. The Go original needed no conversion because both sides were seconds.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_workflow_task_schedule_to_start_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "SDK (worker), ms"
+        },
+        {
+          "refId": "B",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket{service_name=\"history\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "SERVER (history), s -> ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Workflow task failures by reason",
+      "description": "Core's failure_reason vocabulary, read from the source rather than the docs: NonDeterminismError, WorkflowError, ActivityError, timeout, GrpcMessageTooLarge, PayloadsTooLarge, ExternalStorageError, RequestTooLarge, plus operation_<name> and handler_error_<name> for Nexus.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (failure_reason) (rate(temporal_workflow_task_execution_failed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{failure_reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Replay latency p95",
+      "description": "Time spent replaying history to rebuild workflow state. Grows with history length when the sticky cache misses. Shares Core's [1..1000] ms bucket set with workflow task execution latency, so no override is needed.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_workflow_task_replay_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Sticky cache hit ratio",
+      "description": "A REAL hit ratio, and the clearest win in the whole Go -> .NET port. Go+tally emits no sticky_cache_miss metric, so the original board could only ship an approximation (hits divided by workflow task executions) with a paragraph apologising for it. Core emits temporal_sticky_cache_miss, so this is hit / (hit + miss) -- the actual quantity.\n\nFalling toward 0 means workers keep rebuilding state from history instead of resuming from cache. Look at forced evictions and MaxCachedWorkflows next.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) / clamp_min(sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) + (sum(rate(temporal_sticky_cache_miss{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)), 1e-9)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Sticky cache hits and misses /s",
+      "description": "The two series behind the ratio. A miss is a workflow task that arrived for a workflow this worker no longer had cached -- it had to fetch and replay history to answer it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "hits/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(temporal_sticky_cache_miss{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "misses/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Cached workflows and forced evictions",
+      "description": "Forced evictions are the leading indicator of replay storms. Note temporal_sticky_cache_total_forced_eviction keeps its 'total' -- that is part of the metric NAME in Core, not the _total counter suffix, so it survives the suffix change.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(temporal_sticky_cache_size{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"})",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "cached workflows"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(temporal_sticky_cache_total_forced_eviction{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "forced evictions/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Replay pressure ratio",
+      "description": "Replayed workflow tasks over executed workflow tasks. Directional proxy, not an exact quantity: toward 1.0 means most tasks are rebuilding state instead of resuming from cache. Now that a real hit ratio exists two panels up, treat this as corroboration.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(temporal_workflow_task_replay_latency_count{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) / clamp_min(sum(rate(temporal_workflow_task_execution_latency_count{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "replay/exec"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Activity retried but recovered /s",
+      "description": "activity_task_fail counts every failed attempt; activity_fail counts only terminal failures. The difference is work the retry policy rescued. Raise fault.failureRate to make this move.\n\nThe third series is the SDK's own per-attempt failure count. Go's equivalent (temporal_activity_task_error) does not exist in Core; temporal_activity_execution_failed does, and it should track activity_task_fail one-for-one. If it does not, the worker is failing activities the server never hears about.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(rate(activity_task_fail{namespace=\"default\"}[$__rate_interval])) or vector(0)) - (sum(rate(activity_fail{namespace=\"default\"}[$__rate_interval])) or vector(0))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "recovered/s (server)"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (activity_type) (rate(temporal_activity_execution_failed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{activity_type}} failed attempts/s (SDK)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Custom: repro workflow outcomes /s",
+      "description": "Emitted from Workflow.MetricMeter. Replay-suppressed with NO opt-out -- ReplaySafeMetricMeter is internal in the .NET SDK, exactly as in Go. Custom metric names are NOT prefixed with MetricPrefix, so this is a literal `repro_` and there is no `temporal_` in front of it.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(repro_workflow_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Custom: repro workflow latency p95 by outcome",
+      "description": "Recorded with CreateHistogram<TimeSpan>, which follows UseSecondsForDuration automatically -- so milliseconds, and no unit suffix on the name. Custom histograms fall into Core's catch-all bucket set [50, 100, 500, 1000, 2500, 10000] ms, which tops out at 10 s. The seed heartbeating workflow runs longer than that, so this one REQUIRES a HistogramBucketOverrides entry too.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(repro_workflow_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Custom: injected activity faults",
+      "description": "Direct view of the fault injector. Both series stay at 0 until fault.failureRate is raised in config.yaml.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(repro_activity_failed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "injected failures/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",retried=\"true\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "retried attempts/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

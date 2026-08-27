@@ -1,0 +1,125 @@
+# After editing:  curl -XPOST http://localhost:9090/-/reload
+# Target health:  http://localhost:9090/targets
+
+global:
+  # 1s is a CHOICE here, not a floor.
+  #
+  # The Go original scraped at 1s because tally flushed into the SDK registry on a
+  # 1s timer, so scraping faster could not surface new values. That is not how the
+  # .NET SDK works. Core's Prometheus exporter holds its own registry, every metric
+  # call writes straight into it, and the HTTP handler runs TextEncoder at scrape
+  # time. There is no flush timer and no stale window: a counter you incremented a
+  # microsecond ago is already visible. The Go README's "fresh series read 0 for up
+  # to 1 second" gotcha does not exist here.
+  #
+  # We keep 1s for RESOLUTION. This stack exists to watch second-scale transients:
+  # a heartbeat throttle interval, a workflow task retry, a slot count hitting zero.
+  # At 5s those are three points wide and unreadable.
+  #
+  # The second reason is structural. The Grafana datasource sets timeInterval: 1s, so
+  #   $__rate_interval = max($__interval + timeInterval, 4 * timeInterval) >= 4s.
+  # A job scraped slower than 2s puts fewer than two samples in a 4s window and
+  # rate() returns NOTHING. That is why every job feeding a dashboard panel is left
+  # on the global interval, and why pushgateway (5s) gets away with it: its series
+  # come from a one-shot push and are constant, so rate() is 0 regardless.
+  #
+  # scrape_timeout MUST be <= scrape_interval, so it is set explicitly here --
+  # Prometheus's 10s default would be rejected against a 1s interval.
+  scrape_interval: 1s
+  scrape_timeout: 900ms
+  evaluation_interval: 10s
+  external_labels:
+    env: sandbox
+
+scrape_configs:
+  - job_name: prometheus
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Temporal server, sibling container, resolved by Compose service name.
+  # Requires PROMETHEUS_ENDPOINT=0.0.0.0:8000 on the temporal service.
+  # This endpoint exposes a few hundred metric families; if you see
+  # "context deadline exceeded" on /targets, raise this job's interval to 5s and
+  # its timeout to 4s -- but then re-read the $__rate_interval note above, because
+  # the server-board panels will start dropping samples.
+  - job_name: temporal-server
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["temporal:8000"]
+        labels:
+          group: server-metrics
+    # COPIES namespace -> temporal_namespace (both survive) so the upstream
+    # temporalio/dashboards server board renders without editing its JSON.
+    # Still mandatory: server-general.json references temporal_namespace throughout.
+    metric_relabel_configs:
+      - source_labels: [namespace]
+        target_label: temporal_namespace
+
+  # Host-run .NET worker. Configure the SDK with
+  #     Prometheus = new PrometheusOptions("0.0.0.0:8077")
+  # NOT Go's ":8077". Core binds through Rust's SocketAddr::from_str, which REJECTS
+  # a bare ":port"; the .NET layer only null-checks the string, so a bad value
+  # surfaces as an opaque native error rather than a clean ArgumentException.
+  # And it must be 0.0.0.0, never 127.0.0.1: a loopback-only bind is unreachable
+  # from this container over host.docker.internal, while `curl localhost:8077`
+  # on the host still succeeds -- which makes it a genuinely nasty debug.
+  - job_name: temporal-sdk-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8077"]
+        labels:
+          group: sdk-metrics
+          component: worker
+
+  - job_name: temporal-sdk-loadgen
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8078"]
+        labels:
+          group: sdk-metrics
+          component: loadgen
+
+  # honor_labels: true is MANDATORY. Without it Prometheus overwrites the job and
+  # instance labels the starter pushed, renaming them exported_job/exported_instance
+  # and breaking any panel that groups by job.
+  #
+  # The starter cannot use Core's exporter: PrometheusOptions and CustomMetricMeter
+  # are mutually exclusive and throw at runtime construction. It reaches the
+  # Pushgateway through prometheus-net's MeterAdapter instead, which renders every
+  # counter as `# TYPE gauge`. rate() and increase() still compute correctly over
+  # the samples; only the type annotation is wrong. See the repo README.
+  - job_name: pushgateway
+    honor_labels: true
+    scrape_interval: 5s
+    scrape_timeout: 4s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["pushgateway:9091"]
+        labels:
+          group: sdk-metrics
+    # STRIPS THE DOUBLE PREFIX. prometheus-net's MeterAdapter prepends the .NET
+    # Meter's name to every metric, so a meter named "temporal" carrying Core's
+    # already-prefixed temporal_request arrives as temporal_temporal_request.
+    #
+    # The obvious fix -- MetricsOptions.MetricPrefix = "" so Core emits a bare
+    # `request` -- does NOT work: the empty string is treated as unset and falls
+    # back to the default "temporal_". (MetricPrefix itself is honoured; "zz_"
+    # really does produce temporal_zz_request. Only "" is unexpressible.)
+    #
+    # Renaming here rather than in the dashboards means the starter's pushed
+    # series land on exactly the same names as the worker's scraped ones, so every
+    # panel sees one metric instead of two spellings.
+    metric_relabel_configs:
+      - source_labels: [__name__]
+        regex: 'temporal_temporal_(.+)'
+        target_label: __name__
+        replacement: 'temporal_${1}'
+
+  - job_name: grafana
+    scrape_interval: 15s
+    scrape_timeout: 10s
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["grafana:3000"]

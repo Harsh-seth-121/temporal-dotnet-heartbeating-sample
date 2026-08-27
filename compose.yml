@@ -1,0 +1,39 @@
+# Root entry point for the sandbox stack. The real definitions live in
+# observability/compose.yml; this file only pulls them in so that the compose
+# commands work from the repo root, which is where `dotnet run --project src/...`
+# is run from. Without it, `docker compose down` at the root fails with
+# "no configuration file provided: not found".
+#
+#   docker compose up -d      # start everything
+#   docker compose down       # keep data
+#   docker compose down -v    # wipe everything (REQUIRED if NUM_HISTORY_SHARDS changes)
+#
+# The same commands still work from inside observability/ and drive the same
+# stack: identical project name, so identical container, volume and network
+# names. Bring it up from one directory and tear it down from the other freely.
+#
+# Needs Compose v2.20+ (`include`). Verified on v5.4.0.
+#
+# Do NOT create a .env in this directory. Compose reads the project-directory
+# .env, and it wins over both observability/.env and the `name:` below -- a
+# COMPOSE_PROJECT_NAME there splits the stack in two, one project per directory
+# you run from.
+
+# Must stay in sync with COMPOSE_PROJECT_NAME in observability/.env, otherwise
+# the two directories address two different stacks.
+#
+# Deliberately NOT `temporal-sandbox`: that is the Go project this one is ported
+# from, and a shared project name makes the two repos drive one stack.
+name: temporal-dotnet-sandbox
+
+include:
+  # `include` (unlike `-f`) resolves the included file against ITS OWN
+  # directory, so ./scripts, ./prometheus and ./dynamicconfig keep working.
+  #
+  # env_file is not strictly required -- include already defaults to .env in the
+  # included file's directory -- but naming it makes a missing observability/.env
+  # exit 1 with "stat observability/.env: no such file or directory" instead of
+  # silently interpolating every ${...} to a blank string and rendering
+  # `image: postgres:`.
+  - path: observability/compose.yml
+    env_file: observability/.env

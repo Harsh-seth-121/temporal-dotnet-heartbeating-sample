@@ -1,0 +1,48 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+indent_style = space
+trim_trailing_whitespace = true
+
+[*.{yml,yaml,json,csproj,props,slnx}]
+indent_size = 2
+
+[*.sh]
+indent_size = 2
+
+[*.py]
+indent_size = 4
+
+[*.cs]
+indent_size = 4
+
+# Analyzers are left at AnalysisMode=Recommended and warnings are errors, because
+# the rules DO catch real things here. Exactly three are turned off, each for a
+# reason specific to this repo rather than to taste.
+
+# CA1848: use LoggerMessage delegates instead of LogInformation(...).
+#
+# The performance argument is real in a hot service and irrelevant here: this
+# sandbox logs a handful of lines per activity, and its log output is part of the
+# thing being demonstrated. Compliance means a partial class of [LoggerMessage]
+# declarations sitting between the reader and the heartbeat loop, which is the
+# code people clone this repo to read.
+dotnet_diagnostic.CA1848.severity = none
+
+# CA1873: log argument evaluation may be expensive if logging is disabled.
+#
+# Fires on things like (long)staleness.TotalMilliseconds inside a log call. The
+# "expensive" evaluation is a division. Suppressing this is cheaper than wrapping
+# every diagnostic line in an IsEnabled check.
+dotnet_diagnostic.CA1873.severity = none
+
+# CA1822: member does not access instance data and can be marked static.
+#
+# Actively WRONG for Temporal. A [WorkflowRun] method must be an instance method
+# on the workflow class — the SDK constructs one instance per workflow execution
+# and dispatches to it. Making it static to satisfy the analyzer would break
+# workflow registration at runtime, not compile time.
+dotnet_diagnostic.CA1822.severity = none

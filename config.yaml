@@ -1,0 +1,130 @@
+# Every knob for the sandbox lives here. Any field may be omitted; the C# POCOs in
+# src/Repro.Core/Config/ReproConfig.cs hold the defaults.
+#
+# Durations are Go-style strings -- "150ms", "10s", "1m30s", "0" -- parsed by
+# GoDurationYamlConverter. That is deliberate: this file is meant to be dialled up
+# and down while watching Grafana, and TimeSpan's own "00:00:00.150" form makes
+# that miserable.
+#
+# Unknown keys are a HARD ERROR, not a warning. A misspelled `failurRate` that
+# quietly means 0.0 is an afternoon spent staring at a flat panel.
+
+address: localhost:7233
+namespace: default
+
+# Keep the hyphen. Core does NOT sanitize label values, so this appears as
+# task_queue="repro-task-queue" on :8077, while the Temporal server's own tally
+# metrics sanitize it to taskqueue="repro_task_queue" on :8000. One queue, two
+# spellings, and you cannot join them. That asymmetry is new in the .NET port.
+taskQueue: repro-task-queue
+
+# Fixed ID for the starter, so `temporal workflow describe -w repro-workflow`
+# always works. Loadgen generates its own per-run IDs instead.
+workflowId: repro-workflow
+
+# Temporal Cloud: set apiKey OR tls.certPath + tls.keyPath. Either turns TLS on.
+# Keep secrets out of this committed file -- put them in config.local.yaml
+# (gitignored) and pass --config config.local.yaml.
+apiKey: ""
+tls:
+  certPath: ""
+  keyPath: ""
+  serverName: ""     # maps to TlsOptions.Domain; override when the cert CN differs
+  serverCaPath: ""
+
+# SDK metrics.
+#
+# The listen addresses MUST be a full IP:port. Go's ":8077" is accepted here and
+# normalized, but Core itself parses these with Rust's SocketAddr, which rejects a
+# bare ":port". They must also not be loopback: 127.0.0.1 is unreachable from the
+# Prometheus container over host.docker.internal, and the only symptom is a DOWN
+# target while `curl localhost:8077` on this host still works.
+metrics:
+  listenAddress: "0.0.0.0:8077"     # worker
+  loadgenAddress: "0.0.0.0:8078"    # loadgen
+  # MUST end in /metrics: prometheus-net appends /job/<job>/instance/<instance> to
+  # this verbatim, and without the path every push 404s silently.
+  pushgatewayUrl: "http://localhost:9091/metrics"
+  pushJob: "temporal_starter"
+  pushInstance: "local"             # keep STABLE; a run id here leaks Pushgateway groups
+  # How long the starter waits after closing its client before the final push.
+  # Core buffers metric updates and exposes no flush API, so this is a guess with a
+  # knob on it. Too short and the last temporal_request samples are simply missing
+  # from the Pushgateway, with no error.
+  pushSettle: 2s
+
+# Shape of the seed job. steps x stepDuration is roughly the activity's runtime.
+# 60 x 1s is deliberately longer than Core's default top activity_execution_latency
+# bucket (60s), which is why HistogramBuckets.cs overrides it.
+job:
+  steps: 60
+  stepDuration: 1s
+
+activity:
+  # REQUIRED for the activity to receive cancellation at all -- the server only
+  # communicates cancellation in the RESPONSE to a heartbeat RPC.
+  #
+  # Also the input to Core's throttle: min(heartbeatTimeout x 0.8,
+  # worker.maxHeartbeatThrottleInterval). At 5s the SDK sends at most one heartbeat
+  # every 4s no matter how often the activity calls Heartbeat(), so a resumed
+  # attempt can redo up to 4 seconds of work. Resume must be idempotent.
+  heartbeatTimeout: 5s
+  startToCloseTimeout: 10m
+  scheduleToCloseTimeout: 1h
+  retry:
+    initialInterval: 1s
+    backoffCoefficient: 2.0
+    maximumInterval: 10s
+    maximumAttempts: 5     # 0 means unlimited
+
+worker:
+  # The SDK default is 0s. Zero grace plus a minute-long heartbeating activity is
+  # the hang this repo demonstrates on purpose; set it to 0s together with
+  # fault.ignoreCancellation to watch it.
+  gracefulShutdownTimeout: 30s
+  maxHeartbeatThrottleInterval: 60s
+  defaultHeartbeatThrottleInterval: 30s
+  # 0 leaves the SDK default (10000). Set to 1 or 2 to force sticky-cache evictions
+  # and replay storms on demand -- it is the only way to make the sticky-cache and
+  # replay-pressure panels on the Bug Signals board move on a single laptop.
+  maxCachedWorkflows: 0
+  maxConcurrentActivities: 0      # 0 leaves the SDK default (100)
+  maxConcurrentWorkflowTasks: 0
+
+loadgen:
+  # Go used 500ms/4 because its seed activity returned instantly. This one runs for
+  # steps x stepDuration, so 500ms would skip almost every tick and `--rate` would
+  # be a lie about what the process is doing.
+  rate: 5s
+  concurrency: 8
+  steps: 20                       # shorter than job.steps so a board fills in under a minute
+
+# Fault injection. All zero/false = the activity always succeeds and every failure,
+# retry and heartbeat panel sits at zero.
+#
+# Shipped with the first two ON, like the Go original, so the dashboards move on the
+# first run. The three heartbeat knobs are OFF: each one proves a specific claim and
+# is meant to be turned on ONE AT A TIME while watching a named panel.
+fault:
+  failureRate: 0.15     # fraction of activity ATTEMPTS that fail (retryable)
+  latency: 150ms        # added to every step
+
+  # Sleep past heartbeatTimeout without heartbeating, on attempt 1 only. Two things
+  # happen in order and both are the point: the server times the ATTEMPT out, and we
+  # keep running anyway, because the only channel it has to tell us is the response
+  # to a heartbeat RPC and we are not sending any.
+  # Panel: heartbeat board "Heartbeat timeouts"; signals board outcome -> timed_out.
+  stallPastHeartbeatTimeout: false
+
+  # Keep doing work but never call Heartbeat(). Proves an activity that stops
+  # heartbeating can never be cancelled.
+  # Panel: heartbeat board "Heartbeat calls vs heartbeat RPCs" -- both fall to zero
+  # while repro_activity_progress keeps climbing.
+  stopHeartbeating: false
+
+  # Swallow OperationCanceledException and finish the batch on an uncancellable
+  # token. Proves TemporalWorker.ExecuteAsync does not return until every executing
+  # activity returns, and that gracefulShutdownTimeout does NOT bound that -- it
+  # only controls WHEN ctx.CancellationToken fires.
+  # THIS WEDGES YOUR TERMINAL FOR THE REST OF THE BATCH. That is the demo.
+  ignoreCancellation: false

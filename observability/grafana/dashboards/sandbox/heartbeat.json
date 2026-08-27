@@ -1,0 +1,984 @@
+{
+  "uid": "sandbox-heartbeat",
+  "title": "Repro / Heartbeating",
+  "description": "The seed case's own board. No Core SDK has a heartbeat metric, so every panel here is a proxy (the RecordActivityTaskHeartbeat RPC), a server-side consequence (activity_task_timeout), or something this repo emits itself. Start at 'Heartbeat interval: asked for vs throttled vs observed'.",
+  "tags": [
+    "sandbox",
+    "heartbeat"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "SDK namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "sandbox-prometheus"
+        },
+        "query": "label_values(temporal_request, namespace)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "default",
+          "value": "default",
+          "selected": true
+        },
+        "description": "Values are NOT sanitized by the .NET SDK; dashes survive."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Heartbeat RPCs /s",
+      "description": "The only built-in heartbeat signal in any Core SDK. Counts RecordActivityTaskHeartbeat calls that actually reached the server, i.e. AFTER Core's throttle. It is a normal request, not a long poll -- Core only marks the poll RPCs as long -- so it lands in temporal_request, never temporal_long_request. On Temporal Cloud each of these is a billable Action.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "heartbeat RPCs/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Heartbeat timeouts (dashboard range)",
+      "description": "The authoritative signal that an activity stopped heartbeating in time, from the server's timer queue. Self-hosted only: this metric is not exposed in Temporal Cloud. Present in server 1.31.2 as activity_task_timeout{timeout_type=\"Heartbeat\"}, tagged operation=\"TimerActiveTaskActivityTimeout\". NOTE: there is no metric called heartbeat_timeout in server 1.31.2 -- activity timeouts are one counter split by a timeout_type label. increase() over the range, not rate(), so a single fault still registers.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(activity_task_timeout{namespace=\"default\",operation=\"TimerActiveTaskActivityTimeout\",timeout_type=\"Heartbeat\"}[$__range])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "heartbeat timeouts"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Running heartbeating activities",
+      "description": "Used activity slots. This repo has exactly one activity type and it always heartbeats, so this is the divisor that turns a heartbeat RATE into a per-activity INTERVAL on the panel below.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "running activities"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Heartbeat interval: asked for vs throttled vs observed",
+      "description": "The most educational panel in this repo. It makes an invisible algorithm visible.\n\nCore throttles heartbeats to min(HeartbeatTimeout * 0.8, MaxHeartbeatThrottleInterval), falling back to DefaultHeartbeatThrottleInterval when the timeout is 0 or unset. It sends immediately, then suppresses until the interval elapses, then sends the LATEST buffered details. So calling Heartbeat() every 100 ms does not send 10 RPCs a second, and the SDK docs say only 'users do not have to be concerned with burdening the server', which tells you nothing about what you will actually see.\n\nFour series:\n  A  what the activity code asks for (config)\n  B  what Core enforces (the app computes and echoes the formula)\n  C  HeartbeatTimeout -- the cliff\n  D  what actually reaches the server:\n       running activities / heartbeat RPCs per second\n\nRead it: D should sit on B, nowhere near A. When D climbs toward C you are about to get a heartbeat timeout.\n\nA, B and C are static config echoed as gauges from the ACTIVITY meter, not the runtime meter -- the runtime meter has no root tags, so those series would carry no namespace and the $namespace selector would drop them silently.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(repro_heartbeat_call_interval_ms{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "A: configured call interval"
+        },
+        {
+          "refId": "B",
+          "expr": "max(repro_heartbeat_throttle_ms{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "B: Core throttle = min(HeartbeatTimeout*0.8, MaxHeartbeatThrottleInterval)"
+        },
+        {
+          "refId": "C",
+          "expr": "max(repro_heartbeat_timeout_ms{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "C: HeartbeatTimeout (the cliff)"
+        },
+        {
+          "refId": "D",
+          "expr": "1000 * sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\"}) / clamp_min(sum(rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])), 1e-9)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "D: observed interval per activity"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Heartbeat calls vs heartbeat RPCs /s",
+      "description": "The throttle, seen from the other side. repro_heartbeat_sent is incremented at every ctx.Heartbeat() call site, before Core sees it. temporal_request{operation=RecordActivityTaskHeartbeat} counts what survived. The gap IS the throttle, and it is the gap between your Cloud bill and your intuition.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(repro_heartbeat_sent{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "ctx.Heartbeat() calls/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "RPCs reaching the server/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Heartbeat RPC failures by status code",
+      "description": "Empty when healthy, and it is the failures that carry the information.\n\nNOT_FOUND is the interesting one: the server no longer knows about this activity -- it timed out, was cancelled, or its workflow closed. Core turns that response into a cancellation of ActivityExecutionContext.CancellationToken with CancelReason=GoneFromServer. This RPC's RESPONSE is the ONLY channel by which cancellation ever reaches an activity: no HeartbeatTimeout plus no Heartbeat() calls means the activity can never be cancelled at all.\n\nTRANSPORT_ERROR is Core's synthetic value for 'the connection broke before a gRPC status came back'. It is not a gRPC code and you will not find it in any status enum. Codes are SCREAMING_SNAKE.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (status_code) (rate(temporal_request_failure{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{status_code}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Heartbeat RPC latency p95",
+      "description": "How long the heartbeat call itself takes. Matters because the throttle interval is a floor on the SEND rate, not a budget for the round trip -- a slow heartbeat RPC eats into the 20% margin between the throttle and the timeout. Shares the temporal_request_latency bucket override.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_request_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Activity timeouts by type, server view",
+      "description": "All four counters come off the same emit site in the history service's timer queue, so they are directly comparable. This is how you tell a heartbeat timeout from a start-to-close timeout without opening the Web UI -- the workflow-side exception looks similar in both cases (ActivityFailureException wrapping TimeoutFailureException) and only TimeoutType tells them apart.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (timeout_type) (rate(activity_task_timeout{namespace=\"default\",operation=\"TimerActiveTaskActivityTimeout\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{timeout_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Activity attempt outcomes, server view",
+      "description": "activity_task_fail counts every failed ATTEMPT; activity_fail counts only terminal failures. Same for activity_task_timeout vs activity_timeout. The gap in each pair is what the retry policy rescued -- and for a heartbeating activity, rescuing means resuming from a checkpoint, which is what the bottom two panels measure.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(activity_success{namespace=\"default\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "success"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(activity_task_fail{namespace=\"default\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "failed attempts"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(activity_fail{namespace=\"default\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "terminal failures"
+        },
+        {
+          "refId": "D",
+          "expr": "sum(rate(activity_task_timeout{namespace=\"default\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "timed-out attempts"
+        },
+        {
+          "refId": "E",
+          "expr": "sum(rate(activity_cancel{namespace=\"default\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "cancelled"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Cancellation reasons, SDK view",
+      "description": "Emitted from the activity's catch block as ctx.CancelReason.ToString(). Nothing built in reports this -- the server sees 'cancelled', not why.\n\nThe .NET values: CancelRequested (workflow or client cancelled), GoneFromServer (the heartbeat RPC came back NOT_FOUND -- the activity already timed out or its workflow closed), WorkerShutdown (fired GracefulShutdownTimeout after WorkerShutdownToken), Timeout, HeartbeatRecordFailure (your heartbeat details failed to serialize -- anonymous types and delegates do this silently), Paused, Reset, None.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (reason) (rate(repro_activity_cancel{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Activity execution latency",
+      "description": "Per-attempt wall time from the worker's point of view. For a heartbeating activity this is the thing HeartbeatTimeout is NOT measuring -- the timeout is about the gap between heartbeats, not the total run.\n\nREQUIRES a HistogramBucketOverrides entry: Core's default top bucket for this metric is 60 s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le, activity_type) (rate(temporal_activity_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{activity_type}} p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le, activity_type) (rate(temporal_activity_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{activity_type}} p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Activity schedule-to-start p95, SDK vs server",
+      "description": "Two independent views of how long an activity task sat in the queue. The server series is multiplied by 1000: server timers are seconds, Core histograms are milliseconds. Both need the schedule-to-start bucket override on the SDK side; the server's buckets are tally's and are fine.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_activity_schedule_to_start_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "SDK (worker), ms"
+        },
+        {
+          "refId": "B",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le, task_type) (rate(task_schedule_to_start_latency_bucket{service_name=\"history\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "SERVER {{task_type}}, s -> ms"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Attempts resuming from a checkpoint",
+      "description": "Fraction of activity attempts that started from a heartbeat detail rather than from scratch. Reads 0 when nothing is failing; raise fault.failureRate or fault.stallPastHeartbeatTimeout and watch it climb.\n\nIn .NET there is no HasHeartbeatDetails helper -- the app checks ctx.Info.HeartbeatDetails.Count > 0 and tags this counter with the answer. HeartbeatDetailAtAsync<T>(0) throws if you skip the check.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",resumed=\"true\"}[$__rate_interval])) / clamp_min(sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "resumed fraction"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Checkpoint staleness on resume p95",
+      "description": "How much work gets redone. Measured in the activity as now - checkpoint.RecordedAtUtc at the moment of resume, which requires the heartbeat detail to be a record carrying a timestamp -- a plain int progress counter cannot answer this.\n\nThe overlaid throttle line is the theoretical upper bound: Core coalesces heartbeats, so the details the server holds can be up to one full throttle interval old. If p95 staleness sits near that line, your resume logic had better be idempotent, because it is reprocessing that much work on every retry.\n\nCustom histograms land in Core's catch-all bucket set, which tops out at 10 s -- needs a HistogramBucketOverrides entry.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(repro_heartbeat_staleness_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95 staleness"
+        },
+        {
+          "refId": "B",
+          "expr": "max(repro_heartbeat_throttle_ms{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "throttle interval (upper bound)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Activity progress",
+      "description": "A gauge the activity sets each iteration. The sawtooth is the point: every drop is an attempt that died and a new one that picked up from the last checkpoint, and the height of the drop is the staleness measured two panels up. With no fault injected this is a clean ramp.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (activity_type) (repro_activity_progress{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{activity_type}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}
