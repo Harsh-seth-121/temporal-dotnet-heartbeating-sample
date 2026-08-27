@@ -107,7 +107,13 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - DEFAULT_NAMESPACE=default
-      - DEFAULT_NAMESPACE_RETENTION=1d
+      # 7d, not the 1d the Go original used. Retention caps how long a CLOSED
+      # workflow's history survives, and this repo's whole replay workflow depends on
+      # `temporal workflow show` still finding it. At 1d, a history captured on Friday
+      # is gone on Monday and the README's capture-and-replay recipe fails with a
+      # not-found error that looks like a bug in the replayer.
+      # Matches Prometheus's --storage.tsdb.retention.time=7d.
+      - DEFAULT_NAMESPACE_RETENTION=7d
     networks: [temporal-network]
     volumes:
       - ./scripts:/scripts:ro
@@ -163,14 +169,24 @@ services:
     image: prom/pushgateway:v1.11.3
     container_name: dotnet-sandbox-pushgateway
     restart: unless-stopped
-    command:
-      # Survive restarts so a starter run from minutes ago is still visible.
-      - --persistence.file=/pushgateway/persist.store
-      - --persistence.interval=1m
+    # NO --persistence.file, deliberately, and this is a change from the Go original.
+    #
+    # Persistence makes a pushed group outlive `docker compose down`, and the
+    # Pushgateway then keeps SERVING it: Prometheus scrapes a fresh sample every 5s
+    # for a starter that is not running, so the series looks perpetually live. Worse
+    # for this repo specifically, a group pushed before a HistogramBucketOverrides
+    # change keeps its old `le` layout, and `sum by (le, operation)` silently merges
+    # two incompatible bucket sets.
+    #
+    # The Go original's justification -- "so a starter run from minutes ago is still
+    # visible" -- does not need persistence: Prometheus already scraped those samples
+    # and keeps them for its own 7d retention. Dropping the group just lets the series
+    # go stale, which is the truthful outcome when nothing is pushing.
+    #
+    # Clear a group without restarting:
+    #   dotnet run --project src/Repro.Starter -- --delete-push-group
     ports:
       - "9091:9091"
-    volumes:
-      - pushgateway-data:/pushgateway
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9091/-/ready"]
       interval: 15s
@@ -218,5 +234,4 @@ networks:
 volumes:
   temporal-pgdata:
   prometheus-data:
-  pushgateway-data:
   grafana-data:

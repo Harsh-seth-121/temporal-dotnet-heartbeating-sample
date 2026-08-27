@@ -34,6 +34,9 @@ setup_db() {
     return 0
   fi
   echo "Initializing database '${db}' ..."
+  # `|| true` absorbs only the benign "database already exists". A genuinely broken
+  # create is NOT swallowed: set -e plus the unguarded update-schema two lines down
+  # aborts the container, which fails the compose dependency and stops the server.
   ${SQLTOOL} --db "${db}" create || true
   ${SQLTOOL} --db "${db}" setup-schema -v 0.0
   ${SQLTOOL} --db "${db}" update-schema -d "${versioned}"

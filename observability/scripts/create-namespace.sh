@@ -22,8 +22,12 @@ until temporal operator cluster health --address "${ADDRESS}" >/dev/null 2>&1; d
 done
 echo "Temporal is healthy."
 
+# NOTE: retention is only applied at CREATION. Changing DEFAULT_NAMESPACE_RETENTION
+# and re-running `docker compose up` does NOT update an existing namespace -- this
+# branch exits first. To change it on a live stack:
+#   temporal operator namespace update -n default --retention 7d
 if temporal operator namespace describe -n "${NAMESPACE}" --address "${ADDRESS}" >/dev/null 2>&1; then
-  echo "Namespace '${NAMESPACE}' already exists."
+  echo "Namespace '${NAMESPACE}' already exists (retention unchanged; see note above)."
   exit 0
 fi
 

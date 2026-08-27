@@ -206,6 +206,24 @@ your `temporal_workflow_completed` and the server's have **identical names**. In
 the Go original tally's suffix kept them apart by accident. Every SDK selector on
 every authored board pins `service_name`.
 
+**The Pushgateway does NOT persist, and that is deliberate.** The Go original ran it
+with `--persistence.file`, so a pushed group outlived `docker compose down` and the
+gateway kept serving it — Prometheus scraped a fresh sample every 5s for a starter that
+was not running. Worse here specifically: a group pushed before a `HistogramBucketOverrides`
+change keeps its old `le` layout, and `sum by (le, operation)` silently merges two
+incompatible bucket sets. Persistence is not needed to see an old run, because Prometheus
+already scraped those samples and keeps them for its own 7d retention. Clear a group
+without restarting: `dotnet run --project src/Repro.Starter -- --delete-push-group`.
+
+**Namespace retention is 7d, and changing it does not affect an existing namespace.**
+Retention caps how long a CLOSED workflow's history survives, and the capture-and-replay
+recipe depends on `temporal workflow show` still finding it — at the Go original's `1d`,
+a history captured on Friday is gone on Monday and replay fails with a not-found error
+that reads like a replayer bug. `create-namespace.sh` exits early when the namespace
+exists, so editing `DEFAULT_NAMESPACE_RETENTION` and re-running `docker compose up` does
+nothing. On a live stack:
+`temporal operator namespace update -n default --retention 7d`.
+
 **The dynamicconfig mount is mandatory.** `temporalio/server:1.31.x` ships no
 default dynamicconfig file, but its embedded config template always sets
 `dynamicConfigClient.filepath`, and the file-based client hard-fails at startup if
