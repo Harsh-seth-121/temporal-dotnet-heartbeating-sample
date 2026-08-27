@@ -7,6 +7,12 @@
 # Eight services: Postgres, two one-shot admin-tools jobs, the server, the Web UI,
 # Prometheus, Pushgateway, Grafana.
 #
+# Every published port binds 127.0.0.1, not 0.0.0.0. Grafana here runs with anonymous
+# Admin and Prometheus with --web.enable-lifecycle, so a 0.0.0.0 bind would hand
+# anyone on the LAN an admin console and an unauthenticated shutdown endpoint. It also
+# keeps 5432 from colliding with a local Postgres. Container-to-container traffic is
+# unaffected: that goes over the compose network by service name.
+#
 # All images verified multi-arch (linux/amd64 + linux/arm64) -- no platform overrides.
 # No top-level `version:` key: obsolete in Compose v2+.
 #
@@ -23,12 +29,13 @@ services:
   postgresql:
     image: postgres:${POSTGRESQL_VERSION}
     container_name: dotnet-temporal-postgresql
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: postgres
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - temporal-pgdata:/var/lib/postgresql/data
     networks: [temporal-network]
@@ -61,6 +68,7 @@ services:
   temporal:
     image: temporalio/server:${TEMPORAL_VERSION}
     container_name: dotnet-temporal
+    restart: unless-stopped
     depends_on:
       temporal-schema-setup:
         condition: service_completed_successfully
@@ -85,9 +93,9 @@ services:
       - LOG_LEVEL=info
     networks: [temporal-network]
     ports:
-      - "7233:7233"
-      - "7243:7243"
-      - "8000:8000"
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:7243:7243"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./dynamicconfig:/etc/temporal/config/dynamicconfig:ro
     healthcheck:
@@ -112,7 +120,6 @@ services:
       # `temporal workflow show` still finding it. At 1d, a history captured on Friday
       # is gone on Monday and the README's capture-and-replay recipe fails with a
       # not-found error that looks like a bug in the replayer.
-      # Matches Prometheus's --storage.tsdb.retention.time=7d.
       - DEFAULT_NAMESPACE_RETENTION=7d
     networks: [temporal-network]
     volumes:
@@ -123,6 +130,7 @@ services:
   temporal-ui:
     image: temporalio/ui:${TEMPORAL_UI_VERSION}
     container_name: dotnet-temporal-ui
+    restart: unless-stopped
     depends_on:
       temporal:
         condition: service_healthy
@@ -134,7 +142,7 @@ services:
       - TEMPORAL_SHOW_TEMPORAL_SYSTEM_NAMESPACE=true
     networks: [temporal-network]
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   prometheus:
     image: prom/prometheus:v3.14.0
@@ -144,11 +152,22 @@ services:
       # `command:` overrides the image CMD wholesale, so the defaults must be repeated.
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=7d
+      # MEASURED: a 1s scrape over this topology writes ~11 GB/day (945 MB in the
+      # first 2h, ~24k active series). The Go original's 7d would be ~78 GB, which is
+      # not a thing to leave running on a laptop. A repro session is hours, not days.
+      - --storage.tsdb.retention.time=2d
+      # Hard ceiling regardless of the time window -- whichever limit is hit first
+      # wins. This is the one that actually protects the disk.
+      - --storage.tsdb.retention.size=8GB
       # enables: curl -XPOST localhost:9090/-/reload
+      #
+      # It ALSO enables an unauthenticated POST /-/quit that shuts Prometheus down.
+      # Verified: it returns 200 and the process exits. That is acceptable only
+      # because every port in this file is published on 127.0.0.1 -- do not widen
+      # any of them without dropping this flag first.
       - --web.enable-lifecycle
     ports:
-      - "9090:9090"
+      - "127.0.0.1:9090:9090"
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
@@ -186,7 +205,7 @@ services:
     # Clear a group without restarting:
     #   dotnet run --project src/Repro.Starter -- --delete-push-group
     ports:
-      - "9091:9091"
+      - "127.0.0.1:9091:9091"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9091/-/ready"]
       interval: 15s
@@ -203,7 +222,7 @@ services:
       prometheus:
         condition: service_healthy
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
