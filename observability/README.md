@@ -66,8 +66,14 @@ three `PrometheusOptions` suffix flags left at their defaults you get
 `temporal_workflow_task_execution_latency_bucket` with `le="500"` meaning 500
 **milliseconds** — where the same bucket in the Go SDK meant 500 **seconds**.
 Every SDK latency panel here uses Grafana unit `ms`. Server panels keep `s`,
-because the server is still a Go binary emitting tally metrics in seconds. The one
-panel that plots both multiplies the server series by 1000.
+because the server is still a Go binary emitting tally metrics in seconds. TWO panels
+plot both on one axis and both multiply the server series by 1000 — Bug Signals
+"Schedule-to-start: SDK view vs server view" and Heartbeating "Activity
+schedule-to-start p95, SDK vs server". Both also pin ONE `task_type`:
+`task_schedule_to_start_latency` is a single server histogram covering
+`task_type="Workflow"` and `task_type="Activity"`, so summing over it compares a
+one-sided SDK series against a two-sided server series and calls the difference
+divergence.
 
 **"Fixing" the missing `_total` blanks the imported SDK board.** The obvious
 reaction to bare counter names is to set `HasCounterTotalSuffix = true`. Do not.
@@ -83,12 +89,12 @@ default first bucket for `request_latency` is `le=50` while loopback gRPC is
 0-5 ms, so every observation lands in one bucket and `histogram_quantile`
 interpolates p95 to a flat ~47 ms forever. Same for schedule-to-start (flat
 ~99 ms) and for activity execution latency, whose top default bucket is 60 s while
-the seed activity deliberately runs longer. `HistogramBuckets.cs` overrides seven
-metrics for this reason. Two traps in that mechanism: Core matches override keys
-by **substring** against the already-prefixed name and iterates them in
-nondeterministic order, so keys must be disjoint and prefixed; and changing
-`MetricPrefix` breaks Core's own default-bucket lookup, which strips a hard-coded
-`"temporal_"`.
+the seed activity deliberately runs longer. `HistogramBuckets.cs` overrides eight
+metrics for this reason — six SDK ones plus the two `repro_*` histograms. Two traps
+in that mechanism: Core matches override keys by **substring** against the
+already-prefixed name and iterates them in nondeterministic order, so keys must be
+disjoint and prefixed; and changing `MetricPrefix` breaks Core's own default-bucket
+lookup, which strips a hard-coded `"temporal_"`.
 
 **`TemporalRuntime` must be built once, first, and shared.**
 `TemporalRuntime.Default` is materialized on first touch, and
@@ -119,13 +125,15 @@ RPC. No `HeartbeatTimeout` plus no `Heartbeat()` calls means nothing except work
 shutdown can ever stop the activity. `fault.stopHeartbeating` demonstrates it.
 
 **There is no heartbeat metric in any Core SDK, and the RPC rate is not your call
-rate.** The proxies are `temporal_request{operation="RecordActivityTaskHeartbeat"}`
-and the server's `heartbeat_timeout{operation="TimerActiveTaskActivityTimeout"}`.
-But Core throttles heartbeats to `min(HeartbeatTimeout × 0.8,
-MaxHeartbeatThrottleInterval)`, so the observed RPC rate is the throttle, not the
-rate at which your code calls `Heartbeat()`. That is why this repo emits
-`repro_heartbeat_sent` at the call site: the gap between the two lines on the
-Heartbeating board *is* the throttle.
+rate.** The two proxies are `temporal_request{operation="RecordActivityTaskHeartbeat"}`
+on the SDK side and, on the server side,
+`activity_task_timeout{timeout_type="Heartbeat"}` — *not* a `heartbeat_timeout`
+metric, which does not exist in server 1.31.2; see the entry further down. But Core
+throttles heartbeats to `min(HeartbeatTimeout × 0.8, MaxHeartbeatThrottleInterval)`,
+so the observed RPC rate is the throttle, not the rate at which your code calls
+`Heartbeat()`. That is why this repo emits `repro_heartbeat_sent` at the call site,
+and `repro_heartbeat_call_interval_ms` next to it: the gap between the two lines on
+the Heartbeating board *is* the throttle.
 
 **`GracefulShutdownTimeout` defaults to `TimeSpan.Zero`, and `ExecuteAsync` waits
 for every activity.** A long heartbeating activity therefore gets no grace at all
@@ -165,8 +173,8 @@ A capitalized value does not error; the panel is just permanently empty.
 
 **`temporal_request_attempt` exists in the TSDB but never for your worker.** It is
 emitted by the Temporal server's own embedded **Go** SDK workers on :8000
-(`service_name="worker"`), not by any Core-based SDK. Measured: 10 occurrences on
-:8000, zero on :8077. A panel built on it will look like it should work and never
+(`service_name="worker"`), not by any Core-based SDK. Measured: present and growing
+on :8000, and **exactly zero** occurrences on :8077. A panel built on it will look like it should work and never
 populate for your code. That is why the Go original's "gRPC attempts per logical
 call" panel was deleted rather than ported.
 
@@ -213,17 +221,40 @@ That is why schema init and namespace registration are separate one-shot
 **`dotnet run` launches your app as a CHILD process.** Killing the parent leaves
 the child running and holding :8077, and the next worker start fails with
 `Address already in use (os error 48)`. For any kill test, run the built binary
-directly or `kill $(lsof -ti tcp:8077)`.
+directly and kill it by port: `kill -9 $(lsof -ti tcp:8077)`.
+
+**And use `-9`, unless the drain is what you are testing.** A plain SIGTERM starts a
+graceful shutdown, and the worker keeps :8077 for as long as that takes. The SDK
+says so out loud — measured on a SIGTERM with one activity in flight:
+
+```
+Beginning activity worker shutdown, will wait 00:00:30 before cancelling 1 activity instance(s)
+worker draining; checkpointing at step 3
+```
+
+That is `worker.gracefulShutdownTimeout` before `ctx.CancellationToken` even fires,
+and then however long the activity takes to unwind. Restarting into that window is
+the `Address already in use` above, arriving from the direction you were not
+watching.
 
 ## What each process contributes
 
 | Process | Transport | Port | Emits |
 |---|---|---|---|
-| Temporal server (container) | scraped | 8000 | ~145 server metric families, plus its own Go SDK worker metrics |
+| Temporal server (container) | scraped | 8000 | 233 metric families, 27 of them `temporal_*` from its own embedded Go SDK workers |
 | `Repro.Worker` (host) | scraped | 8077 | SDK metrics + `repro_*` custom metrics |
 | `Repro.LoadGen` (host) | scraped | 8078 | same, under continuous traffic |
 | `Repro.Starter` (host) | pushes on exit | 9091 | SDK **client** metrics only |
 | `Repro.Replay` (host) | opt-in `--metrics` | 8079 | **nothing** — 200 with an empty body |
+
+`--metrics <addr>` overrides the configured port on all three of worker, loadgen and
+replay, and `--metrics off` starts no exporter and binds no port at all — that is how
+you run a SECOND worker on this host without fighting the first one for :8077. `off`
+is a FLAG value only: `metrics.listenAddress: off` in config.yaml still fails
+validation, and the error says so. Note it means no *exporter*, not no *runtime* —
+the process still adopts a telemetry-free `TemporalRuntime`, because a client that
+connects without one binds to `TemporalRuntime.Default` and that is the silent
+metrics loss above.
 
 `Repro.Starter` pushes client metrics only. `repro_workflow_*` and
 `repro_activity_*` come from the worker, because workflow and activity code does
@@ -243,15 +274,24 @@ curl -sS -o /dev/null -w '%{http_code} %{size_download}\n' localhost:8079/metric
 
 ## Proving the boards
 
-`grafana/probe-dashboards.py` runs every target on every authored board twice: as
-the panel ships it, and again with `or vector(0)` stripped. A single check is
+`grafana/probe-dashboards.py` runs every target on every board it is pointed at
+twice: as the panel ships it, and again with `or vector(0)` stripped. A single check is
 useless in both directions — an expression ending in `or vector(0)` always returns
 a row, so it proves nothing about whether the metric exists.
 
 ```bash
-python3 grafana/probe-dashboards.py            # all boards
-python3 grafana/probe-dashboards.py heartbeat  # one board
+python3 grafana/probe-dashboards.py             # the four authored boards
+python3 grafana/probe-dashboards.py heartbeat   # one board, by file stem
+python3 grafana/probe-dashboards.py --vendored  # the four imported boards
+python3 grafana/probe-dashboards.py --all       # both
 ```
+
+Only the authored boards gate the exit code. The vendored ones are pinned at
+`dashboards/UPSTREAM_SHA` and are not ours to fix; upstream writes them against a
+fully loaded cluster, so plenty of their panels are legitimately empty here. Probing
+them is still worth doing: it is how "leave all three `PrometheusOptions` suffix
+flags false, because that is what the vendored Core SDK board is written against"
+stops being an assertion and becomes a measurement.
 
 States: `OK` (both modes return data), `FALLBACK` (renders via `or vector(0)`
 because the series has not been created yet — expected for anything that only
@@ -262,15 +302,20 @@ Measured against a live stack with the worker and loadgen running and
 `failureRate: 0.15`:
 
 ```
-68 OK  +  14 FALLBACK  =  82/82 targets render
-0 NODATA, 0 ERROR
+authored: 70 OK  +  12 FALLBACK  =  82/82 targets render
+authored: 0 NODATA, 0 ERROR
+authored: 55/55 panels have at least one series
 ```
+
+The OK/FALLBACK split moves with stack state; `82/82`, `0 NODATA, 0 ERROR` and
+`55/55` are the parts that must not.
 
 To move the `FALLBACK` targets into `OK`, put the stack in the state each needs:
 
 | Targets | State needed |
 |---|---|
-| heartbeat timeouts, `timed_out` outcomes | `fault.stallPastHeartbeatTimeout: true` |
+| heartbeat timeouts | `fault.stallPastHeartbeatTimeout: true` |
+| `timed_out` outcomes | `fault.stopHeartbeating: true` — **not** `stallPastHeartbeatTimeout`, which only stalls attempt 1, so attempt 2 completes and the outcome stays `completed` |
 | cancellation reasons | `temporal workflow cancel -w repro-workflow`, or Ctrl-C the starter |
 | sticky cache miss / forced eviction / replay pressure | `worker.maxCachedWorkflows: 1` |
 | non-determinism (SDK and server) | break the workflow and replay, or edit it while a run is in flight |
@@ -279,32 +324,70 @@ To move the `FALLBACK` targets into `OK`, put the stack in the state each needs:
 ## Known-empty official panels
 
 The four dashboards under `temporal-server/` and `temporal-sdk/` are imported from
-[temporalio/dashboards](https://github.com/temporalio/dashboards) at commit
-`4994df2` as-is, so they cover more ground than this sandbox exercises. Measured
-against a running stack with worker and loadgen and faults on:
+[temporalio/dashboards](https://github.com/temporalio/dashboards) as-is, pinned at
+the SHA in `grafana/dashboards/UPSTREAM_SHA` (`4994df2`), so they cover more ground
+than this sandbox exercises. These are panel counts, from
+`probe-dashboards.py --vendored` against a running stack with worker and loadgen and
+faults on — reproduce them rather than trust them, they move with stack state:
 
 | Dashboard | With data | Empty | Non-query |
 |---|---|---|---|
-| `temporal-sdk/core-sdks-otel` | 23 | 3 | 2 |
-| `temporal-server/server-general` | 29 | 6 | 1 |
-| `temporal-server/frontend-service` | 14 | 2 | 0 |
-| `temporal-server/history-service` | 34 | 17 | 0 |
+| `temporal-sdk/core-sdks-otel` | 24 | 2 | 2 |
+| `temporal-server/server-general` | 31 | 4 | 1 |
+| `temporal-server/frontend-service` | 14 | 1 | 1 |
+| `temporal-server/history-service` | 33 | 17 | 1 |
+
+102 of 126 panels, 124 of 182 targets, and **0 ERROR** — no imported expression is
+rejected by this Prometheus. "Non-query" is a text panel or a panel whose only
+target ships a blank `expr` (the probe skips both); Grafana `row` headers are not
+counted at all.
 
 The SDK board scores far better than the Go original's equivalent did (19 of 34)
 for one reason: it is written against exactly the metric names a Core-based SDK
 emits, which is why all three `PrometheusOptions` suffix flags stay at their
-defaults.
+defaults. That premise is checked panel by panel, not asserted: its only two empty
+panels are `temporal_workflow_task_execution_failed` and `temporal_sticky_cache_miss`,
+both **absent counters** on a worker where nothing has failed and nothing has missed
+the sticky cache — not name-shape mismatches. Every bare-name, millisecond-histogram
+selector on that board resolves.
 
-Most remaining empties are correct, not broken:
+The empties are correct, not broken, and they fall into four groups. Each claim
+below was checked against `curl localhost:8000/metrics`, not inferred from the panel
+title:
 
-- Error panels are empty because nothing is failing. Raise `fault.failureRate`.
-- Local activity panels. This sandbox uses no local activities.
-- Timer and transfer task panels on the history board. The seed workflow schedules
-  no timers. Add a `Workflow.DelayAsync` and they fill.
-- `GC Counter` and other Go-runtime panels are empty permanently. The server's
-  Prometheus registry is private, so no `go_*` / `process_*` collectors exist.
-- `Shard Rebalancing` is empty permanently. Single-node deployment.
-- Panels keyed on `kubernetes_pod_name` are empty permanently. No Kubernetes here.
+- **A family that has never been emitted here.** Most of the empty targets are
+  server-side error counters: `service_errors_entity_not_found`,
+  `service_errors_resource_exhausted`, `persistence_errors`, `cache_errors`,
+  `acquire_lock_failed`, `task_errors_discarded`, `stale_mutable_state`,
+  `failed_workflow_tasks`, `multiple_completion_commands` — no `# TYPE` line at all,
+  so absent rather than zero, exactly like Core. Raising `fault.failureRate` will
+  **not** fill them: an activity failure is a normal completion path as far as the
+  server is concerned. Stop the server mid-run or throttle persistence instead.
+- **A family that exists, under label values the panel does not select.** Bare
+  `service_errors` is here but only with `service_name="matching"`, while the panels
+  select `frontend` and `history`. `cache_requests` and `cache_latency` are here
+  under `HistoryCacheGetOrCreate`, `HistoryCacheGetOrCreateCurrent`,
+  `EventsCacheGetEvent` and `EventsCachePutEvent`, while "Mutable State Load Counts"
+  hard-codes `HistoryCacheGetCurrentExecution`. `task_attempt` is here under
+  `TransferActiveTaskActivity` and `TimerActiveTaskActivityTimeout`, while the two
+  "Task Attempt Stats" panels hard-code `TransferActiveTaskCommand` and
+  `TimerActiveTaskCommand`. Upstream is not wrong; it is written against a different
+  server build than the one pinned in `.env`.
+- **A grouping label that does not exist on this endpoint.** `GC Counter` is the
+  instructive one: `memory_num_gc` really is exported and really has data, tagged
+  `service_name` — the panel groups by `kubernetes_pod_name`, of which there are
+  **zero** occurrences in the whole scrape. Every `kubernetes_pod_name` panel is
+  empty for that reason and no amount of load will change it. (Separately, there
+  genuinely are no `go_*` / `process_*` series: the server's Prometheus registry is
+  private.)
+- **Permanently empty because of this topology.** `Shard Rebalancing`, `Shards
+  Closed` and `State Transition` all read `shard_closed_count` /
+  `sharditem_removed_count`, which a single-node deployment never emits.
+
+Three empties are one command away from filling: `Workflow Completion Overview` and
+`Workflow Timedout / Cancelled By Namespace` read `workflow_cancel` and
+`workflow_timeout` at `operation="CompletionStats"`, so `temporal workflow cancel -w
+repro-workflow` or `fault.stopHeartbeating: true` fills them.
 
 The `$Service` and `$Client` variables on `server-general` are decorative; they
 appear only in panel titles, never in any expression.

@@ -20,8 +20,20 @@ global:
   #   $__rate_interval = max($__interval + timeInterval, 4 * timeInterval) >= 4s.
   # A job scraped slower than 2s puts fewer than two samples in a 4s window and
   # rate() returns NOTHING. That is why every job feeding a dashboard panel is left
-  # on the global interval, and why pushgateway (5s) gets away with it: its series
-  # come from a one-shot push and are constant, so rate() is 0 regardless.
+  # on the global interval.
+  #
+  # Pushgateway (5s) is the one exemption, and NOT because "those series are constant
+  # so rate() is 0 anyway". That is the comforting version and it is false. MEASURED,
+  # six samples in a row:
+  #   rate(temporal_request{job="temporal_starter"}[4s])     -> EMPTY
+  #   rate(temporal_request{job="temporal-sdk-worker"}[4s])  -> 7 series
+  # The real reason it is safe: nothing reads the pushed series ON THEIR OWN. No panel
+  # pins job="temporal_starter", so the starter's group only ever appears as one member
+  # inside a `sum by (...) (rate(...))` on an SDK board -- and a member that drops out
+  # of a sum contributes exactly what a constant member's 0 would have. The values only
+  # change when the starter process exits, so 1s would buy five copies of one sample.
+  # Add a panel that selects the push group alone and this stops being true: put the
+  # job back on the global interval first.
   #
   # scrape_timeout MUST be <= scrape_interval, so it is set explicitly here --
   # Prometheus's 10s default would be rejected against a 1s interval.
@@ -92,6 +104,8 @@ scrape_configs:
   # the samples; only the type annotation is wrong. See the repo README.
   - job_name: pushgateway
     honor_labels: true
+    # 5s, not the global 1s. The reason it is safe is at the top of this file, and it
+    # is not the obvious one.
     scrape_interval: 5s
     scrape_timeout: 4s
     metrics_path: /metrics

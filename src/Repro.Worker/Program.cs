@@ -6,6 +6,7 @@ using Repro.Core.Config;
 using Repro.Core.Telemetry;
 using Repro.Core.Temporal;
 using Repro.Core.Workflows;
+using Temporalio.Runtime;
 using Temporalio.Worker;
 
 var flags = Flags.Parse(args);
@@ -19,8 +20,25 @@ var log = loggerFactory.CreateLogger("worker");
 // FIRST, before any TemporalClient exists. A client that connects first binds to
 // TemporalRuntime.Default and its metrics are lost with no error anywhere.
 var bind = flags.Str("--metrics") ?? config.Metrics.ListenAddress;
-var runtime = ReproRuntime.CreateScrape(bind);
-log.LogInformation("metrics: serving http://{Bind}/metrics", bind);
+
+// `--metrics off` is how you run a SECOND worker on this host without fighting the
+// first one for :8077 — the "kill the worker mid-activity" recipe needs two. Off
+// means NO EXPORTER, not no runtime: ClientFactory requires a runtime, and a client
+// that connects without one binds to TemporalRuntime.Default, which is the silent
+// metrics loss ReproRuntime exists to prevent. Adopt a telemetry-free runtime so the
+// single-shot guard still owns this process.
+var metricsOff = BindAddress.IsOff(bind);
+var runtime = metricsOff
+    ? ReproRuntime.Adopt(new TemporalRuntime(new TemporalRuntimeOptions()))
+    : ReproRuntime.CreateScrape(bind);
+if (metricsOff)
+{
+    log.LogInformation("metrics: OFF; this worker exports nothing and binds no port");
+}
+else
+{
+    log.LogInformation("metrics: serving http://{Bind}/metrics", bind);
+}
 
 var client = await ClientFactory.ConnectAsync(config, runtime, "worker", loggerFactory);
 
@@ -28,7 +46,7 @@ var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
     // Instance registration is the SetFaultConfig replacement: the fault config is
     // reachable only from this object, so no workflow can read it.
-    .AddAllActivities(new HeartbeatActivities(config.Fault));
+    .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker));
 
 // The SDK default is TimeSpan.Zero. Zero grace plus a minute-long heartbeating
 // activity is the hang this repo demonstrates on purpose (fault.ignoreCancellation);

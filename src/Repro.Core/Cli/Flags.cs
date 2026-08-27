@@ -48,6 +48,19 @@ public sealed class Flags
                     $"unknown flag \"{name}\". Known: {string.Join(", ", Known.Order(StringComparer.Ordinal))}");
             }
 
+            // GOTCHA: Go's flag package accepts -restart=false, so people type it here
+            // too. This used to store the text and Switch() only tested ContainsKey, so
+            // --restart=false, --restart=0 and --delete-push-group=false all turned the
+            // switch ON — the exact opposite of what was typed, with no output. Rejecting
+            // every =form beats parsing it: there is then one spelling that means on, and
+            // no spelling that quietly means the reverse of what it says.
+            if (eq >= 0 && Switches.Contains(name))
+            {
+                throw new ArgumentException(
+                    $"{name} is a switch and takes no value (got \"{arg}\"). Write \"{name}\" to turn it on " +
+                    $"and omit it to leave it off — \"{name}=false\" would have turned it ON.");
+            }
+
             if (eq >= 0)
             {
                 flags.values[name] = arg[(eq + 1)..];

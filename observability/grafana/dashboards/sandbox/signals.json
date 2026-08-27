@@ -26,7 +26,7 @@
           "type": "prometheus",
           "uid": "sandbox-prometheus"
         },
-        "query": "label_values(temporal_request, namespace)",
+        "query": "label_values(temporal_request{service_name=\"temporal-core-sdk\"}, namespace)",
         "refresh": 1,
         "includeAll": false,
         "multi": false,
@@ -182,7 +182,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Schedule-to-start: SDK view vs server view",
-      "description": "Two independent measurements of the same quantity. They should track each other closely; sustained divergence means clock skew or dispatch loss.\n\nTHE * 1000 IS NOT DECORATION. Core records milliseconds; the server's tally timers record seconds. Plotting them raw puts a 1000x gap on the panel that looks exactly like the dispatch loss this panel exists to detect. The Go original needed no conversion because both sides were seconds.",
+      "description": "Two independent measurements of the SAME quantity: how long a WORKFLOW task sat between being scheduled and being started. They should track each other closely; sustained divergence means clock skew or dispatch loss.\n\nTHE * 1000 IS NOT DECORATION. Core records milliseconds; the server's tally timers record seconds. Plotting them raw puts a 1000x gap on the panel that looks exactly like the dispatch loss this panel exists to detect. The Go original needed no conversion because both sides were seconds.\n\nTHE task_type PIN IS NOT DECORATION EITHER. The SDK metric is workflow-task-only by construction (activities have their own temporal_activity_schedule_to_start_latency), but the server's task_schedule_to_start_latency_bucket is one histogram carrying both task_type=\"Workflow\" and task_type=\"Activity\". Sum over it and the two lines are not the same quantity, so every gap between them reads as divergence when it is really just the activity half of a different metric.",
       "datasource": {
         "type": "prometheus",
         "uid": "sandbox-prometheus"
@@ -205,7 +205,7 @@
         },
         {
           "refId": "B",
-          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket{service_name=\"history\"}[$__rate_interval])))",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket{service_name=\"history\",task_type=\"Workflow\"}[$__rate_interval])))",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"
@@ -381,7 +381,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) / clamp_min(sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) + (sum(rate(temporal_sticky_cache_miss{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)), 1e-9)",
+          "expr": "(sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)) / clamp_min((sum(rate(temporal_sticky_cache_hit{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)) + (sum(rate(temporal_sticky_cache_miss{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)), 1e-9)",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"
@@ -575,7 +575,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(temporal_workflow_task_replay_latency_count{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) / clamp_min(sum(rate(temporal_workflow_task_execution_latency_count{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
+          "expr": "(sum(rate(temporal_workflow_task_replay_latency_count{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(temporal_workflow_task_execution_latency_count{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"

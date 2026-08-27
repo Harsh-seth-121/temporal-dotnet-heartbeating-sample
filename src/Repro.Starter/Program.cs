@@ -28,17 +28,44 @@ if (flags.Switch("--delete-push-group"))
 var steps = flags.Number("--steps") ?? config.Job.Steps;
 var stepDuration = flags.Duration("--step-duration") ?? config.Job.StepDuration;
 
-// DISPOSAL ORDER IS LOad-BEARING. `await using` declarations dispose in REVERSE
-// declaration order, so declaring the push guard FIRST makes it dispose LAST --
-// after the client is gone and Core has drained its buffered metric updates. This
-// is the C# analogue of the Go original registering `defer flush()` before
-// `defer c.Close()` so that LIFO ran the flush last. Do not move this line below
-// the ConnectAsync.
+// These two overrides land AFTER ConfigLoader.Validate, so they inherit none of its
+// checks and have to repeat them. `--steps 0` otherwise walks straight past the
+// "job.steps must be > 0" startup fatal and starts a workflow that completes zero
+// steps and reports SUCCESS: a green run that exercised nothing.
+if (steps <= 0)
+{
+    throw new ArgumentException(
+        $"--steps must be > 0 (got {steps}). It overrides job.steps, which has the same rule.");
+}
+
+// Zero is the interesting one, not negative: a zero step still "works", it just
+// spins the activity loop with no sleep in it. Negative reaches Task.Delay and
+// throws from inside the activity, five attempts deep.
+if (stepDuration <= TimeSpan.Zero)
+{
+    throw new ArgumentException(
+        $"--step-duration must be > 0 (got {GoDuration.ToGoString(stepDuration)}).");
+}
+
+// The final push is guaranteed by PushMetrics's SETTLE DELAY, not by disposal
+// order: Temporalio 1.18.0's client is a plain `var`, is never disposed, and
+// ITemporalClient is not IDisposable, so there is no LIFO interaction to arrange
+// here. (The Go original genuinely did rely on ordering -- `defer flush()`
+// registered before `defer c.Close()` -- which is why this looks like it should.)
+// `await using` earns its keep for a duller reason: it runs the settle-and-push on
+// every exit path below, including the WorkflowFailedException one.
 await using var push = PushMetrics.Start(config.Metrics, m => log.LogInformation("{Message}", m));
 
 var client = await ClientFactory.ConnectAsync(config, push.Runtime, "starter", loggerFactory);
 
-var input = new JobInput(steps, (int)stepDuration.TotalMilliseconds);
+var input = new JobInput(
+    steps,
+    (int)stepDuration.TotalMilliseconds,
+    // Carries activity.* from config.yaml INTO the workflow input, so the values are
+    // captured in history. Without this the `activity:` block is dead config: the
+    // workflow falls back to ActivityOptionsInput's defaults and changing
+    // heartbeatTimeout does nothing.
+    ActivityOptionsInput.From(config.Activity));
 var options = new WorkflowOptions(id: config.WorkflowId, taskQueue: config.TaskQueue)
 {
     // Explicit, so "already running" is a message rather than a surprise. The Go
@@ -96,4 +123,4 @@ catch (WorkflowFailedException e)
     return 1;
 }
 
-// `push` disposes here: settle -> stop the adapter -> guaranteed final PUT.
+// `push` disposes here: settle -> guaranteed final PUT -> stop the adapter.

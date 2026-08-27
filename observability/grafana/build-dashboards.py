@@ -30,10 +30,16 @@ and what every other .NET user sees:
       temporal_request_latency_seconds_bucket -> temporal_request_latency_bucket
   Every SDK latency panel below therefore carries unit "ms", not "s".
   SERVER panels keep unit "s": the server is still the same Go binary emitting
-  tally metrics, and tally still reports seconds. The one panel that plots both
-  ("Schedule-to-start: SDK view vs server view", Signals board) multiplies the
-  server series by 1000. Getting that wrong yields a 1000x gap that looks
-  exactly like the dispatch loss the panel exists to detect.
+  tally metrics, and tally still reports seconds. TWO panels put both sides on
+  one axis, and both multiply the server series by 1000:
+      Signals    "Schedule-to-start: SDK view vs server view"
+      Heartbeat  "Activity schedule-to-start p95, SDK vs server"
+  Getting that conversion wrong yields a 1000x gap that looks exactly like the
+  dispatch loss those panels exist to detect. Both also pin the server side to
+  ONE task_type: task_schedule_to_start_latency is a single histogram covering
+  task_type="Workflow" and task_type="Activity", so summing over it compares a
+  workflow-task SDK series against a workflow+activity server series and calls
+  the difference divergence.
   Corollary you cannot escape: integer ms means sub-millisecond durations round
   to 0, and no bucket override recovers them. Fixing that needs
   UseSecondsForDuration=true, which blanks every panel on the imported
@@ -62,6 +68,18 @@ and what every other .NET user sees:
   -- a collision the Go original was structurally incapable of having. `sdk()`
   below pins service_name on every SDK selector so a board cannot silently pick
   up the server's internal system workers.
+
+* Core creates a metric on FIRST INCREMENT. A counter that has never fired is
+  absent from /metrics entirely rather than reading 0 -- including counters that
+  exist only under a label value nothing has produced yet, e.g.
+  repro_activity_started{resumed="true"} with fault.failureRate at 0. PromQL
+  turns absence into silence, not into zero: `A + B` and `A / B` with either
+  operand empty yield EMPTY. So every operand of every arithmetic expression
+  below that can be absent carries `or vector(0)`, and the probe script runs
+  each target twice (with and without the fallbacks) so a panel cannot pass on
+  its fallback alone. Standalone targets do NOT get the fallback: `sum by (x)
+  (...) or vector(0)` returns a series with no x, which renders as a blank
+  legend and cannot join anything.
 
 * Core's default histogram buckets are coarse for a laptop sandbox. Five of the
   latency panels here require PrometheusOptions.HistogramBucketOverrides in the
@@ -158,7 +176,14 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",)):
             # counters. This query is also the cheapest way to prove the worker's
             # exporter is being scraped at all -- if the dropdown is empty, the
             # Prometheus target is down, not the dashboard.
-            "query": "label_values(temporal_request, namespace)",
+            # The service_name pin is the same pin sdk() applies, and for the same
+            # reason -- this selector just cannot call sdk(), which would pin
+            # namespace="$namespace" to the variable being defined. Unpinned, this
+            # dropdown lists the SERVER's internal namespaces too (_unknown_,
+            # system, temporal_system), because the server's own embedded Go SDK
+            # workers emit a metric with the byte-identical name on :8000. Pick one
+            # of those and every panel on the board goes blank at once.
+            "query": 'label_values(temporal_request{service_name="temporal-core-sdk"}, namespace)',
             "refresh": 1,
             "includeAll": False,
             "multi": False,
@@ -251,6 +276,12 @@ SDK = sdk()          # {namespace="$namespace",service_name="temporal-core-sdk"}
 SRV = srv()          # {namespace="default"}
 FE = '{service_name="frontend"}'
 HI = '{service_name="history"}'
+# task_schedule_to_start_latency is ONE histogram split by task_type, so a panel
+# comparing it against an SDK series has to pin the half that SDK series measures.
+# Summing both halves and calling the difference "divergence" compares apples to
+# apples plus oranges.
+HI_WFT = '{service_name="history",task_type="Workflow"}'
+HI_ACT = '{service_name="history",task_type="Activity"}'
 HB = '{operation="RecordActivityTaskHeartbeat"}'   # documentation only; see sdk(...)
 
 
@@ -313,6 +344,13 @@ worker = grid([
          exprs=[('histogram_quantile(0.95, sum by (le, workflow_type) (rate(temporal_workflow_endtoend_latency_bucket%s[$__rate_interval])))' % SDK, "{{workflow_type}}")]),
     dict(title="Task slot saturation", unit=PCT, minval=0,
          desc="used / (used + available). Sustained 100% means add slots or workers.",
+         # No `or vector(0)` on either operand, deliberately, and this is the one
+         # ratio on any of these boards that does not need one: the slot gauges are
+         # registered when the worker starts, not on first use, so every worker_type
+         # is present reading 0 from the first scrape (LocalActivityWorker proves it
+         # -- this repo never runs one). A fallback would also be actively wrong
+         # here: `sum by (worker_type) (...) or vector(0)` yields a series with NO
+         # worker_type, which cannot match the other side of the division.
          exprs=[('100 * sum by (worker_type) (temporal_worker_task_slots_used%s) / clamp_min(sum by (worker_type) (temporal_worker_task_slots_used%s) + sum by (worker_type) (temporal_worker_task_slots_available%s), 1)' % (SDK, SDK, SDK), "{{worker_type}}")]),
 
     dict(title="Client RPC rate by operation", unit=RPS,
@@ -383,7 +421,10 @@ server = grid([
     dict(title="Sync-match ratio", unit=RATIO, h=6, w=8, kind="stat",
          desc="1.0 means tasks handed straight to a waiting poller and never "
               "touched the database. Drops when workers fall behind.",
-         exprs=[('sum(rate(poll_success_sync[$__rate_interval])) / clamp_min(sum(rate(poll_success[$__rate_interval])), 1e-9)', "sync-match")]),
+         # Numerator guarded for the same reason the denominator is clamped: a
+         # server that has only ever matched through the database emits no
+         # poll_success_sync at all, and empty / anything is EMPTY, not 0.
+         exprs=[('(sum(rate(poll_success_sync[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(poll_success[$__rate_interval])), 1e-9)', "sync-match")]),
 
     dict(title="Frontend RPS by operation", unit=RPS,
          exprs=[('sum by (operation) (rate(service_requests%s[$__rate_interval]))' % FE, "{{operation}}")]),
@@ -404,10 +445,13 @@ server = grid([
          exprs=[('sum by (operation) (rate(persistence_requests%s[$__rate_interval]))' % HI, "{{operation}}")]),
 
     dict(title="Server-side schedule-to-start p95", unit=SEC, minval=0,
-         desc="History service's own view, in seconds. Compare with the SDK's "
-              "view on the Signals board -- that panel converts this series to "
-              "milliseconds so the two are comparable. Sustained divergence means "
-              "clock skew or dispatch loss.",
+         desc="History service's own view, in seconds. Broken out by task_type "
+              "because this is ONE histogram covering both Workflow and Activity "
+              "tasks -- the SDK has a separate metric per type. Compare with the "
+              "SDK's view on the Signals board, which converts this series to "
+              "milliseconds AND pins task_type=\"Workflow\" so the two sides "
+              "measure the same thing. Sustained divergence means clock skew or "
+              "dispatch loss.",
          exprs=[('histogram_quantile(0.95, sum by (task_type, le) (rate(task_schedule_to_start_latency_bucket%s[$__rate_interval])))' % HI, "{{task_type}}")]),
     dict(title="Workflow outcomes, server view", unit=RPS,
          desc="Server label keys differ from SDK ones: workflowType (camelCase) "
@@ -467,16 +511,25 @@ signals = grid([
          exprs=[('histogram_quantile(0.99, sum by (le) (rate(workflow_task_attempt_bucket[$__rate_interval])))', "p99 attempt")]),
 
     dict(title="Schedule-to-start: SDK view vs server view", unit=MS, minval=0, w=24,
-         desc="Two independent measurements of the same quantity. They should "
-              "track each other closely; sustained divergence means clock skew "
-              "or dispatch loss.\n\n"
+         desc="Two independent measurements of the SAME quantity: how long a "
+              "WORKFLOW task sat between being scheduled and being started. They "
+              "should track each other closely; sustained divergence means clock "
+              "skew or dispatch loss.\n\n"
               "THE * 1000 IS NOT DECORATION. Core records milliseconds; the "
               "server's tally timers record seconds. Plotting them raw puts a "
               "1000x gap on the panel that looks exactly like the dispatch loss "
               "this panel exists to detect. The Go original needed no conversion "
-              "because both sides were seconds.",
+              "because both sides were seconds.\n\n"
+              "THE task_type PIN IS NOT DECORATION EITHER. The SDK metric is "
+              "workflow-task-only by construction (activities have their own "
+              "temporal_activity_schedule_to_start_latency), but the server's "
+              "task_schedule_to_start_latency_bucket is one histogram carrying "
+              "both task_type=\"Workflow\" and task_type=\"Activity\". Sum over "
+              "it and the two lines are not the same quantity, so every gap "
+              "between them reads as divergence when it is really just the "
+              "activity half of a different metric.",
          exprs=[('histogram_quantile(0.95, sum by (le) (rate(temporal_workflow_task_schedule_to_start_latency_bucket%s[$__rate_interval])))' % SDK, "SDK (worker), ms"),
-                ('1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket%s[$__rate_interval])))' % HI, "SERVER (history), s -> ms")]),
+                ('1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket%s[$__rate_interval])))' % HI_WFT, "SERVER (history), s -> ms")]),
 
     dict(title="Workflow task failures by reason", unit=RPS, stack=True,
          desc="Core's failure_reason vocabulary, read from the source rather than "
@@ -502,13 +555,17 @@ signals = grid([
               "Falling toward 0 means workers keep rebuilding state from history "
               "instead of resuming from cache. Look at forced evictions and "
               "MaxCachedWorkflows next.",
-         # The `or vector(0)` on the MISS term is load-bearing, not decorative.
-         # Core creates a metric on first increment, so on a worker that has never
-         # had a cache miss temporal_sticky_cache_miss does not exist at all -- and
-         # in PromQL `A + B` where B is empty yields EMPTY, not A. Without the
-         # fallback the whole ratio silently vanishes on exactly the healthy worker
-         # you would expect to read 1.0.
-         exprs=[('sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) / clamp_min(sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) + (sum(rate(temporal_sticky_cache_miss%s[$__rate_interval])) or vector(0)), 1e-9)' % (SDK, SDK, SDK), "hit ratio")]),
+         # Every `or vector(0)` here is load-bearing, not decorative. Core creates
+         # a metric on first increment, so on a worker that has never had a cache
+         # miss temporal_sticky_cache_miss does not exist at all -- and in PromQL
+         # `A + B` where B is empty yields EMPTY, not A. Without the fallback the
+         # whole ratio silently vanishes on exactly the healthy worker you would
+         # expect to read 1.0. The HIT term needs it just as much and in both
+         # positions: a worker whose cache has only ever missed (cold start, or
+         # MaxCachedWorkflows=0) has no hit series, and an empty NUMERATOR empties
+         # the division too -- blanking the panel on the one worker whose 0.0 you
+         # most wanted to see.
+         exprs=[('(sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) or vector(0)) / clamp_min((sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) or vector(0)) + (sum(rate(temporal_sticky_cache_miss%s[$__rate_interval])) or vector(0)), 1e-9)' % (SDK, SDK, SDK), "hit ratio")]),
     dict(title="Sticky cache hits and misses /s", unit=RPS,
          desc="The two series behind the ratio. A miss is a workflow task that "
               "arrived for a workflow this worker no longer had cached -- it had "
@@ -528,7 +585,11 @@ signals = grid([
               "proxy, not an exact quantity: toward 1.0 means most tasks are "
               "rebuilding state instead of resuming from cache. Now that a real "
               "hit ratio exists two panels up, treat this as corroboration.",
-         exprs=[('sum(rate(temporal_workflow_task_replay_latency_count%s[$__rate_interval])) / clamp_min(sum(rate(temporal_workflow_task_execution_latency_count%s[$__rate_interval])), 1e-9)' % (SDK, SDK), "replay/exec")]),
+         # Replay latency does not exist until the first replay. On a worker whose
+         # sticky cache has never missed, the unguarded numerator empties the whole
+         # ratio and the panel reads "No data" instead of the 0.0 that is the
+         # actual, and good, answer.
+         exprs=[('(sum(rate(temporal_workflow_task_replay_latency_count%s[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(temporal_workflow_task_execution_latency_count%s[$__rate_interval])), 1e-9)' % (SDK, SDK), "replay/exec")]),
 
     dict(title="Activity retried but recovered /s", unit=RPS,
          desc="activity_task_fail counts every failed attempt; activity_fail "
@@ -612,10 +673,33 @@ heartbeat = grid([
               "  A  what the activity code asks for (config)\n"
               "  B  what Core enforces (the app computes and echoes the formula)\n"
               "  C  HeartbeatTimeout -- the cliff\n"
-              "  D  what actually reaches the server:\n"
-              "       running activities / heartbeat RPCs per second\n\n"
-              "Read it: D should sit on B, nowhere near A. When D climbs toward "
-              "C you are about to get a heartbeat timeout.\n\n"
+              "  D  the mean gap between the heartbeat RPCs that actually reach "
+              "the server, per running activity:\n"
+              "       1000 * running activities / heartbeat RPCs per second\n\n"
+              "WHAT D IS, EXACTLY -- because it is NOT a measurement of B and it "
+              "does not sit on B. An attempt sends one heartbeat immediately and "
+              "then at most one per throttle interval, so over an attempt "
+              "lifetime L it emits about 1 + L/B RPCs; running activities is L "
+              "times the attempt start rate (Little's law), and the two rates "
+              "cancel to D = B * (L/B) / (1 + L/B). That is always BELOW B, and "
+              "it only approaches B as attempts get long: L = B reads B/2, L = 9B "
+              "reads 0.9B. The shipped config runs attempts for many multiples "
+              "of the throttle interval, so D lands just under B -- but shorten "
+              "the activity and D drops with nothing wrong. Read D as a LOWER "
+              "BOUND on the throttle, not as the throttle. Its numerator is an "
+              "instantaneous "
+              "gauge and its denominator a rate over the whole rate interval, so "
+              "a few percent of sampling jitter is normal and D can cross B for a "
+              "scrape or two.\n\n"
+              "Read it: D up near B and far above A is the throttle doing its job "
+              "-- the activity asks every A ms and the server hears one every "
+              "~B ms. D climbing toward C means heartbeats are arriving too "
+              "slowly and a heartbeat timeout is coming. D VANISHING means no "
+              "heartbeat RPC reached the server in the window at all, which is "
+              "what fault.stopHeartbeating looks like: the `and rate > 0` guard "
+              "drops the series on purpose rather than dividing by ~0 and "
+              "spiking to ~1e12 ms, which would autoscale A, B and C into one "
+              "flat line at the bottom exactly when you need to read them.\n\n"
               "A, B and C are static config echoed as gauges from the ACTIVITY "
               "meter, not the runtime meter -- the runtime meter has no root "
               "tags, so those series would carry no namespace and the "
@@ -623,7 +707,13 @@ heartbeat = grid([
          exprs=[('max(%sheartbeat_call_interval_ms%s) or vector(0)' % (CUSTOM, SDK), "A: configured call interval"),
                 ('max(%sheartbeat_throttle_ms%s) or vector(0)' % (CUSTOM, SDK), "B: Core throttle = min(HeartbeatTimeout*0.8, MaxHeartbeatThrottleInterval)"),
                 ('max(%sheartbeat_timeout_ms%s) or vector(0)' % (CUSTOM, SDK), "C: HeartbeatTimeout (the cliff)"),
-                ('1000 * sum(temporal_worker_task_slots_used%s) / clamp_min(sum(rate(temporal_request%s[$__rate_interval])), 1e-9)' % (sdk('worker_type="ActivityWorker"'), sdk('operation="RecordActivityTaskHeartbeat"')), "D: observed interval per activity")]),
+                # No clamp_min here on purpose. clamp_min(rate, 1e-9) never
+                # divides by zero, but that is the bug, not the fix: when
+                # heartbeats stop the guard yields ~1e12 ms and Grafana's
+                # autoscale flattens A, B and C. `and rate > 0` yields NO SERIES
+                # instead -- the honest answer to "what is the mean gap between
+                # events that did not happen".
+                ('(1000 * sum(temporal_worker_task_slots_used%s) / sum(rate(temporal_request%s[$__rate_interval]))) and (sum(rate(temporal_request%s[$__rate_interval])) > 0)' % (sdk('worker_type="ActivityWorker"'), sdk('operation="RecordActivityTaskHeartbeat"'), sdk('operation="RecordActivityTaskHeartbeat"')), "D: observed gap per activity (lower bound on B)")]),
 
     dict(title="Heartbeat calls vs heartbeat RPCs /s", unit=RPS,
          desc="The throttle, seen from the other side. repro_heartbeat_sent is "
@@ -701,13 +791,16 @@ heartbeat = grid([
          exprs=[('histogram_quantile(0.50, sum by (le, activity_type) (rate(temporal_activity_execution_latency_bucket%s[$__rate_interval])))' % SDK, "{{activity_type}} p50"),
                 ('histogram_quantile(0.95, sum by (le, activity_type) (rate(temporal_activity_execution_latency_bucket%s[$__rate_interval])))' % SDK, "{{activity_type}} p95")]),
     dict(title="Activity schedule-to-start p95, SDK vs server", unit=MS, minval=0,
-         desc="Two independent views of how long an activity task sat in the "
+         desc="Two independent views of how long an ACTIVITY task sat in the "
               "queue. The server series is multiplied by 1000: server timers are "
               "seconds, Core histograms are milliseconds. Both need the "
               "schedule-to-start bucket override on the SDK side; the server's "
-              "buckets are tally's and are fine.",
+              "buckets are tally's and are fine.\n\n"
+              "The server histogram is shared by both task types, so it is pinned "
+              "to task_type=\"Activity\" here -- unpinned it also plots workflow "
+              "tasks, which the SDK series opposite it does not measure.",
          exprs=[('histogram_quantile(0.95, sum by (le) (rate(temporal_activity_schedule_to_start_latency_bucket%s[$__rate_interval])))' % SDK, "SDK (worker), ms"),
-                ('1000 * histogram_quantile(0.95, sum by (le, task_type) (rate(task_schedule_to_start_latency_bucket%s[$__rate_interval])))' % HI, "SERVER {{task_type}}, s -> ms")]),
+                ('1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket%s[$__rate_interval])))' % HI_ACT, "SERVER (history), s -> ms")]),
 
     dict(title="Attempts resuming from a checkpoint", unit=RATIO, minval=0,
          desc="Fraction of activity attempts that started from a heartbeat detail "
@@ -717,7 +810,13 @@ heartbeat = grid([
               "In .NET there is no HasHeartbeatDetails helper -- the app checks "
               "ctx.Info.HeartbeatDetails.Count > 0 and tags this counter with the "
               "answer. HeartbeatDetailAtAsync<T>(0) throws if you skip the check.",
-         exprs=[('sum(rate(%sactivity_started%s[$__rate_interval])) / clamp_min(sum(rate(%sactivity_started%s[$__rate_interval])), 1e-9)' % (CUSTOM, sdk('resumed="true"'), CUSTOM, SDK), "resumed fraction")]),
+         # Guarding only the denominator was not enough. resumed="true" is a LABEL
+         # VALUE, and Core registers a series on first increment -- so with
+         # fault.failureRate 0 nothing ever increments it and the numerator series
+         # does not exist. Empty / anything is EMPTY in PromQL, so the panel read
+         # "No data" in precisely the healthy state whose 0 the description above
+         # promises.
+         exprs=[('(sum(rate(%sactivity_started%s[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(%sactivity_started%s[$__rate_interval])), 1e-9)' % (CUSTOM, sdk('resumed="true"'), CUSTOM, SDK), "resumed fraction")]),
     dict(title="Checkpoint staleness on resume p95", unit=MS, minval=0,
          desc="How much work gets redone. Measured in the activity as "
               "now - checkpoint.RecordedAtUtc at the moment of resume, which "

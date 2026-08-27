@@ -74,8 +74,11 @@ foreach (var file in files)
     if (result.ReplayFailure is { } failure)
     {
         // Non-determinism arrives as WorkflowNondeterminismException, a subclass of
-        // InvalidWorkflowOperationException. There is NO TMPRL1100-style error code
-        // in .NET -- that is a Go SDK convention. Match on the type, never on text.
+        // InvalidWorkflowOperationException. MEASURED: the message DOES carry
+        // [TMPRL1100] -- it is not a Go-only convention. The string is built by the
+        // Rust Core, not by the managed SDK, so you will not find it anywhere in
+        // sdk-dotnet and cannot grep your way to that conclusion. Match on the TYPE
+        // anyway: the code travels with a message Core is free to reword.
         log.LogError("replay FAILED: {File}\n{Failure}", file, failure);
         failed++;
     }

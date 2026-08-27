@@ -26,7 +26,7 @@
           "type": "prometheus",
           "uid": "sandbox-prometheus"
         },
-        "query": "label_values(temporal_request, namespace)",
+        "query": "label_values(temporal_request{service_name=\"temporal-core-sdk\"}, namespace)",
         "refresh": 1,
         "includeAll": false,
         "multi": false,
@@ -182,7 +182,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Heartbeat interval: asked for vs throttled vs observed",
-      "description": "The most educational panel in this repo. It makes an invisible algorithm visible.\n\nCore throttles heartbeats to min(HeartbeatTimeout * 0.8, MaxHeartbeatThrottleInterval), falling back to DefaultHeartbeatThrottleInterval when the timeout is 0 or unset. It sends immediately, then suppresses until the interval elapses, then sends the LATEST buffered details. So calling Heartbeat() every 100 ms does not send 10 RPCs a second, and the SDK docs say only 'users do not have to be concerned with burdening the server', which tells you nothing about what you will actually see.\n\nFour series:\n  A  what the activity code asks for (config)\n  B  what Core enforces (the app computes and echoes the formula)\n  C  HeartbeatTimeout -- the cliff\n  D  what actually reaches the server:\n       running activities / heartbeat RPCs per second\n\nRead it: D should sit on B, nowhere near A. When D climbs toward C you are about to get a heartbeat timeout.\n\nA, B and C are static config echoed as gauges from the ACTIVITY meter, not the runtime meter -- the runtime meter has no root tags, so those series would carry no namespace and the $namespace selector would drop them silently.",
+      "description": "The most educational panel in this repo. It makes an invisible algorithm visible.\n\nCore throttles heartbeats to min(HeartbeatTimeout * 0.8, MaxHeartbeatThrottleInterval), falling back to DefaultHeartbeatThrottleInterval when the timeout is 0 or unset. It sends immediately, then suppresses until the interval elapses, then sends the LATEST buffered details. So calling Heartbeat() every 100 ms does not send 10 RPCs a second, and the SDK docs say only 'users do not have to be concerned with burdening the server', which tells you nothing about what you will actually see.\n\nFour series:\n  A  what the activity code asks for (config)\n  B  what Core enforces (the app computes and echoes the formula)\n  C  HeartbeatTimeout -- the cliff\n  D  the mean gap between the heartbeat RPCs that actually reach the server, per running activity:\n       1000 * running activities / heartbeat RPCs per second\n\nWHAT D IS, EXACTLY -- because it is NOT a measurement of B and it does not sit on B. An attempt sends one heartbeat immediately and then at most one per throttle interval, so over an attempt lifetime L it emits about 1 + L/B RPCs; running activities is L times the attempt start rate (Little's law), and the two rates cancel to D = B * (L/B) / (1 + L/B). That is always BELOW B, and it only approaches B as attempts get long: L = B reads B/2, L = 9B reads 0.9B. The shipped config runs attempts for many multiples of the throttle interval, so D lands just under B -- but shorten the activity and D drops with nothing wrong. Read D as a LOWER BOUND on the throttle, not as the throttle. Its numerator is an instantaneous gauge and its denominator a rate over the whole rate interval, so a few percent of sampling jitter is normal and D can cross B for a scrape or two.\n\nRead it: D up near B and far above A is the throttle doing its job -- the activity asks every A ms and the server hears one every ~B ms. D climbing toward C means heartbeats are arriving too slowly and a heartbeat timeout is coming. D VANISHING means no heartbeat RPC reached the server in the window at all, which is what fault.stopHeartbeating looks like: the `and rate > 0` guard drops the series on purpose rather than dividing by ~0 and spiking to ~1e12 ms, which would autoscale A, B and C into one flat line at the bottom exactly when you need to read them.\n\nA, B and C are static config echoed as gauges from the ACTIVITY meter, not the runtime meter -- the runtime meter has no root tags, so those series would carry no namespace and the $namespace selector would drop them silently.",
       "datasource": {
         "type": "prometheus",
         "uid": "sandbox-prometheus"
@@ -223,12 +223,12 @@
         },
         {
           "refId": "D",
-          "expr": "1000 * sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\"}) / clamp_min(sum(rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])), 1e-9)",
+          "expr": "(1000 * sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\"}) / sum(rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval]))) and (sum(rate(temporal_request{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",operation=\"RecordActivityTaskHeartbeat\"}[$__rate_interval])) > 0)",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"
           },
-          "legendFormat": "D: observed interval per activity"
+          "legendFormat": "D: observed gap per activity (lower bound on B)"
         }
       ],
       "fieldConfig": {
@@ -730,7 +730,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Activity schedule-to-start p95, SDK vs server",
-      "description": "Two independent views of how long an activity task sat in the queue. The server series is multiplied by 1000: server timers are seconds, Core histograms are milliseconds. Both need the schedule-to-start bucket override on the SDK side; the server's buckets are tally's and are fine.",
+      "description": "Two independent views of how long an ACTIVITY task sat in the queue. The server series is multiplied by 1000: server timers are seconds, Core histograms are milliseconds. Both need the schedule-to-start bucket override on the SDK side; the server's buckets are tally's and are fine.\n\nThe server histogram is shared by both task types, so it is pinned to task_type=\"Activity\" here -- unpinned it also plots workflow tasks, which the SDK series opposite it does not measure.",
       "datasource": {
         "type": "prometheus",
         "uid": "sandbox-prometheus"
@@ -753,12 +753,12 @@
         },
         {
           "refId": "B",
-          "expr": "1000 * histogram_quantile(0.95, sum by (le, task_type) (rate(task_schedule_to_start_latency_bucket{service_name=\"history\"}[$__rate_interval])))",
+          "expr": "1000 * histogram_quantile(0.95, sum by (le) (rate(task_schedule_to_start_latency_bucket{service_name=\"history\",task_type=\"Activity\"}[$__rate_interval])))",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"
           },
-          "legendFormat": "SERVER {{task_type}}, s -> ms"
+          "legendFormat": "SERVER (history), s -> ms"
         }
       ],
       "fieldConfig": {
@@ -812,7 +812,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",resumed=\"true\"}[$__rate_interval])) / clamp_min(sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
+          "expr": "(sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",resumed=\"true\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(repro_activity_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"

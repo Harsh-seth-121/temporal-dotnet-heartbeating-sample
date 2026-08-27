@@ -26,10 +26,12 @@ namespace Repro.Starter.Telemetry;
 /// is the point of this repo:
 /// </para>
 /// <para>
-/// 1. MeterAdapter PREPENDS the Meter's name to every metric. Naming the meter
-/// "temporal" and setting MetricPrefix = "" makes those cancel out to canonical
-/// temporal_* names. Any other combination gives you temporal_temporal_request or
-/// my_meter_temporal_request.
+/// 1. MeterAdapter PREPENDS the Meter's name to every metric, and Core's own
+/// "temporal_" prefix cannot be switched off (see MetricPrefix below), so the
+/// pushed names are DOUBLE prefixed: temporal_temporal_request_latency. The meter
+/// is still named "temporal" so that the doubled half is a known constant rather
+/// than my_meter_temporal_request; the duplicate is stripped at scrape time by the
+/// metric_relabel_configs on the pushgateway job in prometheus.yml, not here.
 /// </para>
 /// <para>
 /// 2. MeterAdapter renders EVERY counter as a Prometheus gauge, deliberately: a
@@ -71,9 +73,9 @@ public sealed class PushMetrics : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(config);
 
-        // Named "temporal" so that MeterAdapter's prepending, combined with
-        // MetricPrefix = "" below, produces exactly temporal_request rather than
-        // temporal_temporal_request.
+        // Named "temporal" so the segment MeterAdapter prepends is a predictable
+        // "temporal_". It does NOT cancel Core's own prefix out — that was the plan
+        // and it is not expressible; see MetricPrefix below.
         var meter = new Meter("temporal");
 
         var registry = Metrics.NewCustomRegistry();
@@ -103,9 +105,10 @@ public sealed class PushMetrics : IAsyncDisposable
 
             // prometheus-net's default is ExponentialBuckets(0.01, 2, 25) — seconds-
             // shaped. Core emits integer MILLISECONDS, so every latency would land
-            // in the far tail. Note the lookup key here is the UNPREFIXED instrument
-            // name, because MetricPrefix is "" on this path; the scrape path keys the
-            // same table by the prefixed name.
+            // in the far tail. The key is Instrument.Name, i.e. Core's name WITH its
+            // "temporal_" prefix — MeterAdapter's own prepending happens later, on
+            // the registry side, and the resolver never sees it. HistogramBuckets
+            // keys its table that way for both paths.
             ResolveHistogramBuckets = i => HistogramBuckets.ForInstrument(i.Name),
         });
 
@@ -181,17 +184,22 @@ public sealed class PushMetrics : IAsyncDisposable
         return new PushMetrics(config, meter, adapter, pusher, runtime, log);
     }
 
-    /// <summary>Settle, stop listening, then perform the guaranteed final push.</summary>
+    /// <summary>Settle, push, THEN stop listening. That order is the whole trick.</summary>
     /// <remarks>
-    /// Ordering is the whole trick, and it is the C# analogue of the Go original's
-    /// `defer flush()` registered BEFORE `defer c.Close()` so that LIFO runs it last.
-    /// Here, declaring this object as the FIRST `await using` in Program.cs makes it
-    /// dispose LAST — after the Temporal client is gone.
+    /// The settle delay is doing all the work, and it is the genuinely fragile part.
+    /// Core buffers metric updates and delivers them to the custom meter on its own
+    /// threads, and it exposes no flush API. Push too early and the starter's final
+    /// temporal_request samples are simply absent from the group, with no error to
+    /// tell you. The Go original got this structurally instead, from `defer flush()`
+    /// registered before `defer c.Close()`; there is no C# equivalent to lean on,
+    /// because Temporalio 1.18.0's client is not IDisposable and never gets disposed.
     /// <para>
-    /// The settle delay is the genuinely fragile part. Core buffers metric updates
-    /// and delivers them to the custom meter on its own threads, and it exposes no
-    /// flush API. Push too early and the starter's final temporal_request samples are
-    /// simply absent from the group, with no error to tell you.
+    /// adapter.Dispose() therefore happens AFTER the push, not before. Disposing it
+    /// removes MeterAdapter's before-collect callback from the registry, and that
+    /// callback is what drives MeterListener.RecordObservableInstruments — i.e. what
+    /// makes every ObservableGauge (all of Core's gauges, and every custom
+    /// Gauge&lt;long&gt;) produce a value at collect time. Dispose first and the final
+    /// push carries stale gauges, or none at all.
     /// </para>
     /// </remarks>
     public async ValueTask DisposeAsync()
@@ -201,8 +209,6 @@ public sealed class PushMetrics : IAsyncDisposable
             await Task.Delay(config.PushSettle).ConfigureAwait(false);
         }
 
-        adapter.Dispose();
-
         // StopAsync cancels the pusher's loop and awaits it; the loop is written to
         // perform exactly one more full push after cancellation before exiting. That
         // is the only "push now" guarantee prometheus-net offers — there is no
@@ -210,6 +216,7 @@ public sealed class PushMetrics : IAsyncDisposable
         await pusher.StopAsync().ConfigureAwait(false);
         log($"pushgateway: pushed job={config.PushJob} instance={config.PushInstance}");
 
+        adapter.Dispose();
         meter.Dispose();
     }
 

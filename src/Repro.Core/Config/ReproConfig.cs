@@ -103,6 +103,22 @@ public sealed class JobConfig
     public TimeSpan StepDuration { get; set; } = TimeSpan.FromSeconds(1);
 }
 
+/// <summary>The timeouts and retry policy the workflow schedules the activity with.</summary>
+/// <remarks>
+/// NOT WIRED YET, and the only block in <see cref="ReproConfig"/> that is not the
+/// source of truth for what it names. HeartbeatWorkflow builds its ActivityOptions
+/// from JobInput.Activity rather than from here, deliberately: options carried in the
+/// input are recorded in the history, so a replay reproduces them byte for byte,
+/// while a file that can be edited between the original execution and the replay
+/// cannot promise that. ActivityOptionsInput.From projects this class onto that
+/// input, but no call site does so yet, so the workflow falls back to
+/// ActivityOptionsInput's defaults — which are exactly the values below.
+/// <para>
+/// The consequence to know before you debug: today
+/// <see cref="HeartbeatTimeout"/> and <see cref="StartToCloseTimeout"/> only affect
+/// what ConfigLoader.Validate refuses to start on, and the other two affect nothing.
+/// </para>
+/// </remarks>
 public sealed class ActivityConfig
 {
     /// <summary>
@@ -159,6 +175,11 @@ public sealed class WorkerConfig
     public int MaxCachedWorkflows { get; set; }
 
     /// <summary>0 leaves the SDK default (100). Mutually exclusive with a Tuner, which this repo does not set.</summary>
+    /// <remarks>
+    /// Applied by Repro.Worker AND Repro.LoadGen. The loadgen used to drop both slot
+    /// counts on the floor, so :8078 ran at 100/100 whatever this file said and the
+    /// slot-saturation panels could only ever be driven from the :8077 worker.
+    /// </remarks>
     public int MaxConcurrentActivities { get; set; }
 
     public int MaxConcurrentWorkflowTasks { get; set; }
@@ -195,6 +216,14 @@ public sealed class LoadgenConfig
 public sealed class FaultConfig
 {
     /// <summary>Fraction of activity ATTEMPTS that throw a retryable failure. 0-1.</summary>
+    /// <remarks>
+    /// ONE roll per attempt, outside the step loop, so P(this attempt fails) IS this
+    /// number. That makes P(the WORKFLOW fails) FailureRate ^ maximumAttempts —
+    /// 0.15^5, roughly one in thirteen thousand — which is why the shipped 0.15
+    /// produces an outcome split that is entirely `completed`. Rolling per step
+    /// instead would give 1 - (1 - r)^steps, i.e. 99.99% at the shipped steps: 60,
+    /// and every workflow would die terminally.
+    /// </remarks>
     public double FailureRate { get; set; }
 
     /// <summary>Added to every step.</summary>
@@ -206,12 +235,25 @@ public sealed class FaultConfig
     /// out, and we keep running, because the only channel the server has to tell us
     /// is the response to a heartbeat RPC and we are not sending any.
     /// </summary>
+    /// <remarks>
+    /// It moves activity_task_timeout{timeout_type="Heartbeat"} and NOTHING ELSE.
+    /// Attempt 2 is not gated, runs normally and succeeds, so the workflow outcome
+    /// stays `completed`. For an outcome of timed_out you want
+    /// <see cref="StopHeartbeating"/>, which starves every attempt.
+    /// </remarks>
     public bool StallPastHeartbeatTimeout { get; set; }
 
     /// <summary>
     /// Keep doing work but never call Heartbeat(). Proves an activity that stops
     /// heartbeating can never be cancelled.
     /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="StallPastHeartbeatTimeout"/> this is not gated to attempt 1,
+    /// so all of activity.retry.maximumAttempts heartbeat-time-out, the retry policy
+    /// is exhausted, and the terminal failure really is
+    /// ActivityFailure -> TimeoutFailure{Heartbeat}. This is the knob that moves the
+    /// outcome split to timed_out.
+    /// </remarks>
     public bool StopHeartbeating { get; set; }
 
     /// <summary>

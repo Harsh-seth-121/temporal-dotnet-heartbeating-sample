@@ -26,7 +26,7 @@
           "type": "prometheus",
           "uid": "sandbox-prometheus"
         },
-        "query": "label_values(temporal_request, namespace)",
+        "query": "label_values(temporal_request{service_name=\"temporal-core-sdk\"}, namespace)",
         "refresh": 1,
         "includeAll": false,
         "multi": false,

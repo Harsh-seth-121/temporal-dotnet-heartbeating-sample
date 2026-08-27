@@ -130,7 +130,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(poll_success_sync[$__rate_interval])) / clamp_min(sum(rate(poll_success[$__rate_interval])), 1e-9)",
+          "expr": "(sum(rate(poll_success_sync[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(poll_success[$__rate_interval])), 1e-9)",
           "datasource": {
             "type": "prometheus",
             "uid": "sandbox-prometheus"
@@ -396,7 +396,7 @@
       "id": 8,
       "type": "timeseries",
       "title": "Server-side schedule-to-start p95",
-      "description": "History service's own view, in seconds. Compare with the SDK's view on the Signals board -- that panel converts this series to milliseconds so the two are comparable. Sustained divergence means clock skew or dispatch loss.",
+      "description": "History service's own view, in seconds. Broken out by task_type because this is ONE histogram covering both Workflow and Activity tasks -- the SDK has a separate metric per type. Compare with the SDK's view on the Signals board, which converts this series to milliseconds AND pins task_type=\"Workflow\" so the two sides measure the same thing. Sustained divergence means clock skew or dispatch loss.",
       "datasource": {
         "type": "prometheus",
         "uid": "sandbox-prometheus"

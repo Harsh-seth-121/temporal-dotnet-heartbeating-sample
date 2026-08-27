@@ -60,6 +60,15 @@ job:
   steps: 60
   stepDuration: 1s
 
+# NOT WIRED YET, and this is the one block in this file that is not the source of
+# truth. HeartbeatWorkflow builds its ActivityOptions from JobInput.Activity, on
+# purpose: options carried in the input are recorded in the history, so a replay
+# reproduces them byte for byte. ActivityOptionsInput.From(config.Activity) exists to
+# project this block onto that input, but the starter and loadgen do not call it yet,
+# so the workflow falls back to ActivityOptionsInput's defaults -- which are exactly
+# the values below, which is why nothing looks wrong until you edit one. Editing
+# heartbeatTimeout or startToCloseTimeout today only changes what ConfigLoader.Validate
+# refuses to start on.
 activity:
   # REQUIRED for the activity to receive cancellation at all -- the server only
   # communicates cancellation in the RESPONSE to a heartbeat RPC.
@@ -106,20 +115,30 @@ loadgen:
 # first run. The three heartbeat knobs are OFF: each one proves a specific claim and
 # is meant to be turned on ONE AT A TIME while watching a named panel.
 fault:
-  failureRate: 0.15     # fraction of activity ATTEMPTS that fail (retryable)
-  latency: 150ms        # added to every step
+  # ONE roll per ATTEMPT, not per step: P(this attempt fails) IS this number. A
+  # workflow therefore only fails when all activity.retry.maximumAttempts rolls come
+  # up failure -- 0.15^5, about one in thirteen thousand -- so at 0.15 the signals
+  # board's outcome split is all `completed` and that is correct. Raise this to ~0.8
+  # if you want to watch `failed`.
+  failureRate: 0.15
+  latency: 150ms        # added to every step, and included in repro_heartbeat_call_interval_ms
 
   # Sleep past heartbeatTimeout without heartbeating, on attempt 1 only. Two things
   # happen in order and both are the point: the server times the ATTEMPT out, and we
   # keep running anyway, because the only channel it has to tell us is the response
   # to a heartbeat RPC and we are not sending any.
-  # Panel: heartbeat board "Heartbeat timeouts"; signals board outcome -> timed_out.
+  # Panel: heartbeat board "Heartbeat timeouts", and NOTHING ELSE. Attempt 2 is not
+  # gated, runs normally and succeeds, so the workflow still ends `completed`. If you
+  # came here looking for outcome -> timed_out, that is stopHeartbeating, below.
   stallPastHeartbeatTimeout: false
 
   # Keep doing work but never call Heartbeat(). Proves an activity that stops
   # heartbeating can never be cancelled.
   # Panel: heartbeat board "Heartbeat calls vs heartbeat RPCs" -- both fall to zero
-  # while repro_activity_progress keeps climbing.
+  # while repro_activity_progress keeps climbing. Unlike stallPastHeartbeatTimeout
+  # this is not gated to attempt 1, so all five attempts heartbeat-time-out, the
+  # retry policy is exhausted, and THIS is the knob that moves the signals board's
+  # outcome split to timed_out.
   stopHeartbeating: false
 
   # Swallow OperationCanceledException and finish the batch on an uncancellable

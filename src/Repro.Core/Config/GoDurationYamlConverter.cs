@@ -21,7 +21,16 @@ public sealed class GoDurationYamlConverter : IYamlTypeConverter
         var scalar = parser.Consume<Scalar>();
         if (scalar.Value.Length == 0)
         {
-            return type == typeof(TimeSpan?) ? null : TimeSpan.Zero;
+            // GOTCHA: `latency:` with nothing after it is an EMPTY SCALAR, not an
+            // absent key — the property is still assigned, so returning TimeSpan.Zero
+            // here overwrote the POCO default with 0s and the run looked configured.
+            // GoDuration.Parse("") is itself an error, and the loader's whole policy is
+            // that a config mistake stops the process instead of picking a value.
+            throw new YamlException(
+                scalar.Start,
+                scalar.End,
+                "empty duration. A key with no value REPLACES the default with 0s rather than leaving " +
+                "it alone. Write \"0s\" if you mean zero, or delete the key.");
         }
 
         return GoDuration.Parse(scalar.Value);

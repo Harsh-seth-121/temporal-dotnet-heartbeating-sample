@@ -20,38 +20,63 @@ namespace Repro.Core.Workflows;
 [Workflow]
 public class HeartbeatWorkflow
 {
-    /// <summary>Activity options, built here so the workflow owns its own timeouts.</summary>
+    /// <summary>Activity options, built from the values the input carried in.</summary>
     /// <remarks>
-    /// These are literals rather than config reads ON PURPOSE. Reading mutable
-    /// process state from workflow code is a determinism violation: change the file,
-    /// replay an old history, and the commands no longer match. The Go original
-    /// carried the same warning.
+    /// GOTCHA, and this is the one people get backwards. Config is not banned from
+    /// workflow code because it is "mutable process state". It is banned because a
+    /// REPLAY of an old history has to emit byte-identical commands, and a file that
+    /// can be edited between the original execution and the replay cannot promise
+    /// that. Activity options are captured into the history as a
+    /// ScheduleActivityTask command at the moment the activity is scheduled, so they
+    /// only have to be stable FOR ONE EXECUTION — and options that arrive in the
+    /// INPUT are stable by construction, because replay reads back the same bytes it
+    /// wrote. Threading them through the input is the Temporal idiom for a
+    /// configurable timeout; it removes the determinism objection instead of
+    /// arguing with it, and it is what makes <c>activity:</c> in config.yaml live.
+    /// <para>
+    /// A null <c>activity</c> means an input that predates the field. The fallback
+    /// defaults on <see cref="ActivityOptionsInput"/> are the literals this method
+    /// used to hard-code, so those older histories still replay clean.
+    /// </para>
     /// </remarks>
-    internal static ActivityOptions BuildActivityOptions() => new()
+    internal static ActivityOptions BuildActivityOptions(ActivityOptionsInput? activity)
     {
-        StartToCloseTimeout = TimeSpan.FromMinutes(10),
-        ScheduleToCloseTimeout = TimeSpan.FromHours(1),
+        var a = activity ?? new ActivityOptionsInput();
 
-        // REQUIRED for the activity to receive cancellation at all. The server only
-        // communicates cancellation in the RESPONSE to a heartbeat RPC, so an
-        // activity with no heartbeat timeout and no Heartbeat() calls can never be
-        // cancelled by anything except worker shutdown.
-        HeartbeatTimeout = TimeSpan.FromSeconds(5),
-
-        RetryPolicy = new RetryPolicy
+        return new ActivityOptions
         {
-            InitialInterval = TimeSpan.FromSeconds(1),
-            BackoffCoefficient = 2.0F,
-            MaximumInterval = TimeSpan.FromSeconds(10),
-            MaximumAttempts = 5,
-        },
+            StartToCloseTimeout = TimeSpan.FromMilliseconds(a.StartToCloseTimeoutMs),
+            ScheduleToCloseTimeout = TimeSpan.FromMilliseconds(a.ScheduleToCloseTimeoutMs),
 
-        // Without this the workflow reports cancelled the instant it asks, before
-        // the activity has observed anything, and the whole demo is hollow: you
-        // never see the activity honour the request. WaitCancellationCompleted makes
-        // the workflow wait for the activity to actually finish unwinding.
-        CancellationType = ActivityCancellationType.WaitCancellationCompleted,
-    };
+            // REQUIRED for the activity to receive cancellation at all. The server only
+            // communicates cancellation in the RESPONSE to a heartbeat RPC, so an
+            // activity with no heartbeat timeout and no Heartbeat() calls can never be
+            // cancelled by anything except worker shutdown. ConfigLoader.Validate
+            // rejects a zero or missing activity.heartbeatTimeout for that reason.
+            HeartbeatTimeout = TimeSpan.FromMilliseconds(a.HeartbeatTimeoutMs),
+
+            RetryPolicy = new RetryPolicy
+            {
+                InitialInterval = TimeSpan.FromMilliseconds(a.RetryInitialIntervalMs),
+
+                // float, not double — Temporalio.Common.RetryPolicy takes a float and
+                // config.yaml's 2.0 is parsed as a double.
+                BackoffCoefficient = (float)a.RetryBackoffCoefficient,
+                MaximumInterval = TimeSpan.FromMilliseconds(a.RetryMaximumIntervalMs),
+                MaximumAttempts = a.RetryMaximumAttempts,
+            },
+
+            // Without this the workflow reports cancelled the instant it asks, before
+            // the activity has observed anything, and the whole demo is hollow: you
+            // never see the activity honour the request. WaitCancellationCompleted makes
+            // the workflow wait for the activity to actually finish unwinding.
+            //
+            // Deliberately NOT configurable: every cancellation panel and every
+            // README recipe assumes it, and the two other values turn those into
+            // silently empty panels rather than a different demo.
+            CancellationType = ActivityCancellationType.WaitCancellationCompleted,
+        };
+    }
 
     [WorkflowRun]
     public async Task<int> RunAsync(JobInput input)
@@ -70,7 +95,7 @@ public class HeartbeatWorkflow
         {
             completed = await Workflow.ExecuteActivityAsync(
                 (HeartbeatActivities a) => a.ProcessBatchAsync(input),
-                BuildActivityOptions()).ConfigureAwait(true);
+                BuildActivityOptions(input.Activity)).ConfigureAwait(true);
         }
         catch (Exception e)
         {
@@ -101,6 +126,12 @@ public class HeartbeatWorkflow
         // A heartbeat timeout is NOT a generic failure and lumping it in with one
         // hides the most interesting thing this repo can show you. The chain is
         // ActivityFailureException -> TimeoutFailureException{TimeoutType.Heartbeat}.
+        //
+        // Reaching here at all takes an attempt that heartbeat-times-out and keeps
+        // doing so until retries are EXHAUSTED, which in practice means
+        // fault.stopHeartbeating. fault.stallPastHeartbeatTimeout only stalls attempt
+        // 1, so attempt 2 completes and the outcome is `completed` — see the fault
+        // comments in HeartbeatActivities.
         if (e is ActivityFailureException
             {
                 InnerException: TimeoutFailureException { TimeoutType: TimeoutType.Heartbeat },

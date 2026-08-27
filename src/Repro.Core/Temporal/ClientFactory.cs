@@ -35,10 +35,18 @@ public static class ClientFactory
         {
             options.ApiKey = config.ApiKey;
 
-            // REQUIRED even though it is empty. TlsOptions must be non-null for TLS
-            // to be enabled at all; an API key over a plaintext connection is both a
-            // credential leak and rejected by Cloud.
-            options.Tls = new();
+            // REQUIRED even when there is nothing to put in it. TlsOptions must be
+            // non-null for TLS to be enabled at all; an API key over a plaintext
+            // connection is both a credential leak and rejected by Cloud.
+            //
+            // Domain is carried in here too, exactly as the Go original did in this
+            // same branch (config.go:140). `new()` on its own dropped tls.serverName,
+            // and an API key against a host whose cert CN differs from config.address
+            // then fails the handshake with nothing pointing back at this line.
+            options.Tls = new()
+            {
+                Domain = string.IsNullOrEmpty(config.Tls.ServerName) ? null : config.Tls.ServerName,
+            };
         }
         else if (!string.IsNullOrEmpty(config.Tls.CertPath) || !string.IsNullOrEmpty(config.Tls.KeyPath))
         {

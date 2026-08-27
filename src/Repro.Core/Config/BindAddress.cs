@@ -38,18 +38,33 @@ public static class BindAddress
                 $"{origin} is empty. PrometheusOptions.BindAddress has no default; set something like \"0.0.0.0:8077\".");
         }
 
-        // Bare port, or Go's ":8077".
-        if (s.StartsWith(':'))
+        // Bare port, or Go's ":8077". BOTH arms insist the rest is digits: a bare
+        // IPv6 also starts with ':', so an unguarded StartsWith rewrote "::1" into
+        // "0.0.0.0::1" and then blamed the result on being a hostname.
+        if (s.StartsWith(':') && IsPort(s[1..]))
         {
             s = "0.0.0.0" + s;
         }
-        else if (!s.Contains(':', StringComparison.Ordinal)
-                 && int.TryParse(s, NumberStyles.None, CultureInfo.InvariantCulture, out _))
+        else if (IsPort(s))
         {
             s = "0.0.0.0:" + s;
         }
 
         var colon = s.LastIndexOf(':');
+        if (colon < 0)
+        {
+            // GOTCHA: this used to fall straight into s[..colon] with colon == -1 and
+            // throw a raw ArgumentOutOfRangeException reading "length ('-1') must be a
+            // non-negative value" — naming neither the option nor the value. Every
+            // other failure in this method explains itself; "localhost", "off",
+            // "0.0.0.0" and "0x8077" got that instead.
+            throw new ArgumentException(
+                $"{origin}: \"{value}\" has no port. Expected host:port, e.g. \"0.0.0.0:8077\" — Core parses " +
+                "this with Rust's SocketAddr, which has no default port. The one value that is not an " +
+                "address is \"off\", and that is honoured for the --metrics FLAG only (BindAddress.IsOff), " +
+                "never for a config key.");
+        }
+
         var host = s[..colon];
         var portText = s[(colon + 1)..];
 
@@ -59,11 +74,24 @@ public static class BindAddress
             throw new ArgumentException($"{origin}: \"{value}\" has no valid port. Expected host:port, e.g. \"0.0.0.0:8077\".");
         }
 
+        // "[::]:8077" splits correctly on the last colon and the brackets survive into
+        // the return value, which is what Rust's SocketAddr wants. An UNBRACKETED IPv6
+        // does not: "::1" splits into host ":" and port "1", both nonsense. Say which
+        // thing is wrong rather than let it fail as a hostname.
+        if (host.Contains(':', StringComparison.Ordinal)
+            && !(host.StartsWith('[') && host.EndsWith(']')))
+        {
+            throw new ArgumentException(
+                $"{origin}: \"{value}\" looks like an IPv6 address without brackets. Rust's SocketAddr " +
+                "requires \"[addr]:port\", e.g. \"[::]:8077\"; without them the last colon is part of " +
+                "the address and everything after it is read as the port.");
+        }
+
         if (!IPAddress.TryParse(host.Trim('[', ']'), out var ip))
         {
             throw new ArgumentException(
                 $"{origin}: \"{value}\" must be an IP:port, not a hostname. Core parses this with Rust's " +
-                "SocketAddr and does not resolve names. Use \"0.0.0.0:{port}\".".Replace("{port}", portText, StringComparison.Ordinal));
+                $"SocketAddr and does not resolve names. Use \"0.0.0.0:{portText}\".");
         }
 
         if (IPAddress.IsLoopback(ip))
@@ -85,4 +113,8 @@ public static class BindAddress
     /// </remarks>
     public static bool IsOff(string? value) =>
         value is not null && value.Trim().Equals("off", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Digits only — no sign, no whitespace, no "0x". The range check happens later.</summary>
+    private static bool IsPort(string text) =>
+        text.Length > 0 && int.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out _);
 }

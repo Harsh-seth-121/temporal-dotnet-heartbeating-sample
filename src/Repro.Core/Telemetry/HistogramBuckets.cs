@@ -10,24 +10,28 @@ namespace Repro.Core.Telemetry;
 /// le=50, so every observation lands in one bucket and histogram_quantile
 /// interpolates p95 to a flat ~47ms forever.
 /// <para>
-/// ONE table, TWO lookup shapes, because the scrape path and the push path key
-/// differently.
+/// ONE table, ONE key shape — the PREFIXED name — but TWO match semantics, and a
+/// key has to satisfy both at once.
 /// </para>
 /// <para>
 /// SCRAPE (PrometheusOptions.HistogramBucketOverrides). Core matches with
 /// metric_name.Contains(key) against the ALREADY PREFIXED name, and iterates the
-/// map in NONDETERMINISTIC order. Keys therefore carry the "temporal_" prefix:
-/// "temporal_request_latency" is not a substring of "temporal_long_request_latency",
-/// and "temporal_activity_execution_latency" is not a substring of
-/// "temporal_local_activity_execution_latency". Drop the prefix and BOTH become
-/// collisions, resolved by a coin flip at process start.
+/// map in NONDETERMINISTIC order. Keys therefore have to carry "temporal_" to stay
+/// unambiguous: "temporal_request_latency" is not a substring of
+/// "temporal_long_request_latency", and "temporal_activity_execution_latency" is
+/// not a substring of "temporal_local_activity_execution_latency". Drop the prefix
+/// and BOTH become collisions, resolved by a coin flip at process start.
 /// </para>
 /// <para>
-/// PUSH (prometheus-net MeterAdapterOptions.ResolveHistogramBuckets). The starter
-/// sets MetricPrefix = "" so that MeterAdapter's meter-name prepending produces
-/// canonical temporal_* names. The Instrument.Name the resolver sees is therefore
-/// the UNPREFIXED Core name. Same logical metric, different lookup key on the two
-/// paths. This is not a typo.
+/// PUSH (prometheus-net MeterAdapterOptions.ResolveHistogramBuckets). Matching is
+/// EXACT, on Instrument.Name — which is the name CORE handed the custom meter, so
+/// it carries "temporal_" as well. The design here once assumed otherwise: set
+/// MetricPrefix = "" and the names would arrive bare. Measured, that is
+/// unexpressible — string.Empty reads as UNSET and falls back to Core's default
+/// "temporal_" (see PushMetrics). So both paths present the same key, and both
+/// lookups below are derived from ONE dictionary on purpose: while they were built
+/// separately they silently disagreed, every non-custom push-path entry missed, and
+/// the starter's latencies fell through to the catch-all with nothing to show for it.
 /// </para>
 /// <para>
 /// Custom metrics bypass prefixing on both paths and otherwise fall into Core's
@@ -37,11 +41,14 @@ namespace Repro.Core.Telemetry;
 /// </remarks>
 public static class HistogramBuckets
 {
+    /// <summary>Core's default prefix. ReproRuntime documents why it is never changed.</summary>
+    private const string CorePrefix = "temporal_";
+
     /// <summary>Core's catch-all default, for anything not in the table.</summary>
     public static ReadOnlyCollection<double> DefaultMs { get; } =
         new([50, 100, 500, 1000, 2500, 10_000]);
 
-    /// <remarks><c>Custom</c> means "already unprefixed on both paths".</remarks>
+    /// <remarks><c>Custom</c> means MetricPrefix never applies, so the name is already final.</remarks>
     private static readonly (string Name, bool Custom, double[] Buckets)[] Table =
     [
         // Core default [50,100,500,1000,2500,10000]. Loopback gRPC is 0-5ms.
@@ -82,17 +89,24 @@ public static class HistogramBuckets
         //     -> already spans 100ms..24h
     ];
 
+    /// <summary>Keyed the way BOTH paths present the name: prefixed unless custom.</summary>
     private static readonly Dictionary<string, double[]> Lookup =
-        Table.ToDictionary(e => e.Name, e => e.Buckets, StringComparer.Ordinal);
-
-    /// <summary>For <c>PrometheusOptions.HistogramBucketOverrides</c>. Prefixed keys.</summary>
-    public static IReadOnlyDictionary<string, IReadOnlyCollection<double>> ScrapeOverrides { get; } =
         Table.ToDictionary(
-            e => e.Custom ? e.Name : "temporal_" + e.Name,
-            e => (IReadOnlyCollection<double>)e.Buckets,
+            e => e.Custom ? e.Name : CorePrefix + e.Name,
+            e => e.Buckets,
             StringComparer.Ordinal);
 
-    /// <summary>For prometheus-net's <c>ResolveHistogramBuckets</c>. Unprefixed instrument names.</summary>
+    /// <summary>For <c>PrometheusOptions.HistogramBucketOverrides</c>. Substring-matched by Core.</summary>
+    public static IReadOnlyDictionary<string, IReadOnlyCollection<double>> ScrapeOverrides { get; } =
+        Lookup.ToDictionary(
+            e => e.Key,
+            e => (IReadOnlyCollection<double>)e.Value,
+            StringComparer.Ordinal);
+
+    /// <summary>
+    /// For prometheus-net's <c>ResolveHistogramBuckets</c>. Exact match against
+    /// <c>Instrument.Name</c>, which arrives temporal_-prefixed on the push path.
+    /// </summary>
     public static double[] ForInstrument(string instrumentName) =>
         Lookup.TryGetValue(instrumentName, out var buckets) ? buckets : [.. DefaultMs];
 }

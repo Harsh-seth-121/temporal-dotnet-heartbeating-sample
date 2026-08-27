@@ -8,6 +8,7 @@ using Repro.Core.Telemetry;
 using Repro.Core.Temporal;
 using Repro.Core.Workflows;
 using Temporalio.Client;
+using Temporalio.Runtime;
 using Temporalio.Worker;
 
 // loadgen keeps workflows flowing so the histogram panels have data. It runs BOTH a
@@ -28,14 +29,28 @@ using var loggerFactory = LoggerFactory.Create(b => b
 var log = loggerFactory.CreateLogger("loadgen");
 
 var bind = flags.Str("--metrics") ?? config.Metrics.LoadgenAddress;
-var runtime = ReproRuntime.CreateScrape(bind);
-log.LogInformation("metrics: serving http://{Bind}/metrics", bind);
+
+// Same deal as the worker: `--metrics off` means no exporter, not no runtime.
+// ClientFactory needs one, and a client that connects without it binds to
+// TemporalRuntime.Default and loses its metrics with no error anywhere.
+var metricsOff = BindAddress.IsOff(bind);
+var runtime = metricsOff
+    ? ReproRuntime.Adopt(new TemporalRuntime(new TemporalRuntimeOptions()))
+    : ReproRuntime.CreateScrape(bind);
+if (metricsOff)
+{
+    log.LogInformation("metrics: OFF; this loadgen exports nothing and binds no port");
+}
+else
+{
+    log.LogInformation("metrics: serving http://{Bind}/metrics", bind);
+}
 
 var client = await ClientFactory.ConnectAsync(config, runtime, "loadgen", loggerFactory);
 
 var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
-    .AddAllActivities(new HeartbeatActivities(config.Fault));
+    .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker));
 options.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
 if (config.Worker.MaxCachedWorkflows > 0)
 {
@@ -44,6 +59,19 @@ if (config.Worker.MaxCachedWorkflows > 0)
 
 options.MaxHeartbeatThrottleInterval = config.Worker.MaxHeartbeatThrottleInterval;
 options.DefaultHeartbeatThrottleInterval = config.Worker.DefaultHeartbeatThrottleInterval;
+
+// All six worker: knobs, same as Repro.Worker. These two were missing, so the :8078
+// worker kept the SDK defaults (100 / 100) whatever config.yaml said and the
+// slot-saturation panels could only ever be driven from the :8077 worker.
+if (config.Worker.MaxConcurrentActivities > 0)
+{
+    options.MaxConcurrentActivities = config.Worker.MaxConcurrentActivities;
+}
+
+if (config.Worker.MaxConcurrentWorkflowTasks > 0)
+{
+    options.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
+}
 
 using var shutdown = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
@@ -75,7 +103,14 @@ log.LogInformation(
     GoDuration.ToGoString(rate), concurrency, steps, GoDuration.ToGoString(stepDuration));
 
 var started = 0;
-var input = new JobInput(steps, (int)stepDuration.TotalMilliseconds);
+var input = new JobInput(
+    steps,
+    (int)stepDuration.TotalMilliseconds,
+    // Carries activity.* from config.yaml INTO the workflow input, so the values are
+    // captured in history. Without this the `activity:` block is dead config: the
+    // workflow falls back to ActivityOptionsInput's defaults and changing
+    // heartbeatTimeout does nothing.
+    ActivityOptionsInput.From(config.Activity));
 
 try
 {
