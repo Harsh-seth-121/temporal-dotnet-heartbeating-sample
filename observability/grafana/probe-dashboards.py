@@ -21,7 +21,7 @@ Each target lands in one of four states:
             as "broken", a zero reads as "healthy".
   NODATA    neither mode returns data and there is no fallback. Either the stack
             is not in the state this panel needs, or the metric name is WRONG.
-            Check it against observability/README.md, "Proving the boards".
+            Check it against docs/DASHBOARDS.md, "Proving the boards".
   ERROR     Prometheus rejected the query. Always a bug in the expression.
 
 Note that FALLBACK is not a weaker OK. Core creates a metric on FIRST INCREMENT,

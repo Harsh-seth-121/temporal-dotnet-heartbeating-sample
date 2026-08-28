@@ -34,7 +34,7 @@ options.LoggerFactory = loggerFactory;
 // forever while every panel stayed blank.
 //
 // The flag is kept so the claim is reproducible rather than folklore. See
-// README.md, "Capture and replay a history".
+// docs/REPLAY.md.
 var metricsBind = flags.Str("--metrics");
 if (!string.IsNullOrEmpty(metricsBind) && !BindAddress.IsOff(metricsBind))
 {
@@ -42,7 +42,7 @@ if (!string.IsNullOrEmpty(metricsBind) && !BindAddress.IsOff(metricsBind))
     log.LogWarning(
         "a TemporalRuntime is attached to the replayer, but replay emits NO metrics: " +
         "http://{Bind}/metrics will answer 200 with an empty body. This flag exists only " +
-        "so you can confirm that yourself. See README.md.", metricsBind);
+        "so you can confirm that yourself. See docs/REPLAY.md.", metricsBind);
 }
 
 var replayer = new WorkflowReplayer(options);

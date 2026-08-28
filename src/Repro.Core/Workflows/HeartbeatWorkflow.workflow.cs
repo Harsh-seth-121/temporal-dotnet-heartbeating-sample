@@ -72,8 +72,8 @@ public class HeartbeatWorkflow
             // the workflow wait for the activity to actually finish unwinding.
             //
             // Deliberately NOT configurable: every cancellation panel and every
-            // README recipe assumes it, and the two other values turn those into
-            // silently empty panels rather than a different demo.
+            // docs/HEARTBEATING.md recipe assumes it, and the two other values turn those
+            // into silently empty panels rather than a different demo.
             CancellationType = ActivityCancellationType.WaitCancellationCompleted,
         };
     }

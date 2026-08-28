@@ -101,7 +101,7 @@ scrape_configs:
   # are mutually exclusive and throw at runtime construction. It reaches the
   # Pushgateway through prometheus-net's MeterAdapter instead, which renders every
   # counter as `# TYPE gauge`. rate() and increase() still compute correctly over
-  # the samples; only the type annotation is wrong. See the repo README.
+  # the samples; only the type annotation is wrong. See docs/GOTCHAS.md.
   - job_name: pushgateway
     honor_labels: true
     # 5s, not the global 1s. The reason it is safe is at the top of this file, and it

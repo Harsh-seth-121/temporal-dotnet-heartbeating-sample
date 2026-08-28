@@ -119,7 +119,7 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
         // cardinality into the Prometheus you are debugging with. So read it as "some
         // activity on this worker reached step N", and watch it against a single
         // execution (the starter, or `--concurrency 1`) when you want the monotone
-        // climb the README's stopHeartbeating recipe describes.
+        // climb the stopHeartbeating recipe in docs/HEARTBEATING.md describes.
         var progressGauge = meter.CreateGauge<long>(MetricNames.ActivityProgress);
         var heartbeatCounter = meter.CreateCounter<long>(MetricNames.HeartbeatSent);
 

@@ -11,7 +11,7 @@ Every PromQL expression here was probed against a live stack before being
 included -- a panel that cannot return data does not belong on a dashboard,
 because next time you cannot tell "no data" from "nothing is wrong".
 The probe script and the stack states each board needs are in
-observability/README.md under "Proving the boards".
+docs/DASHBOARDS.md under "Proving the boards".
 
 --------------------------------------------------------------------------
 WHAT CHANGED FROM THE GO ORIGINAL, AND WHY
@@ -85,16 +85,16 @@ and what every other .NET user sees:
   latency panels here require PrometheusOptions.HistogramBucketOverrides in the
   worker/loadgen runtime config; without them they do not read "no data", they
   read a plausible CONSTANT, which is worse. Each affected panel says so in its
-  description. The exact override block lives in the repo README.
+  description. The exact override block is explained in docs/GOTCHAS.md.
 """
 
 import json
 import pathlib
 
 DS = {"type": "prometheus", "uid": "sandbox-prometheus"}
-# Anchored to this file: the README invokes it as grafana/build-dashboards.py from
-# observability/, and the repo root is now the default cwd, so a cwd-relative path
-# would scatter the JSON into whichever directory you happened to be standing in.
+# Anchored to this file: docs/DASHBOARDS.md invokes it as grafana/build-dashboards.py
+# from observability/, and the repo root is now the default cwd, so a cwd-relative
+# path would scatter the JSON into whichever directory you happened to be in.
 OUT = pathlib.Path(__file__).resolve().parent / "dashboards/sandbox"
 
 # ---------------------------------------------------------------------------
@@ -878,7 +878,7 @@ for uid, title, panels, desc, tags in BOARDS:
     total_panels += len(panels)
     total_targets += n
     print(f"  wrote {path}  panels={len(panels)}  targets={n}")
-# The target count is the number observability/README.md claims was probed
-# against a live stack. If you add a panel, this number changes and the README
-# claim goes stale -- printing it here is the reminder.
+# The target count is the number docs/DASHBOARDS.md claims was probed against a
+# live stack. If you add a panel, this number changes and that claim goes stale.
+# Printing it here is the reminder.
 print(f"  TOTAL panels={total_panels} targets={total_targets}")
