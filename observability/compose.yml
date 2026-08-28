@@ -118,7 +118,7 @@ services:
       # 7d, not the 1d the Go original used. Retention caps how long a CLOSED
       # workflow's history survives, and this repo's whole replay workflow depends on
       # `temporal workflow show` still finding it. At 1d, a history captured on Friday
-      # is gone on Monday and the README's capture-and-replay recipe fails with a
+      # is gone on Monday and docs/REPLAY.md's capture recipe fails with a
       # not-found error that looks like a bug in the replayer.
       - DEFAULT_NAMESPACE_RETENTION=7d
     networks: [temporal-network]
