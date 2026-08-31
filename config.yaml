@@ -147,3 +147,48 @@ fault:
   # only controls WHEN ctx.CancellationToken fires.
   # THIS WEDGES YOUR TERMINAL FOR THE REST OF THE BATCH. That is the demo.
   ignoreCancellation: false
+
+# SimpleNoActivity: a workflow with NO activities, driven entirely by messages. The
+# loadgen runs this as a SECOND loop alongside the heartbeat one, on the same task queue
+# and the same worker. Turn it off with `enabled: false` or `--no-simple`.
+simple:
+  enabled: true
+
+  # Carried into SimpleInput and used as the WaitConditionAsync timeout, so a run nobody
+  # signals still ends. KEEP IT UNDER demo-down.sh's drain budget, which is
+  # worker.gracefulShutdownTimeout + 15 = 45s here -- a longer bound means teardown
+  # SIGKILLs the loadgen mid-run instead of draining it.
+  maxDuration: 30s
+
+  # Mean interval between starts. The actual interval is rate x [1-jitter, 1+jitter], so
+  # starts do not land on a metronome and the task-queue backlog panel shows a real shape
+  # instead of a flat line. jitter must stay under 1: at 1 the low end is zero and the
+  # loop becomes a busy spin.
+  rate: 3s
+  jitter: 0.5
+  concurrency: 8                  # at capacity a tick is SKIPPED, never queued
+
+  # Each run gets a random number of messages, coin-flipped between the Poke signal and
+  # the Add update, with a random gap up to messageGap between them.
+  minMessages: 0
+  maxMessages: 5
+  messageGap: 250ms
+
+  # CHAOS. Fraction of Add updates handed operands whose sum overflows an int -- the
+  # workflow's update VALIDATOR rejects those, and a rejected update writes nothing at all
+  # to the event history. This is the only thing in the repo that proves that.
+  overflowRate: 0.05
+
+  # CHAOS. Fraction of runs sent one more message AFTER they have closed. The expected
+  # result is an RpcException with StatusCode.NotFound, which the driver counts instead of
+  # crashing on. A client that does not expect that is one bad deploy from a restart loop.
+  raceRate: 0.10
+
+  # Weighted dice for how each run ends. Only the ratio matters.
+  #   stop   -> the Stop signal; server status Completed, EndedBy "stopped"
+  #   cancel -> a real client CancelAsync; server status CANCELED. This is the only path
+  #             that produces that status: a workflow cannot cancel ITSELF.
+  #   expire -> send nothing and let maxDuration end it; Completed, EndedBy "expired"
+  stopWeight: 5
+  cancelWeight: 3
+  expireWeight: 2

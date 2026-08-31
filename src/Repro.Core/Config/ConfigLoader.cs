@@ -148,5 +148,63 @@ public static class ConfigLoader
         {
             throw new ArgumentException($"job.steps must be > 0 (got {config.Job.Steps}).");
         }
+
+        if (config.Simple.MaxDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simple.maxDuration must be > 0 (got {config.Simple.MaxDuration}). It is the " +
+                "WaitConditionAsync timeout, so at zero every run ends `expired` instantly.");
+        }
+
+        if (config.Simple.Rate <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simple.rate must be > 0 (got {config.Simple.Rate}). At zero the driver loop " +
+                "is a busy spin against the frontend.");
+        }
+
+        if (config.Simple.Jitter is < 0 or >= 1)
+        {
+            throw new ArgumentException(
+                $"simple.jitter must be in [0, 1) (got {config.Simple.Jitter}). The interval is " +
+                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
+        }
+
+        if (config.Simple.Concurrency <= 0)
+        {
+            throw new ArgumentException(
+                $"simple.concurrency must be > 0 (got {config.Simple.Concurrency}), otherwise " +
+                "every tick is skipped at capacity and the driver starts nothing at all.");
+        }
+
+        if (config.Simple.MinMessages < 0 || config.Simple.MaxMessages < config.Simple.MinMessages)
+        {
+            throw new ArgumentException(
+                "simple.minMessages must be >= 0 and simple.maxMessages >= simple.minMessages " +
+                $"(got {config.Simple.MinMessages}..{config.Simple.MaxMessages}). The driver " +
+                "calls Random.Shared.Next(min, max + 1), which throws when max < min.");
+        }
+
+        if (config.Simple.OverflowRate is < 0 or > 1)
+        {
+            throw new ArgumentException(
+                $"simple.overflowRate must be between 0 and 1 (got {config.Simple.OverflowRate}).");
+        }
+
+        if (config.Simple.RaceRate is < 0 or > 1)
+        {
+            throw new ArgumentException(
+                $"simple.raceRate must be between 0 and 1 (got {config.Simple.RaceRate}).");
+        }
+
+        if (config.Simple.StopWeight < 0 || config.Simple.CancelWeight < 0
+            || config.Simple.ExpireWeight < 0
+            || config.Simple.StopWeight + config.Simple.CancelWeight
+                + config.Simple.ExpireWeight <= 0)
+        {
+            throw new ArgumentException(
+                "simple.stopWeight, cancelWeight and expireWeight must be >= 0 with a positive " +
+                "sum. All-zero divides by zero in the driver's ending picker.");
+        }
     }
 }

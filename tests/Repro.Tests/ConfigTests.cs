@@ -231,6 +231,49 @@ public class ConfigLoaderTests
     }
 
     [Fact]
+    public void LoadsTheCommittedSimpleBlock()
+    {
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+
+        Assert.True(config.Simple.Enabled);
+        Assert.Equal(TimeSpan.FromSeconds(30), config.Simple.MaxDuration);
+        Assert.Equal(TimeSpan.FromSeconds(3), config.Simple.Rate);
+        Assert.Equal(0.5, config.Simple.Jitter);
+        Assert.Equal(8, config.Simple.Concurrency);
+        Assert.Equal(5, config.Simple.MaxMessages);
+        Assert.True(config.Simple.StopWeight + config.Simple.CancelWeight
+            + config.Simple.ExpireWeight > 0);
+    }
+
+    [Theory]
+    // jitter 1.0 puts the low end of rate x [1-j, 1+j] at zero, and the driver loop spins.
+    [InlineData("simple:\n  jitter: 1.0\n")]
+    [InlineData("simple:\n  jitter: -0.1\n")]
+    // A zero or negative rate is the same spin.
+    [InlineData("simple:\n  rate: 0\n")]
+    [InlineData("simple:\n  maxDuration: 0\n")]
+    [InlineData("simple:\n  concurrency: 0\n")]
+    // Random.Shared.Next(min, max + 1) throws when max < min.
+    [InlineData("simple:\n  minMessages: 4\n  maxMessages: 2\n")]
+    [InlineData("simple:\n  minMessages: -1\n")]
+    [InlineData("simple:\n  overflowRate: 1.5\n")]
+    [InlineData("simple:\n  raceRate: -0.5\n")]
+    // All-zero weights divide by zero in the ending picker.
+    [InlineData("simple:\n  stopWeight: 0\n  cancelWeight: 0\n  expireWeight: 0\n")]
+    public void RejectsUnusableSimpleConfig(string yaml)
+    {
+        var path = WriteTemp(yaml);
+        try
+        {
+            Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
     public void RejectsHeartbeatTimeoutLongerThanStartToClose()
     {
         // Otherwise the attempt always dies of start-to-close first and no heartbeat

@@ -47,6 +47,9 @@ public sealed class ReproConfig
     /// </remarks>
     public LoadgenConfig Loadgen { get; set; } = new();
 
+    /// <summary>Everything about SimpleNoActivity: the run bound plus the chaos driver.</summary>
+    public SimpleConfig Simple { get; set; } = new();
+
     public FaultConfig Fault { get; set; } = new();
 }
 
@@ -198,6 +201,80 @@ public sealed class LoadgenConfig
 
     /// <summary>Loadgen runs shorter jobs than the starter, so a board fills in under a minute.</summary>
     public int Steps { get; set; } = 20;
+}
+
+/// <summary>
+/// SimpleNoActivity's run bound, plus every knob of the loadgen's second driver loop.
+/// </summary>
+/// <remarks>
+/// Flat and single-hump on purpose. CamelCaseNamingConvention lowers only the FIRST
+/// character, so a property named MaxMessages maps to the YAML key <c>maxMessages</c> --
+/// but a property named MinMsgIDs would map to <c>minMsgIDs</c>, and an unmatched key is
+/// a hard error here. Keep new names boring.
+/// </remarks>
+public sealed class SimpleConfig
+{
+    /// <summary>Turn the second driver loop off without editing the loadgen. <c>--no-simple</c> does the same.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>
+    /// Carried into SimpleInput and used as the WaitConditionAsync timeout, so a run that
+    /// is never signalled still ends.
+    /// </summary>
+    /// <remarks>
+    /// KEEP THIS UNDER demo-down.sh's drain budget, which is
+    /// worker.gracefulShutdownTimeout + 15 = 45s with the shipped config. A longer bound
+    /// means a teardown that arrives mid-run gets SIGKILLed instead of draining.
+    /// </remarks>
+    public TimeSpan MaxDuration { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Mean interval between starts, before jitter.</summary>
+    public TimeSpan Rate { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>
+    /// Fractional spread on <see cref="Rate"/>: the interval is
+    /// <c>rate x [1-jitter, 1+jitter]</c>. 0 is a metronome.
+    /// </summary>
+    /// <remarks>
+    /// Validated to be under 1. At exactly 1 the low end of the range is zero and the
+    /// driver loop becomes a busy spin against the frontend.
+    /// </remarks>
+    public double Jitter { get; set; } = 0.5;
+
+    /// <summary>Max runs in flight. At capacity a tick is SKIPPED, never queued.</summary>
+    public int Concurrency { get; set; } = 8;
+
+    public int MinMessages { get; set; }
+
+    public int MaxMessages { get; set; } = 5;
+
+    /// <summary>Upper bound on the random gap between two messages within one run.</summary>
+    public TimeSpan MessageGap { get; set; } = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>Fraction of Add updates handed operands whose sum overflows an int. 0-1.</summary>
+    /// <remarks>
+    /// The workflow's update validator rejects these. It is the only thing in the repo
+    /// that exercises a rejected update, and a rejected update writes NOTHING to history
+    /// -- which is the whole reason validators exist.
+    /// </remarks>
+    public double OverflowRate { get; set; } = 0.05;
+
+    /// <summary>Fraction of runs sent one more message AFTER they have closed. 0-1.</summary>
+    /// <remarks>
+    /// Signalling a closed workflow is an RpcException with StatusCode.NotFound, not a
+    /// crash. A client that does not expect that is one bad deploy from a restart loop,
+    /// so this drives the path on purpose.
+    /// </remarks>
+    public double RaceRate { get; set; } = 0.10;
+
+    /// <summary>Weighted dice for how each run ends. Any non-negative ints; only the ratio matters.</summary>
+    public int StopWeight { get; set; } = 5;
+
+    /// <summary>Real client-side CancelAsync. The ONLY path that produces a Canceled status.</summary>
+    public int CancelWeight { get; set; } = 3;
+
+    /// <summary>Send nothing and let <see cref="MaxDuration"/> end it.</summary>
+    public int ExpireWeight { get; set; } = 2;
 }
 
 /// <summary>
