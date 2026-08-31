@@ -142,6 +142,16 @@ public class FlagsTests
     [Fact]
     public void ValueFlagWithNoValueIsAHardError() =>
         Assert.Throws<ArgumentException>(() => Flags.Parse(["--steps"]));
+
+    [Fact]
+    public void NoSimpleIsASwitchOnEveryBinary()
+    {
+        // Known and Switches are GLOBAL to all four exes, so a flag added for the loadgen
+        // is silently a hard error in the other three until it is registered here.
+        Assert.True(Flags.Parse(["--no-simple"]).Switch("--no-simple"));
+        Assert.False(Flags.Parse([]).Switch("--no-simple"));
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--no-simple=false"]));
+    }
 }
 
 public class ConfigLoaderTests
