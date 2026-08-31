@@ -256,6 +256,8 @@ public class ConfigLoaderTests
     // Random.Shared.Next(min, max + 1) throws when max < min.
     [InlineData("simple:\n  minMessages: 4\n  maxMessages: 2\n")]
     [InlineData("simple:\n  minMessages: -1\n")]
+    // Random.Shared.Next(gapMs + 1) throws on a negative bound.
+    [InlineData("simple:\n  messageGap: -1s\n")]
     [InlineData("simple:\n  overflowRate: 1.5\n")]
     [InlineData("simple:\n  raceRate: -0.5\n")]
     // All-zero weights divide by zero in the ending picker.

@@ -171,8 +171,13 @@ internal sealed class SimpleDriver(
 
         var handle = await client.StartWorkflowAsync(
             (SimpleNoActivity wf) => wf.RunAsync(new SimpleInput(maxDurationMs)),
-            new WorkflowOptions(id: $"repro-simple-{Guid.NewGuid():N}", taskQueue: taskQueue))
-            .ConfigureAwait(false);
+            new WorkflowOptions(id: $"repro-simple-{Guid.NewGuid():N}", taskQueue: taskQueue)
+            {
+                // The start call needs the same bound as every other unary RPC below. An
+                // unresponsive frontend here would hold a capacity slot forever and park
+                // the process past demo-down.sh's 45s drain budget.
+                Rpc = rpc,
+            }).ConfigureAwait(false);
 
         var ending = PickEnding();
         await SendMessagesAsync(handle, rpc, cancellationToken).ConfigureAwait(false);

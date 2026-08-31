@@ -185,6 +185,15 @@ public static class ConfigLoader
                 "calls Random.Shared.Next(min, max + 1), which throws when max < min.");
         }
 
+        if (config.Simple.MessageGap < TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simple.messageGap must be >= 0 (got {config.Simple.MessageGap}). The driver " +
+                "calls Random.Shared.Next(gapMs + 1) to pick each gap, which throws on a " +
+                "negative bound -- and it throws inside a fire-and-forget run body, so the " +
+                "only symptom is the failure counter climbing.");
+        }
+
         if (config.Simple.OverflowRate is < 0 or > 1)
         {
             throw new ArgumentException(
