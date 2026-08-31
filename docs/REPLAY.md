@@ -3,6 +3,12 @@
 ```bash
 temporal workflow show --workflow-id repro-workflow --output json > history/heartbeat-job.json
 dotnet run --project src/Repro.Replay -- --history history/heartbeat-job.json
+
+# Both committed fixtures at once. `history/` holds heartbeat-job.json and
+# simple-no-activity.json; the latter carries WORKFLOW_EXECUTION_UPDATE_ACCEPTED and
+# _UPDATE_COMPLETED events, and MEASURED, HistoryJsonFixer handles those enum
+# shorthands from `workflow show --output json` with no help.
+dotnet run --project src/Repro.Replay -- --history history/
 ```
 
 `--history` also accepts a directory, and replays every `*.json` in it.

@@ -7,6 +7,7 @@ using Repro.Core.Config;
 using Repro.Core.Telemetry;
 using Repro.Core.Temporal;
 using Repro.Core.Workflows;
+using Repro.LoadGen;
 using Temporalio.Client;
 using Temporalio.Runtime;
 using Temporalio.Worker;
@@ -51,6 +52,7 @@ var client = await ClientFactory.ConnectAsync(config, runtime, "loadgen", logger
 
 var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
+    .AddWorkflow<SimpleNoActivity>()
     .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker));
 options.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
 if (config.Worker.MaxCachedWorkflows > 0)
@@ -103,6 +105,26 @@ log.LogInformation(
     "loadgen: 1 workflow every {Rate}, up to {Concurrency} in flight, {Steps} steps of {Step} each",
     GoDuration.ToGoString(rate), concurrency, steps, GoDuration.ToGoString(stepDuration));
 
+// SECOND LOOP, started AFTER the banner above. scripts/demo-lib.sh:70 gates loadgen
+// readiness on the literal substring "loadgen: 1 workflow every" with a 45s budget, so
+// anything that could throw before that line is logged turns a working start into a
+// demo-up.sh timeout.
+var simpleOn = config.Simple.Enabled && !flags.Switch("--no-simple");
+var simpleTask = Task.CompletedTask;
+if (simpleOn)
+{
+    var simpleDriver = new SimpleDriver(
+        client, config.Simple, config.TaskQueue, loggerFactory.CreateLogger("simple"));
+
+    // Not awaited here: RunAsync yields at its first Task.Delay and then runs alongside
+    // the heartbeat loop below, on the same client, worker and shutdown token.
+    simpleTask = simpleDriver.RunAsync(shutdown.Token);
+}
+else
+{
+    log.LogInformation("simple: OFF (simple.enabled is false, or --no-simple was passed)");
+}
+
 var started = 0;
 var input = new JobInput(
     steps,
@@ -153,6 +175,17 @@ try
 catch (OperationCanceledException)
 {
     log.LogInformation("loadgen: shutting down after starting {Count} workflows", started);
+}
+
+// Before the worker, so the driver's final summary lands while the worker is still
+// polling and its in-flight runs can still complete.
+try
+{
+    await simpleTask;
+}
+catch (OperationCanceledException)
+{
+    // Expected: same shutdown token.
 }
 
 try

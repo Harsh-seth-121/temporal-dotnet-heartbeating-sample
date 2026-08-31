@@ -98,6 +98,56 @@ The server only communicates cancellation in the **response** to a
 `RecordActivityTaskHeartbeat` RPC. `fault.stopHeartbeating` demonstrates it. Details in
 [HEARTBEATING.md](HEARTBEATING.md).
 
+## A workflow cannot cancel ITSELF into `CANCELED` status
+
+The server records that status only when a cancellation **request** exists. From inside
+workflow code there is no way to create one:
+
+- Throwing `CanceledFailureException` with no request outstanding records **`FAILED`**.
+- Swallowing a real cancellation and returning records **`COMPLETED`**.
+- `Workflow.GetExternalWorkflowHandle` pointed at your own workflow ID cannot signal
+  you: the server refuses a signal-to-self outright, because the command handler holds a
+  lock on the source execution while writing to the target and self-targeting deadlocks
+  it ([temporalio/temporal#682](https://github.com/temporalio/temporal/issues/682)).
+
+So a "stop me" signal and a cancellation are different things and end differently.
+`SimpleNoActivity` ships both on purpose: the `Stop` signal ends the run `COMPLETED`
+with `EndedBy="stopped"`, and a real `CANCELED` comes only from a client calling
+`handle.CancelAsync()`. The workflow sees that because
+`Workflow.WaitConditionAsync`'s `cancellationToken` argument **defaults to
+`Workflow.CancellationToken`** when you leave it unset, so the cancel raises straight
+out of the wait — and the `catch` rethrows, because swallowing it would report
+`COMPLETED` for a run somebody explicitly cancelled.
+
+## `IsCanceledException` does NOT recognise a cancelled workflow at the client
+
+`TemporalException.IsCanceledException` is the right test **inside** workflow or
+activity code, where a cancel arrives as `OperationCanceledException` or
+`CanceledFailureException` or nested inside an `ActivityFailureException`. Reach for it
+at a **client** call site and it quietly gives you the wrong answer.
+
+MEASURED, on a workflow whose server status really is `CANCELED`:
+
+```
+handle.GetResultAsync()
+  -> WorkflowFailedException
+       InnerException: CanceledFailureException
+     TemporalException.IsCanceledException(e) == False
+```
+
+The helper covers .NET cancellation plus a cancellation nested in an **activity** or
+**child workflow** failure. A client-side workflow-failed wrapper is neither. The only
+symptom is a counter: every deliberately cancelled run lands in your failure bucket and
+nothing logs an error. Match the shape instead:
+
+```csharp
+catch (WorkflowFailedException e) when (e.InnerException is CanceledFailureException)
+```
+
+Matching the shape rather than catching broadly also keeps **shutdown** out of that
+bucket — when your own token cancels `GetResultAsync` you get an
+`OperationCanceledException`, which is not a cancelled workflow.
+
 ## There is no heartbeat metric in any Core SDK, and the RPC rate is not your call rate
 
 Core throttles heartbeats, so the observed RPC rate is the throttle, not the rate at
@@ -225,6 +275,35 @@ After the first schema init. Changing it requires `docker compose down -v`.
 It has no 1.31.x tag (newest 1.29.7). That is why schema init and namespace
 registration are separate one-shot `admin-tools` containers rather than one all-in-one
 image.
+
+## `async` message handlers do not compile in this repo
+
+Every Temporal doc sample writes signal and update handlers as `async`:
+
+```csharp
+[WorkflowSignal]
+public async Task StopAsync() => stopRequested = true;   // CS1998 -> build FAILS here
+```
+
+With no `await` in the body that is **CS1998**, "async method lacks 'await' operators",
+and `Directory.Build.props` sets `TreatWarningsAsErrors`. So the sample you copied does
+not build, and the fix is not a pragma.
+
+The SDK validates only the handler's **return type**, not whether it is `async`. A plain
+method is fully supported and is what `SimpleNoActivity` uses:
+
+```csharp
+[WorkflowSignal]
+public Task StopAsync() { stopRequested = true; return Task.CompletedTask; }
+
+[WorkflowUpdate]
+public Task<int> AddAsync(AddInput input) => Task.FromResult(input.A + input.B);
+```
+
+Queries are different again: a `[WorkflowQuery]` must be non-`async` and must **not**
+return a `Task`, and its wire name is **not** trimmed of an `Async` suffix the way
+signal and update names are. Naming one `GetStatusAsync` gives you a query literally
+called `GetStatusAsync`.
 
 ## `dotnet run` launches your app as a CHILD process
 
