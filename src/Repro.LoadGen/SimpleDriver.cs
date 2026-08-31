@@ -10,17 +10,17 @@ namespace Repro.LoadGen;
 
 /// <summary>
 /// The second loadgen loop: starts SimpleNoActivity runs on a JITTERED interval and
-/// throws chaos at each one -- a random mix of signals and updates, a weighted random
+/// throws chaos at each one: a random mix of signals and updates, a weighted random
 /// ending, deliberately overflowing operands, and a message sent after the run has
 /// already closed.
 /// </summary>
 /// <remarks>
-/// Everything in here is CLIENT code, so Random.Shared and wall-clock are fine -- the
-/// same licence HeartbeatActivities has. Nothing in this file may leak into workflow code.
+/// Everything in here is CLIENT code, so Random.Shared and wall-clock are fine, the same
+/// licence HeartbeatActivities has. Nothing in this file may leak into workflow code.
 /// <para>
-/// NO SemaphoreSlim, unlike the heartbeat loop in Program.cs, and that is deliberate.
+/// NO SemaphoreSlim, unlike the heartbeat loop in Program.cs, and deliberately so.
 /// That loop's <c>using var slots</c> is disposed when the method returns while
-/// fire-and-forget run bodies are still calling slots.Release() in a finally -- a latent
+/// fire-and-forget run bodies are still calling slots.Release() in a finally. That is a latent
 /// ObjectDisposedException masked only by the process exiting immediately afterwards. An
 /// Interlocked counter has no disposal semantics at all and expresses "skip the tick at
 /// capacity" just as directly.
@@ -75,12 +75,15 @@ internal sealed class SimpleDriver(
             while (!cancellationToken.IsCancellationRequested)
             {
                 // Task.Delay, not PeriodicTimer: a PeriodicTimer has one fixed period and
-                // the whole point here is that the period varies. The token is forwarded
+                // the period has to vary here. The token is forwarded
                 // because CA2016 is an error in this repo, and because without it a
-                // shutdown waits out a full interval.
-                await Task.Delay(NextInterval(), cancellationToken).ConfigureAwait(false);
+                // shutdown waits out a full interval. See Jitter for why the formula lives
+                // in one place and which validation rule keeps it safe.
+                await Task.Delay(
+                    Jitter.NextInterval(simple.Rate, simple.Jitter),
+                    cancellationToken).ConfigureAwait(false);
 
-                // SKIP at capacity, never queue -- same contract as the heartbeat loop.
+                // SKIP at capacity, never queue. Same contract as the heartbeat loop.
                 // Queueing would build an unbounded backlog and `rate` would stop
                 // describing what the process is doing.
                 if (Interlocked.Increment(ref inFlight) > simple.Concurrency)
@@ -107,7 +110,7 @@ internal sealed class SimpleDriver(
                             // Shutdown is counted SEPARATELY from failure. A run whose RPCs
                             // were cancelled because the process is going down did not fail,
                             // and folding the two together makes every clean Ctrl-C look
-                            // like it broke something -- which is exactly the kind of
+                            // like it broke something, which is exactly the kind of
                             // misleading signal this repo exists to avoid.
                             if (cancellationToken.IsCancellationRequested)
                             {
@@ -138,17 +141,6 @@ internal sealed class SimpleDriver(
         }
 
         LogSummary();
-    }
-
-    /// <summary>rate x [1-jitter, 1+jitter], floored at 1ms.</summary>
-    /// <remarks>
-    /// ConfigLoader.Validate keeps jitter under 1 and rate above zero, so the floor is
-    /// belt-and-braces rather than the thing standing between you and a spin loop.
-    /// </remarks>
-    private TimeSpan NextInterval()
-    {
-        var factor = 1.0 + (simple.Jitter * ((2.0 * Random.Shared.NextDouble()) - 1.0));
-        return TimeSpan.FromMilliseconds(Math.Max(1.0, simple.Rate.TotalMilliseconds * factor));
     }
 
     private Ending PickEnding()
@@ -227,7 +219,7 @@ internal sealed class SimpleDriver(
             // arrives at a CLIENT as WorkflowFailedException{InnerException:
             // CanceledFailureException}, and TemporalException.IsCanceledException returns
             // FALSE for it. That helper covers .NET cancellation plus a cancellation nested
-            // in an ACTIVITY or CHILD WORKFLOW failure -- which is why it is right inside
+            // in an ACTIVITY or CHILD WORKFLOW failure, which is why it is right inside
             // SimpleNoActivity and wrong here. Using it at this call site classified every
             // deliberately cancelled run as a failure, with the counter reading
             // "0 canceled ... 2 failed" and no other symptom.
@@ -307,7 +299,7 @@ internal sealed class SimpleDriver(
             return;
         }
 
-        // CHAOS: the run is definitely CLOSED here -- GetResultAsync already returned or
+        // CHAOS: the run is definitely CLOSED here, because GetResultAsync already returned or
         // threw. Signalling a closed workflow is an RpcException with StatusCode.NotFound,
         // not a crash.
         try
@@ -325,9 +317,9 @@ internal sealed class SimpleDriver(
     }
 
     /// <remarks>
-    /// The template is a concatenation of string LITERALS, which is a compile-time constant
-    /// -- CA2254 rejects an interpolated template and CA1727 rejects lowercase
-    /// placeholders, and both are errors in this repo.
+    /// The template is a concatenation of string LITERALS, which is a compile-time constant.
+    /// CA2254 rejects an interpolated template and CA1727 rejects lowercase placeholders, and
+    /// both are errors in this repo.
     /// </remarks>
     private void LogSummary() =>
         log.LogInformation(

@@ -22,7 +22,7 @@ var log = loggerFactory.CreateLogger("worker");
 var bind = flags.Str("--metrics") ?? config.Metrics.ListenAddress;
 
 // `--metrics off` is how you run a SECOND worker on this host without fighting the
-// first one for :8077 — the "kill the worker mid-activity" recipe needs two. Off
+// first one for :8077. The "kill the worker mid-activity" recipe needs two. Off
 // means NO EXPORTER, not no runtime: ClientFactory requires a runtime, and a client
 // that connects without one binds to TemporalRuntime.Default, which is the silent
 // metrics loss ReproRuntime exists to prevent. Adopt a telemetry-free runtime so the
@@ -45,9 +45,14 @@ var client = await ClientFactory.ConnectAsync(config, runtime, "worker", loggerF
 var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
     .AddWorkflow<SimpleNoActivity>()
+    .AddWorkflow<WorkflowSimpleActivity>()
     // Instance registration is the SetFaultConfig replacement: the fault config is
     // reachable only from this object, so no workflow can read it.
-    .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker));
+    .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker))
+    // A SECOND call, not a second argument: AddAllActivities takes exactly ONE instance,
+    // so a new activity CLASS needs its own. The two classes must not declare an activity
+    // of the same name. A duplicate throws at registration, before the worker polls.
+    .AddAllActivities(new WeatherActivities(config.SimpleActivity));
 
 // The SDK default is TimeSpan.Zero. Zero grace plus a minute-long heartbeating
 // activity is the hang this repo demonstrates on purpose (fault.ignoreCancellation);
@@ -73,7 +78,7 @@ if (config.Worker.MaxConcurrentWorkflowTasks > 0)
 using var shutdown = new CancellationTokenSource();
 
 // Console.CancelKeyPress catches SIGINT only. `docker compose down`, `docker stop`
-// and most process supervisors send SIGTERM, which it never sees — so a worker
+// and most process supervisors send SIGTERM, which it never sees, so a worker
 // wired only to CancelKeyPress hangs until it is SIGKILLed and never drains.
 // scripts/demo-down.sh relies on the SIGTERM registration below: it is the only
 // reason a scripted teardown drains this worker instead of killing it.
@@ -99,7 +104,7 @@ log.LogInformation(
 try
 {
     // Never succeeds, only fails or is cancelled. On shutdown it waits for EVERY
-    // executing activity to return — an activity that swallows cancellation makes
+    // executing activity to return. An activity that swallows cancellation makes
     // this never come back, which is exactly what fault.ignoreCancellation shows.
     await worker.ExecuteAsync(shutdown.Token);
 }

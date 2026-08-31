@@ -43,12 +43,20 @@ public sealed class ReproConfig
     /// <remarks>
     /// Spelled Loadgen, not LoadGen. CamelCaseNamingConvention lowers only the FIRST
     /// character, so "LoadGen" would map to the YAML key "loadGen" while the file
-    /// says "loadgen" — and an unmatched key is a hard error here, by design.
+    /// says "loadgen", and an unmatched key is a hard error here, by design.
     /// </remarks>
     public LoadgenConfig Loadgen { get; set; } = new();
 
     /// <summary>Everything about SimpleNoActivity: the run bound plus the chaos driver.</summary>
     public SimpleConfig Simple { get; set; } = new();
+
+    /// <summary>Everything about WorkflowSimpleActivity: one activity, no heartbeats.</summary>
+    /// <remarks>
+    /// SimpleActivity maps to the YAML key <c>simpleActivity</c>. Safe under
+    /// CamelCaseNamingConvention, which lowers only the FIRST character. See the
+    /// <see cref="Loadgen"/> remark above for the shape that is not.
+    /// </remarks>
+    public SimpleActivityConfig SimpleActivity { get; set; } = new();
 
     public FaultConfig Fault { get; set; } = new();
 }
@@ -108,18 +116,21 @@ public sealed class JobConfig
 
 /// <summary>The timeouts and retry policy the workflow schedules the activity with.</summary>
 /// <remarks>
-/// NOT WIRED YET, and the only block in <see cref="ReproConfig"/> that is not the
-/// source of truth for what it names. HeartbeatWorkflow builds its ActivityOptions
-/// from JobInput.Activity rather than from here, deliberately: options carried in the
-/// input are recorded in the history, so a replay reproduces them byte for byte,
-/// while a file that can be edited between the original execution and the replay
-/// cannot promise that. ActivityOptionsInput.From projects this class onto that
-/// input, but no call site does so yet, so the workflow falls back to
-/// ActivityOptionsInput's defaults — which are exactly the values below.
+/// LIVE, and reached through the workflow INPUT rather than read from the file.
+/// HeartbeatWorkflow builds its ActivityOptions from JobInput.Activity, deliberately:
+/// options carried in the input are recorded in the history, so a replay reproduces them
+/// byte for byte, while a file that can be edited between the original execution and the
+/// replay cannot promise that.
 /// <para>
-/// The consequence to know before you debug: today
-/// <see cref="HeartbeatTimeout"/> and <see cref="StartToCloseTimeout"/> only affect
-/// what ConfigLoader.Validate refuses to start on, and the other two affect nothing.
+/// ActivityOptionsInput.From projects this class onto that input, and both clients call it:
+/// Repro.Starter/Program.cs and Repro.LoadGen/Program.cs. So every field below really does
+/// change what the next run schedules.
+/// </para>
+/// <para>
+/// The fallback is the part to know: JobInput.Activity is optional with a null default so a
+/// pre-existing history still deserializes, and a null falls back to ActivityOptionsInput's
+/// positional defaults, which are exactly the values below. Change config.yaml, not those
+/// defaults.
 /// </para>
 /// </remarks>
 public sealed class ActivityConfig
@@ -172,7 +183,7 @@ public sealed class WorkerConfig
     /// This is the only way to make the sticky-cache and replay-pressure panels move
     /// on a laptop. At the default of 10000 nothing is ever evicted, no workflow is
     /// ever replayed from scratch, and temporal_sticky_cache_total_forced_eviction is
-    /// never even CREATED — Core registers a counter on first increment, so a metric
+    /// never even CREATED. Core registers a counter on first increment, so a metric
     /// that has never fired is absent from /metrics entirely rather than reading 0.
     /// </remarks>
     public int MaxCachedWorkflows { get; set; }
@@ -254,8 +265,8 @@ public sealed class SimpleConfig
     /// <summary>Fraction of Add updates handed operands whose sum overflows an int. 0-1.</summary>
     /// <remarks>
     /// The workflow's update validator rejects these. It is the only thing in the repo
-    /// that exercises a rejected update, and a rejected update writes NOTHING to history
-    /// -- which is the whole reason validators exist.
+    /// that exercises a rejected update, and a rejected update writes NOTHING to history,
+    /// which is why validators exist.
     /// </remarks>
     public double OverflowRate { get; set; } = 0.05;
 
@@ -278,6 +289,149 @@ public sealed class SimpleConfig
 }
 
 /// <summary>
+/// WorkflowSimpleActivity's job shape, its activity's timeouts, and every knob of the
+/// loadgen's THIRD driver loop.
+/// </summary>
+/// <remarks>
+/// The ordinary case, and the one the other two blocks do not cover: a single activity
+/// with a plain start-to-close timeout and a retry policy. Know the consequence of having
+/// no heartbeat timeout before you try to cancel one. WorkflowSimpleActivity's
+/// BuildActivityOptions spells it out.
+/// <para>
+/// Flat and single-hump, and the names are boring on purpose, for the reason
+/// <see cref="SimpleConfig"/> records: CamelCaseNamingConvention lowers only the FIRST
+/// character, and an unmatched YAML key is a hard error here.
+/// </para>
+/// <para>
+/// Reaches its workflow the same way <see cref="ActivityConfig"/> does: the loadgen driver
+/// calls <c>SimpleActivityInput.From</c> on it, so the values travel into the workflow input
+/// and are recorded in the history. There is no asymmetry between the two blocks to draw.
+/// Both are live, and both are live by the same route.
+/// </para>
+/// </remarks>
+public sealed class SimpleActivityConfig
+{
+    /// <summary>Turn the third driver loop off without editing the loadgen. <c>--no-simple-activity</c> does the same.</summary>
+    /// <remarks>
+    /// NOT <c>--no-simple</c>, which is the SimpleNoActivity loop. Both flags exist and
+    /// they are matched exactly, never by prefix.
+    /// </remarks>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>How long the activity sleeps BEFORE it fetches anything.</summary>
+    /// <remarks>
+    /// In the ACTIVITY, not a workflow timer. That is what makes this case worth having:
+    /// the sleep occupies an activity slot, produces a real
+    /// temporal_activity_execution_latency, and gives
+    /// <see cref="StartToCloseTimeout"/> something that can actually fire.
+    /// Workflow.DelayAsync would write a TimerStarted/TimerFired pair, occupy nothing, and
+    /// leave an activity that returns in one HTTP round trip.
+    /// <para>
+    /// It also FLOORS repro_simple_activity_latency, which is why HistogramBuckets.cs has
+    /// a row with boundaries just above 5000ms. Change this and that row is wrong.
+    /// </para>
+    /// </remarks>
+    public TimeSpan SleepDuration { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Per attempt. Must exceed <see cref="SleepDuration"/> + <see cref="HttpTimeout"/> + 2s.</summary>
+    /// <remarks>
+    /// With no heartbeat timeout, start-to-close is the ONLY activity timeout this
+    /// workflow can produce, which is also why its Classify matches
+    /// TimeoutType.StartToClose and not TimeoutType.Heartbeat. ConfigLoader.Validate
+    /// enforces the headroom: less than that and every attempt dies of start-to-close
+    /// against a perfectly healthy network, and the retry policy burns through
+    /// <see cref="Retry"/>.MaximumAttempts proving it.
+    /// </remarks>
+    public TimeSpan StartToCloseTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Hard bound on the Open-Meteo call, enforced by the activity itself.</summary>
+    /// <remarks>
+    /// A downed interface fails fast; a BLACKHOLED route does not, and without this the
+    /// run outlives demo-down.sh's drain window with nothing in the log to say why. The
+    /// activity aborts its own request so you get a WARNING naming the elapsed time,
+    /// rather than an opaque server-side TimeoutFailure that cannot tell you whether the
+    /// sleep, DNS, TLS or the response ran long.
+    /// </remarks>
+    public TimeSpan HttpTimeout { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>The activity's retry policy.</summary>
+    /// <remarks>
+    /// MaximumAttempts is validated to be greater than zero here, which is STRICTER than
+    /// activity.retry.maximumAttempts. Zero means UNLIMITED in
+    /// Temporalio.Common.RetryPolicy. Write 1 for "do not retry". Unlimited retries
+    /// against a THIRD-PARTY endpoint is the one place in this repo where a stuck run is
+    /// also someone else's problem: a sustained Open-Meteo 5xx would hold an activity slot
+    /// and keep requesting forever.
+    /// </remarks>
+    public RetryConfig Retry { get; set; } = new();
+
+    /// <summary>Degrees north. Seattle by default.</summary>
+    /// <remarks>
+    /// Validated to [-90, 90]. Outside that Open-Meteo answers HTTP 400, which the
+    /// activity throws NON-retryably, so a typo fails every run on attempt 1 instead of
+    /// quietly producing a synthetic reading. A config bug is not an outage.
+    /// </remarks>
+    public double Latitude { get; set; } = 47.6062;
+
+    /// <summary>Degrees east. Validated to [-180, 180], same reasoning as <see cref="Latitude"/>.</summary>
+    public double Longitude { get; set; } = -122.3321;
+
+    /// <summary>Where to fetch the weather from. Open-Meteo needs no API key and no account.</summary>
+    /// <remarks>
+    /// A knob rather than a constant so the synthetic-fallback path is reachable by config
+    /// edit instead of by unplugging a laptop: point it at
+    /// <c>http://127.0.0.1:1/forecast</c> for an instant connection-refused.
+    /// <para>
+    /// Reaches the activity through its CONSTRUCTOR, not the workflow input, because it is
+    /// infrastructure rather than job shape. Same channel FaultConfig uses.
+    /// </para>
+    /// </remarks>
+    public string BaseUrl { get; set; } = "https://api.open-meteo.com/v1/forecast";
+
+    /// <summary>When true an UNREACHABLE Open-Meteo throws instead of falling back to a synthetic reading.</summary>
+    /// <remarks>
+    /// Shipped OFF because the demo scripts have to stay green with no egress.
+    /// <para>
+    /// This flag governs the UNREACHABLE case only, and it is not the only route to
+    /// outcome="failed". The synthetic fallback is gated on transport failure, so with the
+    /// flag off a server that ANSWERED still fails the run: a non-retryable status, a changed
+    /// response schema, or a 429/5xx exhausting <see cref="Retry"/>.MaximumAttempts all reach
+    /// the workflow as an activity failure and record outcome="failed" source="none".
+    /// </para>
+    /// <para>
+    /// No initializer: CA1805 forbids a redundant <c>= false</c> and it is a build error
+    /// here.
+    /// </para>
+    /// </remarks>
+    public bool RequireLiveWeather { get; set; }
+
+    /// <summary>Mean interval between starts, before jitter.</summary>
+    /// <remarks>
+    /// SLOWER than simple.rate on purpose, and not because of your laptop: this is the
+    /// only loop in the repo that calls a third-party API. 15s with concurrency 4 is about
+    /// 4 requests a minute, ~5,760 a day, comfortably inside Open-Meteo's free tier, so a
+    /// demo left running overnight still does not get you blocked. simple.rate's 3s would
+    /// be ~28,800 a day and would.
+    /// </remarks>
+    public TimeSpan Rate { get; set; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Fractional spread on <see cref="Rate"/>: the interval is
+    /// <c>rate x [1-jitter, 1+jitter]</c>. 0 is a metronome.
+    /// </summary>
+    /// <remarks>
+    /// Validated to be under 1, same contract as <see cref="SimpleConfig.Jitter"/> and
+    /// computed by the same helper. At exactly 1 the low end of the range is zero and the
+    /// driver loop becomes a busy spin, here against api.open-meteo.com, which will
+    /// rate-limit you for it.
+    /// </remarks>
+    public double Jitter { get; set; } = 0.5;
+
+    /// <summary>Max runs in flight. At capacity a tick is SKIPPED, never queued.</summary>
+    public int Concurrency { get; set; } = 4;
+}
+
+/// <summary>
 /// Makes the seed workflow produce interesting signal. All zero/false means the
 /// activity always succeeds and every failure, retry and heartbeat panel sits at
 /// zero.
@@ -295,8 +449,8 @@ public sealed class FaultConfig
     /// <summary>Fraction of activity ATTEMPTS that throw a retryable failure. 0-1.</summary>
     /// <remarks>
     /// ONE roll per attempt, outside the step loop, so P(this attempt fails) IS this
-    /// number. That makes P(the WORKFLOW fails) FailureRate ^ maximumAttempts —
-    /// 0.15^5, roughly one in thirteen thousand — which is why the shipped 0.15
+    /// number. That makes P(the WORKFLOW fails) FailureRate ^ maximumAttempts, or
+    /// 0.15^5, roughly one in thirteen thousand, which is why the shipped 0.15
     /// produces an outcome split that is entirely `completed`. Rolling per step
     /// instead would give 1 - (1 - r)^steps, i.e. 99.99% at the shipped steps: 60,
     /// and every workflow would die terminally.

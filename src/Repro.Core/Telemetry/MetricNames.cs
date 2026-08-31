@@ -1,6 +1,6 @@
 namespace Repro.Core.Telemetry;
 
-/// <summary>The 14 custom metric names, their tag keys, and the outcome values.</summary>
+/// <summary>The 16 custom metric names, their tag keys, and the outcome values.</summary>
 /// <remarks>
 /// These exist so a typo is a compile error instead of an empty Grafana panel.
 /// Nothing at runtime would catch "repro_hearbeat_sent": Core accepts any name
@@ -33,14 +33,52 @@ public static class MetricNames
     /// SEPARATE NAMES, not a second workflow_type on repro_workflow_completed, and this
     /// is load-bearing. The Bug Signals board queries that metric as
     /// `sum by (outcome) (rate(repro_workflow_completed{...}))` with NO workflow_type
-    /// selector (signals.json:704, generated at build-dashboards.py:611) and STACKS the
-    /// result. A second workflow type sharing the name would be summed into the
-    /// heartbeat lines and would falsify the outcome-split claim documented at
-    /// config.yaml:118-122.
+    /// selector and STACKS the result. A second workflow type sharing the name would be
+    /// summed into the heartbeat lines and would falsify the outcome-split claim that
+    /// config.yaml's fault.failureRate comment makes.
+    /// <para>
+    /// Anchors rather than line numbers, deliberately: the panel is the one titled
+    /// "Custom: repro workflow outcomes /s" in build-dashboards.py, and its generated
+    /// target is the only `sum by (outcome)` over repro_workflow_completed in
+    /// dashboards/sandbox/signals.json. This comment previously cited
+    /// build-dashboards.py:611 and was silently made wrong by an insertion four lines
+    /// above it; grep for the title instead.
+    /// </para>
     /// </remarks>
     public const string SimpleCompleted = "repro_simple_completed";
     public const string SimpleLatency = "repro_simple_latency";
     public const string SimpleMessage = "repro_simple_message";
+
+    /// <summary>WorkflowSimpleActivity's outcome counter and end-to-end latency.</summary>
+    /// <remarks>
+    /// The THIRD separate pair, for the same reason <see cref="SimpleCompleted"/> is the
+    /// second: the Bug Signals board queries repro_workflow_completed as
+    /// `sum by (outcome) (rate(...))` with NO workflow_type selector and STACKS the result
+    /// (the panel titled "Custom: repro workflow outcomes /s"), so a third workflow type
+    /// sharing that name would be summed into the heartbeat lines.
+    /// <para>
+    /// SUBSTRING-COLLISION CHECK, because HistogramBuckets's header warns that Core matches
+    /// bucket-override keys with metric_name.Contains(key) in nondeterministic order and a
+    /// reader will immediately wonder about this pair.
+    /// "repro_simple_activity_latency".Contains("repro_simple_latency") is FALSE: they
+    /// diverge at index 13, "_l" against "_a". The reverse is false because it is shorter. The two rows are independent. TelemetryTests turns that hand-check into a
+    /// test, because the next name inserted here may not be so lucky.
+    /// </para>
+    /// <para>
+    /// <see cref="SimpleActivityLatency"/> deliberately carries ONLY the outcome tag, not
+    /// <see cref="Tags.Source"/>, and NOT because the source is invisible in the numbers.
+    /// It is plainly visible: measured, a refused endpoint lands near 5.02s and a live fetch
+    /// near 5.77s, three of HistogramBuckets' boundaries apart. The reason is that the
+    /// question "is this demo reaching the internet" is already answered exactly once, by
+    /// <c>sum by (source)</c> on <see cref="SimpleActivityCompleted"/>, and answering it a
+    /// second time would double a 13-boundary histogram's series count for no new
+    /// information. For "how slow is Open-Meteo" specifically, the precise answer is
+    /// WeatherReading.HttpElapsedMs in the result payload, not a latency histogram dominated
+    /// by the sleep.
+    /// </para>
+    /// </remarks>
+    public const string SimpleActivityCompleted = "repro_simple_activity_completed";
+    public const string SimpleActivityLatency = "repro_simple_activity_latency";
 
     /// <remarks>
     /// Do NOT add namespace/task_queue/workflow_type/activity_type here. Both
@@ -56,13 +94,16 @@ public static class MetricNames
 
         /// <summary>Which message arrived: see <see cref="Kinds"/>.</summary>
         public const string Kind = "kind";
+
+        /// <summary>Where a weather reading came from: see <see cref="Sources"/>.</summary>
+        public const string Source = "source";
     }
 
     /// <summary>The values of the <c>kind</c> tag on <see cref="SimpleMessage"/>.</summary>
     /// <remarks>
     /// No value for a REJECTED update. An update the validator refuses never reaches the
-    /// handler and writes nothing to history, and a validator must be side-effect free --
-    /// so there is nowhere honest to count it from inside the workflow. The loadgen
+    /// handler and writes nothing to history, and a validator must be side-effect free, so
+    /// there is nowhere honest to count it from inside the workflow. The loadgen
     /// counts rejections client-side instead.
     /// </remarks>
     public static class Kinds
@@ -71,10 +112,42 @@ public static class MetricNames
         public const string Add = "add";
     }
 
-    /// <summary>Values of the <c>outcome</c> tag: four on the workflow metrics, three on the simple ones.</summary>
+    /// <summary>The values of the <c>source</c> tag on <see cref="SimpleActivityCompleted"/>.</summary>
+    /// <remarks>
+    /// THE HYPHEN IN "open-meteo" IS SAFE. Core replaces '-' with '_' in metric NAMES and
+    /// panics on any other invalid character there, but it does not sanitize label VALUES
+    /// at all. That is the same asymmetry <c>ReproConfig.TaskQueue</c> documents for
+    /// task_queue="repro-task-queue".
+    /// <para>
+    /// <see cref="None"/> exists so `sum by (source)` accounts for 100% of runs. A failed
+    /// or cancelled run has no reading at all, and omitting the tag would put series with
+    /// an absent label next to series that have one. That is readable in Prometheus, confusing
+    /// in a legend, and it makes source="" look like a third kind of run rather than a
+    /// missing one.
+    /// </para>
+    /// </remarks>
+    public static class Sources
+    {
+        /// <summary>A real reading, fetched over the network.</summary>
+        public const string OpenMeteo = "open-meteo";
+
+        /// <summary>The transport failed and the activity returned a stand-in. Watch this one.</summary>
+        public const string Synthetic = "synthetic";
+
+        /// <summary>No reading: the run failed, timed out or was cancelled.</summary>
+        public const string None = "none";
+    }
+
+    /// <summary>
+    /// Values of the <c>outcome</c> tag: four on repro_workflow_completed and
+    /// repro_simple_activity_completed, three on repro_simple_completed.
+    /// </summary>
     /// <remarks>
     /// repro_workflow_completed uses completed / failed / canceled / timed_out.
     /// repro_simple_completed uses stopped / expired / canceled.
+    /// repro_simple_activity_completed uses completed / failed / canceled / timed_out, and
+    /// timed_out THERE is TimeoutType.StartToClose, never Heartbeat, because that
+    /// workflow sets no heartbeat timeout at all.
     /// </remarks>
     public static class Outcomes
     {

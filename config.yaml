@@ -1,7 +1,7 @@
 # Every knob for the sandbox lives here. Any field may be omitted; the C# POCOs in
 # src/Repro.Core/Config/ReproConfig.cs hold the defaults.
 #
-# Durations are Go-style strings -- "150ms", "10s", "1m30s", "0" -- parsed by
+# Durations are Go-style strings, for example "150ms", "10s", "1m30s" and "0", parsed by
 # GoDurationYamlConverter. That is deliberate: this file is meant to be dialled up
 # and down while watching Grafana, and TimeSpan's own "00:00:00.150" form makes
 # that miserable.
@@ -23,7 +23,7 @@ taskQueue: repro-task-queue
 workflowId: repro-workflow
 
 # Temporal Cloud: set apiKey OR tls.certPath + tls.keyPath. Either turns TLS on.
-# Keep secrets out of this committed file -- put them in config.local.yaml
+# Keep secrets out of this committed file. Put them in config.local.yaml
 # (gitignored) and pass --config config.local.yaml.
 apiKey: ""
 tls:
@@ -60,17 +60,19 @@ job:
   steps: 60
   stepDuration: 1s
 
-# NOT WIRED YET, and this is the one block in this file that is not the source of
-# truth. HeartbeatWorkflow builds its ActivityOptions from JobInput.Activity, on
-# purpose: options carried in the input are recorded in the history, so a replay
-# reproduces them byte for byte. ActivityOptionsInput.From(config.Activity) exists to
-# project this block onto that input, but the starter and loadgen do not call it yet,
-# so the workflow falls back to ActivityOptionsInput's defaults -- which are exactly
-# the values below, which is why nothing looks wrong until you edit one. Editing
-# heartbeatTimeout or startToCloseTimeout today only changes what ConfigLoader.Validate
-# refuses to start on.
+# LIVE, but reached INDIRECTLY, and the indirection is the interesting part.
+# HeartbeatWorkflow never reads this file: it builds its ActivityOptions from
+# JobInput.Activity, because options carried in the input are recorded in the history, so a
+# replay reproduces them byte for byte, which a file you can edit between the original run
+# and the replay cannot promise. ActivityOptionsInput.From(config.Activity) closes the gap,
+# and both clients call it (Repro.Starter and Repro.LoadGen), so editing a value here really
+# does change what the next run schedules.
+#
+# The fallback is what to know: JobInput.Activity is optional with a null default so an old
+# history still deserializes, and a null falls back to ActivityOptionsInput's own defaults,
+# which are exactly the values below. Change them here, not in the record.
 activity:
-  # REQUIRED for the activity to receive cancellation at all -- the server only
+  # REQUIRED for the activity to receive cancellation at all. The server only
   # communicates cancellation in the RESPONSE to a heartbeat RPC.
   #
   # Also the input to Core's throttle: min(heartbeatTimeout x 0.8,
@@ -94,7 +96,7 @@ worker:
   maxHeartbeatThrottleInterval: 60s
   defaultHeartbeatThrottleInterval: 30s
   # 0 leaves the SDK default (10000). Set to 1 or 2 to force sticky-cache evictions
-  # and replay storms on demand -- it is the only way to make the sticky-cache and
+  # and replay storms on demand. It is the only way to make the sticky-cache and
   # replay-pressure panels on the Bug Signals board move on a single laptop.
   maxCachedWorkflows: 0
   maxConcurrentActivities: 0      # 0 leaves the SDK default (100)
@@ -117,7 +119,7 @@ loadgen:
 fault:
   # ONE roll per ATTEMPT, not per step: P(this attempt fails) IS this number. A
   # workflow therefore only fails when all activity.retry.maximumAttempts rolls come
-  # up failure -- 0.15^5, about one in thirteen thousand -- so at 0.15 the signals
+  # up failure, 0.15^5 or about one in thirteen thousand, so at 0.15 the signals
   # board's outcome split is all `completed` and that is correct. Raise this to ~0.8
   # if you want to watch `failed`.
   failureRate: 0.15
@@ -134,7 +136,7 @@ fault:
 
   # Keep doing work but never call Heartbeat(). Proves an activity that stops
   # heartbeating can never be cancelled.
-  # Panel: heartbeat board "Heartbeat calls vs heartbeat RPCs" -- both fall to zero
+  # Panel: heartbeat board "Heartbeat calls vs heartbeat RPCs". Both fall to zero
   # while repro_activity_progress keeps climbing. Unlike stallPastHeartbeatTimeout
   # this is not gated to attempt 1, so all five attempts heartbeat-time-out, the
   # retry policy is exhausted, and THIS is the knob that moves the signals board's
@@ -143,7 +145,7 @@ fault:
 
   # Swallow OperationCanceledException and finish the batch on an uncancellable
   # token. Proves TemporalWorker.ExecuteAsync does not return until every executing
-  # activity returns, and that gracefulShutdownTimeout does NOT bound that -- it
+  # activity returns, and that gracefulShutdownTimeout does NOT bound that. It
   # only controls WHEN ctx.CancellationToken fires.
   # THIS WEDGES YOUR TERMINAL FOR THE REST OF THE BATCH. That is the demo.
   ignoreCancellation: false
@@ -156,7 +158,7 @@ simple:
 
   # Carried into SimpleInput and used as the WaitConditionAsync timeout, so a run nobody
   # signals still ends. KEEP IT UNDER demo-down.sh's drain budget, which is
-  # worker.gracefulShutdownTimeout + 15 = 45s here -- a longer bound means teardown
+  # worker.gracefulShutdownTimeout + 15 = 45s here. A longer bound means teardown
   # SIGKILLs the loadgen mid-run instead of draining it.
   maxDuration: 30s
 
@@ -174,7 +176,7 @@ simple:
   maxMessages: 5
   messageGap: 250ms
 
-  # CHAOS. Fraction of Add updates handed operands whose sum overflows an int -- the
+  # CHAOS. Fraction of Add updates handed operands whose sum overflows an int. The
   # workflow's update VALIDATOR rejects those, and a rejected update writes nothing at all
   # to the event history. This is the only thing in the repo that proves that.
   overflowRate: 0.05
@@ -192,3 +194,96 @@ simple:
   stopWeight: 5
   cancelWeight: 3
   expireWeight: 2
+
+# WorkflowSimpleActivity: the ordinary shape, and the one the two blocks above do not
+# cover. ONE activity that sleeps, then fetches the current weather from Open-Meteo, and
+# returns the reading from [WorkflowRun], so it lands in the WorkflowExecutionCompleted
+# event and `temporal workflow show -w <id>` prints the temperature in the payload.
+#
+# NO HEARTBEATS. Plain startToCloseTimeout plus a retry policy, which is what almost every
+# real activity should be. Know the consequence before you try to cancel one: the server
+# communicates cancellation only in the RESPONSE to a heartbeat RPC, so a client
+# CancelAsync records the WORKFLOW as CANCELED while this activity runs to completion on
+# its own schedule and its result is thrown away. Worker shutdown DOES reach it, because
+# that token is local. HeartbeatWorkflow is the other half of the comparison.
+#
+# OFFLINE FALLBACK. If the TRANSPORT fails, say no egress in CI or no wifi on a plane, the
+# activity logs a WARNING and returns a synthetic reading tagged source="synthetic"
+# instead of failing, so the demo scripts stay green. A server that ANSWERED is never
+# smoothed over: 429 and 5xx are retried, other 4xx and a changed schema fail
+# non-retryably. Watch the source label as well as the outcome label.
+#
+# The loadgen runs this as a THIRD loop. Turn it off with `enabled: false` or
+# `--no-simple-activity`, NOT `--no-simple`, which is the SimpleNoActivity loop.
+simpleActivity:
+  enabled: true
+
+  # The activity sleeps this long BEFORE the HTTP call, inside the same attempt. In the
+  # ACTIVITY, not Workflow.DelayAsync. The aim is a long activity: an occupied activity
+  # slot, a real temporal_activity_execution_latency, a start-to-close timeout that can
+  # actually fire. A workflow timer produces a TimerStarted/TimerFired pair and no activity
+  # task at all.
+  #
+  # It also FLOORS repro_simple_activity_latency, which is why HistogramBuckets.cs carries
+  # boundaries at 5100/5250/5500/6000. Change this and that row is wrong.
+  sleepDuration: 5s
+
+  # Must be at least sleepDuration + httpTimeout + 2s; ConfigLoader.Validate refuses less.
+  # The 2s is headroom for activity-task scheduling and payload conversion. With no
+  # heartbeat timeout, start-to-close is the ONLY activity timeout this workflow can
+  # produce, which is also why its Classify matches TimeoutType.StartToClose and not
+  # TimeoutType.Heartbeat.
+  startToCloseTimeout: 30s
+
+  # Hard bound on the Open-Meteo call, enforced by the activity itself so a slow endpoint
+  # produces a logged fallback rather than an opaque server-side TimeoutFailure that cannot
+  # tell you whether the sleep, DNS, TLS or the response ran long. A downed interface fails
+  # fast; a BLACKHOLED route does not, which is the case this exists for.
+  httpTimeout: 3s
+
+  retry:
+    initialInterval: 1s
+    backoffCoefficient: 2.0
+    maximumInterval: 10s
+    # MUST be > 0 here, unlike activity.retry.maximumAttempts. 0 means UNLIMITED in
+    # Temporalio.Common.RetryPolicy. Write 1 for "do not retry". Unlimited retries against
+    # a THIRD-PARTY endpoint is the one place in this repo where a stuck run is also someone
+    # else's problem, and it parks the loadgen past demo-down.sh's 45s drain budget.
+    #
+    # At 3 the worst-case run is 3 x (5s + 3s) + 3s backoff = 27s, comfortably inside it.
+    maximumAttempts: 3
+
+  # Seattle. Open-Meteo needs no API key and no account.
+  # Validated to [-90, 90] / [-180, 180]: outside that Open-Meteo answers HTTP 400, which
+  # the activity throws NON-retryably, so a typo fails every run on attempt 1 instead of
+  # quietly falling back to synthetic. A config bug is not an outage.
+  latitude: 47.6062
+  longitude: -122.3321
+
+  # A knob rather than a constant so the synthetic path is reachable by config edit instead
+  # of by unplugging a laptop. Point it at http://127.0.0.1:1/forecast for an instant
+  # connection-refused, and watch source="synthetic" appear on the signals board.
+  baseUrl: "https://api.open-meteo.com/v1/forecast"
+
+  # When true, an UNREACHABLE Open-Meteo throws instead of falling back to a synthetic
+  # reading. Shipped OFF because demo-up.sh has to stay green with no egress. Set it
+  # together with a dead baseUrl to watch the retry policy exhaust.
+  #
+  # It is NOT the only route to outcome="failed", and believing that will mislead you during
+  # a real upstream incident. A server that ANSWERED already fails with the flag off: the
+  # fallback only ever covers transport failure, so a non-retryable status, a changed
+  # response schema, or a 429/5xx exhausting retry.maximumAttempts all end the run
+  # outcome="failed" source="none" at the shipped setting. The flag decides what happens when
+  # nobody answered at all.
+  requireLiveWeather: false
+
+  # Loadgen's third loop. Same jittered-interval, skip-at-capacity contract as `simple`,
+  # and the same jitter formula (see Jitter.NextInterval).
+  #
+  # SLOWER than simple.rate on purpose, and not because of your laptop: this is the only
+  # loop in the repo that calls a third-party API. 15s x 4 in flight is about 4 requests a
+  # minute, ~5,760 a day, comfortably inside Open-Meteo's free tier, so a demo left running
+  # overnight still does not get you blocked. simple.rate's 3s would be ~28,800 a day.
+  rate: 15s
+  jitter: 0.5
+  concurrency: 4

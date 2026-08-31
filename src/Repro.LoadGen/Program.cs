@@ -53,7 +53,12 @@ var client = await ClientFactory.ConnectAsync(config, runtime, "loadgen", logger
 var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
     .AddWorkflow<SimpleNoActivity>()
-    .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker));
+    .AddWorkflow<WorkflowSimpleActivity>()
+    .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker))
+    // A SECOND call, not a second argument: AddAllActivities takes exactly ONE instance,
+    // so a new activity CLASS needs its own. The two classes must not declare an activity
+    // of the same name. A duplicate throws at registration, before the worker polls.
+    .AddAllActivities(new WeatherActivities(config.SimpleActivity));
 options.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
 if (config.Worker.MaxCachedWorkflows > 0)
 {
@@ -125,6 +130,28 @@ else
     log.LogInformation("simple: OFF (simple.enabled is false, or --no-simple was passed)");
 }
 
+// THIRD LOOP, and like the second it MUST be constructed after the banner above, for the
+// same demo-lib.sh:70 readiness reason.
+//
+// The process now runs three loops at concurrency 8 + 8 + 4, so up to 20 workflows in
+// flight against the SDK's default 100 workflow-task and 100 activity slots. Nothing to
+// change; it is the number you want when a slot-saturation panel moves.
+var weatherOn = config.SimpleActivity.Enabled && !flags.Switch("--no-simple-activity");
+var weatherTask = Task.CompletedTask;
+if (weatherOn)
+{
+    var weatherDriver = new SimpleActivityDriver(
+        client, config.SimpleActivity, config.TaskQueue,
+        loggerFactory.CreateLogger("simple-activity"));
+
+    weatherTask = weatherDriver.RunAsync(shutdown.Token);
+}
+else
+{
+    log.LogInformation(
+        "simple-activity: OFF (simpleActivity.enabled is false, or --no-simple-activity was passed)");
+}
+
 var started = 0;
 var input = new JobInput(
     steps,
@@ -177,15 +204,35 @@ catch (OperationCanceledException)
     log.LogInformation("loadgen: shutting down after starting {Count} workflows", started);
 }
 
-// Before the worker, so the driver's final summary lands while the worker is still
+// Drivers before the worker, so each driver's final summary lands while the worker is still
 // polling and its in-flight runs can still complete.
+//
+// TOTAL catches, deliberately rather than out of laziness. Both drivers already swallow
+// OperationCanceledException internally and return normally, so an OCE-only handler here is
+// dead code. And because these are bare top-level statements, ANY other fault escaping the
+// first await would skip every await below it, including the worker drain. That is how a
+// driver bug silently turns into a worker that was never drained, which is the opposite of
+// what this ordering exists to guarantee. Logging and continuing costs a process-killing
+// stack trace and buys a guaranteed drain; at shutdown, the drain is worth more.
+//
+// Not `await Task.WhenAll(simpleTask, weatherTask)`: it would surface only the first fault
+// and would drop the guarantee that each driver's summary lands before the worker's.
 try
 {
     await simpleTask;
 }
-catch (OperationCanceledException)
+catch (Exception e)
 {
-    // Expected: same shutdown token.
+    log.LogWarning("simple driver ended in error: {Message}", e.Message);
+}
+
+try
+{
+    await weatherTask;
+}
+catch (Exception e)
+{
+    log.LogWarning("simple-activity driver ended in error: {Message}", e.Message);
 }
 
 try
@@ -194,7 +241,8 @@ try
 }
 catch (OperationCanceledException)
 {
-    // Expected: the worker was cancelled by the same token.
+    // Expected, and kept narrow on purpose: this one really is the shutdown token, and a
+    // worker fault SHOULD reach the runtime rather than be logged and swallowed.
 }
 
 return 0;

@@ -1,9 +1,10 @@
 # Dashboards
 
-Grafana on <http://localhost:3000>, no login. Four folders:
+Grafana on <http://localhost:3000>, no login. Three folders, eight dashboards:
 
-- `sandbox/` holds the boards written for this topology: 4 dashboards, 55 panels, 82
-  targets. Every one of the 82 was probed against a live stack before it shipped.
+- `sandbox/` holds the boards written for this topology: 4 dashboards, 57 panels, 84
+  targets. Every one of the 84 has been probed against a live stack, including the two
+  `simple-activity` panels; see the measurement below.
 - `temporal-server/` and `temporal-sdk/` hold boards imported from
   [temporalio/dashboards](https://github.com/temporalio/dashboards) as-is, for breadth,
   pinned to commit `4994df2` in `grafana/dashboards/UPSTREAM_SHA`.
@@ -41,17 +42,36 @@ legitimately empty here. Probing them is still worth doing: it is how "leave all
 `PrometheusOptions` suffix flags false, because that is what the vendored Core SDK board
 is written against" stops being an assertion and becomes a measurement.
 
-Measured against a live stack with the worker and loadgen running and
-`failureRate: 0.15`:
+Measured against a live stack brought up by `./scripts/demo-up.sh` with the worker and
+loadgen running, shipped `config.yaml` (`failureRate: 0.15`), on a Prometheus started fresh
+for this run:
 
 ```
-authored: 70 OK  +  12 FALLBACK  =  82/82 targets render
-authored: 0 NODATA, 0 ERROR
-authored: 55/55 panels have at least one series
+authored: 66 OK  +  17 FALLBACK  =  83/84 targets render
+authored: 1 NODATA, 0 ERROR
+authored: 57/57 panels have at least one series
 ```
 
-The OK/FALLBACK split moves with stack state. `82/82`, `0 NODATA, 0 ERROR` and `55/55`
-are the parts that must not.
+Both `simple-activity` targets scored `OK`, and the p95 read 5926 ms, between the 5500 and
+6000 boundaries, which is a live fetch sitting on top of the 5s sleep exactly where
+`HistogramBuckets.cs` says it should.
+
+**The 1 NODATA is `Checkpoint staleness on resume p95`**, and it is honest rather than
+broken. `repro_heartbeat_staleness` is recorded only when an activity RESUMES from a
+heartbeat checkpoint, so nothing emits it until a worker is killed mid-activity. That target
+carries no `or vector(0)`, so it cannot fall back to a zero line the way most
+only-on-failure targets do. It reads `NODATA` until you run the `kill -9` resume test in
+[HEARTBEATING.md](HEARTBEATING.md). Its row is in the table below.
+
+Read the numbers this way: the OK/FALLBACK split moves with stack state and with how long
+the stack has been up, so do not treat 66/17 as a target. `0 ERROR`, and every target and
+panel accounted for, are the parts that must not move. `NODATA` is only acceptable with a
+named reason, which is why the one above is named.
+
+Do not hand-edit this block or do arithmetic on it. Re-run
+`python3 grafana/probe-dashboards.py` against a live stack and paste what it prints. Note
+that its exit code is `1` only on an authored `ERROR` -- a `NODATA` exits `0`, so read the
+summary lines rather than trusting `$?`.
 
 To move the `FALLBACK` targets into `OK`, put the stack in the state each needs:
 
@@ -61,8 +81,12 @@ To move the `FALLBACK` targets into `OK`, put the stack in the state each needs:
 | `timed_out` outcomes | `fault.stopHeartbeating: true`. **Not** `stallPastHeartbeatTimeout`, which only stalls attempt 1, so attempt 2 completes and the outcome stays `completed` |
 | cancellation reasons | `temporal workflow cancel -w repro-workflow`, or Ctrl-C the starter |
 | sticky cache miss / forced eviction / replay pressure | `worker.maxCachedWorkflows: 1` |
+| checkpoint staleness on resume (**NODATA**, not FALLBACK, because it has no `or vector(0)`) | `kill -9` the worker mid-activity so the next attempt resumes from a heartbeat checkpoint; see [HEARTBEATING.md](HEARTBEATING.md) |
 | non-determinism (SDK and server) | break the workflow and replay, or edit it while a run is in flight |
 | RPC and poll failures | stop the server mid-run, or throttle it |
+| simple-activity `outcome="failed"` | `simpleActivity.requireLiveWeather: true` with an unreachable `simpleActivity.baseUrl` |
+| simple-activity `source="synthetic"` | an unreachable `simpleActivity.baseUrl`, e.g. `http://127.0.0.1:1/forecast`, or no egress |
+| simple-activity `outcome="canceled"` | `temporal workflow cancel -w repro-weather-<hex>` mid-sleep. The third loadgen loop sends no cancels, by design, so this one is hand-only |
 
 ## Known-empty official panels
 
