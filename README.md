@@ -102,7 +102,7 @@ dotnet clean && rm -rf src/*/bin src/*/obj tests/*/bin tests/*/obj
 |---|---|
 | [docs/DEMO.md](docs/DEMO.md) | The two scripts: every phase, flag and exit code, and the six things they do differently from the manual path |
 | [docs/HEARTBEATING.md](docs/HEARTBEATING.md) | The throttle, stale checkpoints, the `kill -9` resume test, the three fault knobs, the `temporal activity` verbs |
-| [docs/GOTCHAS.md](docs/GOTCHAS.md) | 25 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
+| [docs/GOTCHAS.md](docs/GOTCHAS.md) | 29 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
 | [docs/CONFIG.md](docs/CONFIG.md) | Every `config.yaml` field, and the four `activity.*` rows that are validated but not applied |
 | [docs/DASHBOARDS.md](docs/DASHBOARDS.md) | Probing every panel, the `82/82` result, known-empty imported panels |
 | [docs/REPLAY.md](docs/REPLAY.md) | Capture a history, catch a nondeterminism error, and why the replayer emits no metrics |
@@ -120,10 +120,13 @@ src/Repro.Core/     the library everything else references
   Telemetry/        the ONE TemporalRuntime + Core Prometheus exporter, metric name
                     constants, histogram bucket overrides in milliseconds
   Workflows/HeartbeatWorkflow.workflow.cs   seed workflow    <- edit per repro
+  Workflows/SimpleNoActivity.workflow.cs    NO activities: signal, query, update, cancel
   Activities/HeartbeatActivities.cs         seed activity    <- edit per repro
   HeartbeatJob.cs   JobInput, ActivityOptionsInput, Checkpoint
+  SimpleJob.cs      SimpleInput, PokeInput, AddInput, SimpleResult, SimpleStatus
 src/Repro.Worker    polls until interrupted, serves :8077
-src/Repro.LoadGen   worker + continuous start loop, serves :8078
+src/Repro.LoadGen   worker + TWO start loops (heartbeat, and simple with jitter and
+                    injected chaos), serves :8078
 src/Repro.Starter   one run, prints result, pushes metrics on exit
                     (owns Telemetry/PushMetrics.cs, the Pushgateway bridge)
 src/Repro.Replay    replays a history JSON or a directory, exits 1 on mismatch

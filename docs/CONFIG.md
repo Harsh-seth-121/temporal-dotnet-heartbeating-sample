@@ -33,6 +33,16 @@ an afternoon spent staring at a flat panel.
 | `worker.maxCachedWorkflows` | `0` (SDK default 10000) | set to `1` to force evictions and replay storms |
 | `worker.maxConcurrentActivities` / `maxConcurrentWorkflowTasks` | `0` (SDK default 100) | slot counts; `0` leaves the SDK default. Applied by the worker **and** the loadgen. The loadgen used to drop both, so :8078 ran at 100/100 whatever the file said |
 | `loadgen.rate` / `concurrency` / `steps` | `5s` / `8` / `20` | traffic shape |
+| `simple.enabled` | `true` | run the loadgen's second loop at all; `--no-simple` does the same |
+| `simple.maxDuration` | `30s` | how long a `SimpleNoActivity` run waits before ending itself `expired`. Keep it UNDER `demo-down.sh`'s drain budget (`worker.gracefulShutdownTimeout` + 15 = 45s), or teardown SIGKILLs the loadgen mid-run |
+| `simple.rate` | `3s` | mean interval between simple starts, before jitter |
+| `simple.jitter` | `0.5` | interval is `rate x [1-jitter, 1+jitter]`. `0` is a metronome. Must be under `1`: at `1` the low end is zero and the driver loop busy-spins |
+| `simple.concurrency` | `8` | simple runs in flight; at capacity a tick is SKIPPED, never queued |
+| `simple.minMessages` / `maxMessages` | `0` / `5` | messages per run, coin-flipped between the `Poke` signal and the `Add` update |
+| `simple.messageGap` | `250ms` | upper bound on the random gap between two messages in one run |
+| `simple.overflowRate` | `0.05` | fraction of `Add` updates given operands that overflow an `int`. The workflow's update VALIDATOR rejects them, and a rejected update writes nothing at all to history |
+| `simple.raceRate` | `0.10` | fraction of runs sent one more message AFTER they close. Expected result is `RpcException`/`NotFound`, counted rather than crashed on |
+| `simple.stopWeight` / `cancelWeight` / `expireWeight` | `5` / `3` / `2` | weighted dice for how a run ends: `Stop` signal (Completed), a real client `CancelAsync` (CANCELED — the only path to that status), or nothing so `maxDuration` ends it. Only the ratio matters; the sum must be positive |
 | `fault.failureRate` | `0`, shipped as `0.15` | fraction of activity attempts that fail, one roll per attempt, so P(workflow fails) is this to the fifth |
 | `fault.latency` | `0`, shipped as `150ms` | latency added per step |
 | `fault.stallPastHeartbeatTimeout` | `false` | overrun the heartbeat timeout on attempt 1 |
