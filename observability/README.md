@@ -28,6 +28,9 @@ The same three commands work unchanged from the repo root. `../compose.yml` `inc
 this file and pins the project name to `temporal-dotnet-sandbox`, so both directories
 drive one stack.
 
+`../scripts/demo-up.sh` and `../scripts/demo-down.sh` wrap these three and also handle
+the host processes, which compose has never heard of. See [../docs/DEMO.md](../docs/DEMO.md).
+
 That project name is deliberately **not** `temporal-sandbox`, which is what the Go
 project this repo was ported from uses. Sharing it means `docker compose up` here
 silently adopts that stack's containers and volumes, and `down -v` from either repo
@@ -52,6 +55,8 @@ project.
 | `Repro.LoadGen` (host) | scraped | 8078 | same, under continuous traffic |
 | `Repro.Starter` (host) | pushes on exit | 9091 | SDK **client** metrics only |
 | `Repro.Replay` (host) | opt-in `--metrics` | 8079 | **nothing**, 200 with an empty body |
+
+`demo-up.sh` starts the first three. `Repro.Replay` is always manual.
 
 `Repro.Starter` pushes client metrics only. `repro_workflow_*` and `repro_activity_*`
 come from the worker, because workflow and activity code does not execute in the

@@ -44,7 +44,10 @@ resuming at step 2 of 12; checkpoint was 6265ms old (attempt 3)
 
 ## Kill the worker mid-activity
 
-1. Run the **built binary**, not `dotnet run`. `dotnet run` launches the app as a child
+1. Free :8078 first with `./scripts/demo-up.sh --no-loadgen`, or start the second worker
+with `--metrics off`. A `demo-up.sh` with no flags owns both :8077 and :8078.
+
+Run the **built binary**, not `dotnet run`. `dotnet run` launches the app as a child
    process, so killing the parent leaves the child running and holding :8077.
 
    ```bash

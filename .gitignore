@@ -74,3 +74,13 @@ config.local.yaml
 
 # Container state lives in named volumes; nothing container-owned belongs in git.
 observability/**/data/
+
+# Host-side demo state: the pid files and captured stdout for the processes
+# scripts/demo-up.sh launches, plus its build log. Leading slash on purpose, scoped to
+# the repo root like /.env above.
+#
+# The pattern is explicit rather than incidental: `.demo/log/` WOULD already be
+# swallowed by the unanchored `[Ll]og/` rule near the top of this file, but
+# `.demo/worker.pid` would NOT, so the layout is flat and this entry covers both.
+# Verify with:  git check-ignore -v .demo/worker.pid
+/.demo/

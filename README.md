@@ -13,29 +13,27 @@ the SDK band, `observability/.env` pins the server and UI images. Nothing else i
 installed globally.
 
 The four .NET processes run on the **host**, not in containers. Prometheus reaches them
-over `host.docker.internal`.
+over `host.docker.internal`. `demo-up.sh` starts three of them; `Repro.Replay` stays
+manual.
 
 ## Run it
 
 ```bash
-# 0. once, so step 2 is not a silent 30-second NuGet restore
-dotnet build
-
-# 1. the whole stack: Temporal server + Postgres + Web UI + Prometheus + Grafana + Pushgateway
-docker compose up -d
-
-# 2. worker (SDK metrics on :8077)
-dotnet run --project src/Repro.Worker
-
-# 3. continuous traffic, so dashboards have data (SDK metrics on :8078)
-dotnet run --project src/Repro.LoadGen
-
-# 4. one-shot run; pushes its client metrics to the Pushgateway on exit
-dotnet run --project src/Repro.Starter
+./scripts/demo-up.sh      # everything, and it waits until the demo is real
+./scripts/demo-down.sh    # drain the host processes, then remove the containers
 ```
+
+`demo-up.sh` builds, starts the eight containers, waits for the namespace and for
+Grafana, starts the worker on :8077 and the loadgen on :8078 as detached processes with
+logs in `.demo/`, waits until Prometheus has actually scraped both, then runs one
+60-step seed workflow. About 90s warm, several minutes on a cold first boot.
 
 Then open <http://localhost:3000>, which needs no login, and look at the `sandbox`
 folder.
+
+[docs/DEMO.md](docs/DEMO.md) has every flag, the exit codes, and the four-terminal
+manual sequence, which still works and is still the right tool for a debugger or a
+second worker.
 
 | URL | What |
 |---|---|
@@ -69,7 +67,9 @@ failure and latency panels move from the first run. Zero both for a clean baseli
 
 Three heartbeat faults ship off: `stallPastHeartbeatTimeout`, `stopHeartbeating` and
 `ignoreCancellation`. Each proves one specific claim. Turn on exactly one at a time,
-then restart the worker or loadgen. See [docs/HEARTBEATING.md](docs/HEARTBEATING.md).
+then `./scripts/demo-down.sh --keep-stack && ./scripts/demo-up.sh` to restart the host
+processes without rebooting Temporal. See
+[docs/HEARTBEATING.md](docs/HEARTBEATING.md).
 
 ## Start a new repro
 
@@ -84,10 +84,11 @@ JSON that demonstrates the bug. It is the artifact worth keeping.
 ## Reset
 
 ```bash
-docker compose down       # keep all data
-docker compose down -v    # full reset; REQUIRED if you change NUM_HISTORY_SHARDS
+./scripts/demo-down.sh              # keep all data
+./scripts/demo-down.sh --volumes    # full reset; REQUIRED if you change NUM_HISTORY_SHARDS
 
-# clear a stale one-shot starter push (Pushgateway retains groups forever)
+# clear a stale one-shot starter push. Only needed after --keep-stack: a plain down
+# removes the Pushgateway container and the group with it.
 dotnet run --project src/Repro.Starter -- --delete-push-group
 # or:  curl -X DELETE localhost:9091/metrics/job/temporal_starter/instance/local
 
@@ -99,6 +100,7 @@ dotnet clean && rm -rf src/*/bin src/*/obj tests/*/bin tests/*/obj
 
 | File | What is in it |
 |---|---|
+| [docs/DEMO.md](docs/DEMO.md) | The two scripts: every phase, flag and exit code, and the six things they do differently from the manual path |
 | [docs/HEARTBEATING.md](docs/HEARTBEATING.md) | The throttle, stale checkpoints, the `kill -9` resume test, the three fault knobs, the `temporal activity` verbs |
 | [docs/GOTCHAS.md](docs/GOTCHAS.md) | 25 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
 | [docs/CONFIG.md](docs/CONFIG.md) | Every `config.yaml` field, and the four `activity.*` rows that are validated but not applied |
@@ -126,7 +128,8 @@ src/Repro.Starter   one run, prints result, pushes metrics on exit
                     (owns Telemetry/PushMetrics.cs, the Pushgateway bridge)
 src/Repro.Replay    replays a history JSON or a directory, exits 1 on mismatch
 tests/Repro.Tests   config, duration, bind-address and flag parsing
-docs/               the five topic files above
+scripts/            demo-up.sh, demo-down.sh, and the bash 3.2 library they share
+docs/               the six topic files above
 history/            captured histories (committed)
 compose.yml         root entry point; includes observability/compose.yml
 observability/      compose stack, Prometheus, Grafana, dashboards

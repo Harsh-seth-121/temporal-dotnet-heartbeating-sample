@@ -12,8 +12,9 @@ using Temporalio.Runtime;
 using Temporalio.Worker;
 
 // loadgen keeps workflows flowing so the histogram panels have data. It runs BOTH a
-// worker and a starter loop in one process: a single `dotnet run --project
-// src/Repro.LoadGen` is enough to make every dashboard move.
+// worker and a starter loop in one process, so this one process is enough to make
+// every dashboard move. scripts/demo-up.sh starts it alongside Repro.Worker;
+// `--no-loadgen` there leaves :8078 free for the two-worker recipes.
 
 var flags = Flags.Parse(args);
 var config = ConfigLoader.Load(ConfigLoader.Resolve(flags.Str("--config")));

@@ -74,6 +74,8 @@ using var shutdown = new CancellationTokenSource();
 // Console.CancelKeyPress catches SIGINT only. `docker compose down`, `docker stop`
 // and most process supervisors send SIGTERM, which it never sees — so a worker
 // wired only to CancelKeyPress hangs until it is SIGKILLed and never drains.
+// scripts/demo-down.sh relies on the SIGTERM registration below: it is the only
+// reason a scripted teardown drains this worker instead of killing it.
 // Both are registered even though this process is meant to run on the host,
 // because the failure mode is silent and the fix is three lines.
 Console.CancelKeyPress += (_, e) =>
