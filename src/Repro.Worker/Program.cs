@@ -44,6 +44,7 @@ var client = await ClientFactory.ConnectAsync(config, runtime, "worker", loggerF
 
 var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
+    .AddWorkflow<SimpleNoActivity>()
     // Instance registration is the SetFaultConfig replacement: the fault config is
     // reachable only from this object, so no workflow can read it.
     .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker));

@@ -22,7 +22,12 @@ using var loggerFactory = LoggerFactory.Create(b => b
     .SetMinimumLevel(LogLevel.Information));
 var log = loggerFactory.CreateLogger("replay");
 
-var options = new WorkflowReplayerOptions().AddWorkflow<HeartbeatWorkflow>();
+// Both types, because the replayer FAILS on a history whose workflow type it was not
+// given -- pointing it at a directory of mixed fixtures otherwise reports a false
+// non-determinism error.
+var options = new WorkflowReplayerOptions()
+    .AddWorkflow<HeartbeatWorkflow>()
+    .AddWorkflow<SimpleNoActivity>();
 options.LoggerFactory = loggerFactory;
 
 // MEASURED: the .NET replayer emits NOTHING through this runtime.

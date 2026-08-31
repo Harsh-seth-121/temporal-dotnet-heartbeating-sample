@@ -82,6 +82,14 @@ public static class HistogramBuckets
         ("repro_heartbeat_staleness", true,
             [10, 50, 100, 250, 500, 1000, 2000, 4000, 8000, 16_000, 30_000]),
 
+        // MANDATORY, not tuning. Without a row here this falls to Core's catch-all
+        // [50,100,500,1000,2500,10000] ms, which tops out at 10s while simple.maxDuration
+        // ships at 30s -- every `expired` run lands in the +Inf bucket and p95 reads a flat
+        // ~9.9s forever. That is the exact failure this file's header describes.
+        // The 30_000 boundary is there so `expired` shows up as a visible shoulder.
+        ("repro_simple_latency", true,
+            [100, 250, 500, 1000, 2500, 5000, 10_000, 20_000, 30_000, 45_000, 60_000, 90_000]),
+
         // LEFT AT CORE DEFAULTS ON PURPOSE, do not add:
         //   workflow_task_execution_latency, workflow_task_replay_latency
         //     -> [1,10,20,50,100,200,500,1000]: 1ms floor, good spread already
