@@ -46,13 +46,13 @@ second worker.
 
 ## Dashboards
 
-The `sandbox` folder holds 4 boards written for this topology, 55 panels, 82 targets.
+The `sandbox` folder holds 4 boards written for this topology, 57 panels, 84 targets.
 
 | Dashboard | Source | What it answers |
 |---|---|---|
 | Repro / Worker Health | SDK | Are slots exhausted? Are pollers alive? How long did tasks wait? |
 | Repro / Server and Persistence | server | Frontend RPS and latency, persistence latency, backlog, sync-match ratio |
-| Repro / Bug Signals | both | Non-determinism, workflow task retries, sticky cache, replay pressure, injected faults |
+| Repro / Bug Signals | both | Non-determinism, workflow task retries, sticky cache, replay pressure, injected faults, simple-activity outcomes and weather source |
 | **Repro / Heartbeating** | both | Heartbeat RPC rate vs call rate, the throttle, checkpoint staleness, cancellation reasons, timeouts |
 
 Four more boards are imported from
@@ -103,8 +103,8 @@ dotnet clean && rm -rf src/*/bin src/*/obj tests/*/bin tests/*/obj
 | [docs/DEMO.md](docs/DEMO.md) | The two scripts: every phase, flag and exit code, and the six things they do differently from the manual path |
 | [docs/HEARTBEATING.md](docs/HEARTBEATING.md) | The throttle, stale checkpoints, the `kill -9` resume test, the three fault knobs, the `temporal activity` verbs |
 | [docs/GOTCHAS.md](docs/GOTCHAS.md) | 29 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
-| [docs/CONFIG.md](docs/CONFIG.md) | Every `config.yaml` field, and the four `activity.*` rows that are validated but not applied |
-| [docs/DASHBOARDS.md](docs/DASHBOARDS.md) | Probing every panel, the `82/82` result, known-empty imported panels |
+| [docs/CONFIG.md](docs/CONFIG.md) | Every `config.yaml` field, and why activity options travel through the workflow input rather than being read from the file |
+| [docs/DASHBOARDS.md](docs/DASHBOARDS.md) | Probing every panel, the every-target-renders result, known-empty imported panels |
 | [docs/REPLAY.md](docs/REPLAY.md) | Capture a history, catch a nondeterminism error, and why the replayer emits no metrics |
 | [observability/README.md](observability/README.md) | The compose stack itself: bring it up and down, what each process emits on which port |
 
@@ -121,16 +121,21 @@ src/Repro.Core/     the library everything else references
                     constants, histogram bucket overrides in milliseconds
   Workflows/HeartbeatWorkflow.workflow.cs   seed workflow    <- edit per repro
   Workflows/SimpleNoActivity.workflow.cs    NO activities: signal, query, update, cancel
+  Workflows/WorkflowSimpleActivity.workflow.cs  ONE activity, NO heartbeats: plain
+                                            start-to-close + retry, result in history
   Activities/HeartbeatActivities.cs         seed activity    <- edit per repro
-  HeartbeatJob.cs   JobInput, ActivityOptionsInput, Checkpoint
-  SimpleJob.cs      SimpleInput, PokeInput, AddInput, SimpleResult, SimpleStatus
+  Activities/WeatherActivities.cs           Open-Meteo fetch + synthetic offline fallback
+  HeartbeatJob.cs      JobInput, ActivityOptionsInput, Checkpoint
+  SimpleJob.cs         SimpleInput, PokeInput, AddInput, SimpleResult, SimpleStatus
+  SimpleActivityJob.cs SimpleActivityInput, SimpleActivityOptionsInput, WeatherReading
 src/Repro.Worker    polls until interrupted, serves :8077
-src/Repro.LoadGen   worker + TWO start loops (heartbeat, and simple with jitter and
-                    injected chaos), serves :8078
+src/Repro.LoadGen   worker + THREE start loops (heartbeat; simple with jitter and
+                    injected chaos; simple-activity with jitter), serves :8078
 src/Repro.Starter   one run, prints result, pushes metrics on exit
                     (owns Telemetry/PushMetrics.cs, the Pushgateway bridge)
 src/Repro.Replay    replays a history JSON or a directory, exits 1 on mismatch
-tests/Repro.Tests   config, duration, bind-address and flag parsing
+tests/Repro.Tests   config, duration, bind-address and flag parsing, histogram bucket
+                    key collisions, dashboard metric names
 scripts/            demo-up.sh, demo-down.sh, and the bash 3.2 library they share
 docs/               the six topic files above
 history/            captured histories (committed)

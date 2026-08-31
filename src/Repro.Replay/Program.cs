@@ -22,18 +22,26 @@ using var loggerFactory = LoggerFactory.Create(b => b
     .SetMinimumLevel(LogLevel.Information));
 var log = loggerFactory.CreateLogger("replay");
 
-// Both types, because the replayer FAILS on a history whose workflow type it was not
-// given -- pointing it at a directory of mixed fixtures otherwise reports a false
-// non-determinism error.
+// All THREE types, because the replayer FAILS on a history whose workflow type it was not
+// given. No activity registration: the replayer does not execute them.
+//
+// The failure is LOUD, which is worth knowing because the previous wording here claimed the
+// opposite. MEASURED with WorkflowSimpleActivity unregistered: the two registered fixtures
+// still report "replay OK" and only the third fails, with
+// InvalidWorkflowOperationException carrying "Workflow type WorkflowSimpleActivity is not
+// registered on this worker, available workflows: HeartbeatWorkflow, SimpleNoActivity" and
+// ApplicationFailureInfo type NotFoundError. No WorkflowNondeterminismException, no
+// TMPRL1100, so it cannot be mistaken for real nondeterminism.
 var options = new WorkflowReplayerOptions()
     .AddWorkflow<HeartbeatWorkflow>()
-    .AddWorkflow<SimpleNoActivity>();
+    .AddWorkflow<SimpleNoActivity>()
+    .AddWorkflow<WorkflowSimpleActivity>();
 options.LoggerFactory = loggerFactory;
 
 // MEASURED: the .NET replayer emits NOTHING through this runtime.
 //
-// Unlike the Go replayer -- which hard-codes a no-op metrics handler, so you cannot
-// even try -- WorkflowReplayerOptions accepts a real TemporalRuntime. It is worse
+// Unlike the Go replayer, which hard-codes a no-op metrics handler so you cannot even
+// try, WorkflowReplayerOptions accepts a real TemporalRuntime. It is worse
 // than useless: Core starts a real HTTP listener, /metrics answers 200 with a
 // ZERO-BYTE body, and a Prometheus job pointed at it would report the target UP
 // forever while every panel stayed blank.
@@ -71,7 +79,7 @@ foreach (var file in files)
     // not a bare array. MEASURED: the fixer handles the WORKFLOW_EXECUTION_UPDATE_*
     // shorthands too, so a history containing accepted updates replays as-is.
     //
-    // The id is bookkeeping only -- it labels the run in replay errors and does not have
+    // The id is bookkeeping only. It labels the run in replay errors and does not have
     // to match the original execution. Taking it from the FILE NAME beats a hard-coded
     // "repro-workflow": with two fixtures in history/ that literal made every failure
     // report name the wrong one.
@@ -87,7 +95,7 @@ foreach (var file in files)
     {
         // Non-determinism arrives as WorkflowNondeterminismException, a subclass of
         // InvalidWorkflowOperationException. MEASURED: the message DOES carry
-        // [TMPRL1100] -- it is not a Go-only convention. The string is built by the
+        // [TMPRL1100]. It is not a Go-only convention. The string is built by the
         // Rust Core, not by the managed SDK, so you will not find it anywhere in
         // sdk-dotnet and cannot grep your way to that conclusion. Match on the TYPE
         // anyway: the code travels with a message Core is free to reword.
@@ -106,7 +114,7 @@ foreach (var file in files)
 if (!string.IsNullOrEmpty(metricsBind) && !BindAddress.IsOff(metricsBind))
 {
     log.LogInformation(
-        "holding http://{Bind}/metrics open for 30s — curl it now and grep for " +
+        "holding http://{Bind}/metrics open for 30s. Curl it now and grep for " +
         "temporal_workflow_task_replay_latency", metricsBind);
     await Task.Delay(TimeSpan.FromSeconds(30));
 }

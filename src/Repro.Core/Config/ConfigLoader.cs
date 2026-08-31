@@ -190,7 +190,7 @@ public static class ConfigLoader
             throw new ArgumentException(
                 $"simple.messageGap must be >= 0 (got {config.Simple.MessageGap}). The driver " +
                 "calls Random.Shared.Next(gapMs + 1) to pick each gap, which throws on a " +
-                "negative bound -- and it throws inside a fire-and-forget run body, so the " +
+                "negative bound. It throws inside a fire-and-forget run body, so the " +
                 "only symptom is the failure counter climbing.");
         }
 
@@ -214,6 +214,146 @@ public static class ConfigLoader
             throw new ArgumentException(
                 "simple.stopWeight, cancelWeight and expireWeight must be >= 0 with a positive " +
                 "sum. All-zero divides by zero in the driver's ending picker.");
+        }
+
+        ValidateSimpleActivity(config);
+    }
+
+    /// <summary>The <c>simpleActivity:</c> block. Split out only to keep Validate readable.</summary>
+    /// <remarks>
+    /// Every message names the key, gives the value, and says what breaks.
+    /// <para>
+    /// ONE rule here is stricter than its <c>activity:</c> counterpart:
+    /// retry.maximumAttempts may not be 0, because 0 means UNLIMITED and this activity talks
+    /// to a third party. The other retry rules have no counterpart at all, because
+    /// <c>config.Activity.Retry</c> is never validated. And rate/jitter/concurrency are not
+    /// stricter than anything: they repeat the <c>simple.*</c> rules above with the same
+    /// bounds, since there is no <c>activity.rate</c> to compare against.
+    /// </para>
+    /// </remarks>
+    private static void ValidateSimpleActivity(ReproConfig config)
+    {
+        var sa = config.SimpleActivity;
+
+        if (sa.SleepDuration <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.sleepDuration must be > 0 (got {sa.SleepDuration}). A negative " +
+                "value throws inside the activity, where the real cause is buried under " +
+                "retry.maximumAttempts retries and an ActivityFailure chain. Zero makes both the " +
+                "workflow's name and repro_simple_activity_latency's 5000ms boundaries a lie.");
+        }
+
+        if (sa.HttpTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.httpTimeout must be > 0 (got {sa.HttpTimeout}). A downed " +
+                "interface fails fast, but a BLACKHOLED route does not, so without this the " +
+                "request runs until start-to-close kills the whole attempt. The RETRY " +
+                "CHAIN then outlives demo-down.sh's drain window, with nothing in the log to " +
+                "say which of sleep, DNS, TLS or response ran long.");
+        }
+
+        // The activity derives its request deadline as
+        // min(httpTimeout, startToClose - sleep - 2s), so this is the rule that keeps that
+        // subtraction positive. 2s of headroom covers activity-task scheduling and payload
+        // conversion, and the derived value must still leave room for DNS + TLS + request.
+        var floor = sa.SleepDuration + sa.HttpTimeout + TimeSpan.FromSeconds(2);
+        if (sa.StartToCloseTimeout < floor)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.startToCloseTimeout must be >= sleepDuration + httpTimeout + 2s " +
+                $"= {floor} (got {sa.StartToCloseTimeout}). The activity sleeps first and then makes " +
+                "one HTTP round trip in the SAME attempt, so with less headroom every attempt dies " +
+                "of start-to-close against a perfectly healthy network and the retry policy burns " +
+                "through every attempt proving it. With no heartbeat timeout, start-to-close is the " +
+                "only activity timeout this workflow can produce.");
+        }
+
+        if (sa.Retry.InitialInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.retry.initialInterval must be > 0 (got {sa.Retry.InitialInterval}). " +
+                "An invalid retry policy is rejected when the ScheduleActivityTask command is " +
+                "validated, which fails the WORKFLOW TASK rather than the workflow, so the symptom " +
+                "is a run that sits in RUNNING and never schedules its activity.");
+        }
+
+        if (sa.Retry.BackoffCoefficient < 1)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.retry.backoffCoefficient must be >= 1 (got {sa.Retry.BackoffCoefficient}). " +
+                "Below 1 the interval SHRINKS on every retry, which is a retry storm wearing a retry " +
+                "policy's clothes, against the frontend and against api.open-meteo.com at once.");
+        }
+
+        if (sa.Retry.MaximumInterval < sa.Retry.InitialInterval)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.retry.maximumInterval ({sa.Retry.MaximumInterval}) must be >= " +
+                $"initialInterval ({sa.Retry.InitialInterval}). The maximum CLAMPS the computed " +
+                "interval, so a maximum below the initial makes backoffCoefficient do nothing and " +
+                "fires every retry at maximumInterval.");
+        }
+
+        if (sa.Retry.MaximumAttempts <= 0)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.retry.maximumAttempts must be > 0 (got {sa.Retry.MaximumAttempts}). " +
+                "0 means UNLIMITED in Temporalio.Common.RetryPolicy, not \"do not retry\". Write 1 " +
+                "for that. Unlimited retries against a THIRD-PARTY endpoint is the one place in this " +
+                "repo where a stuck run is also someone else's problem, and it parks the loadgen past " +
+                "demo-down.sh's drain budget. activity.retry.maximumAttempts may be 0 because that " +
+                "activity only talks to itself.");
+        }
+
+        if (sa.Latitude is < -90 or > 90)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.latitude must be in [-90, 90] (got {sa.Latitude}). Open-Meteo answers " +
+                "HTTP 400 outside that, which the activity throws NON-retryably, so a typo fails every " +
+                "run on attempt 1 instead of quietly producing a synthetic reading. A config bug is " +
+                "not an outage.");
+        }
+
+        if (sa.Longitude is < -180 or > 180)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.longitude must be in [-180, 180] (got {sa.Longitude}). Same reason as " +
+                "latitude: out of range is an HTTP 400 the activity refuses to retry.");
+        }
+
+        if (!Uri.TryCreate(sa.BaseUrl, UriKind.Absolute, out var baseUri)
+            || (baseUri.Scheme != Uri.UriSchemeHttp && baseUri.Scheme != Uri.UriSchemeHttps))
+        {
+            throw new ArgumentException(
+                $"simpleActivity.baseUrl must be an absolute http or https URL (got \"{sa.BaseUrl}\"). " +
+                "An unusable URL fails inside a fire-and-forget run body, so the only symptom is the " +
+                "driver's failure counter climbing. Point it at http://127.0.0.1:1/forecast to " +
+                "exercise the synthetic fallback on purpose.");
+        }
+
+        if (sa.Rate <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.rate must be > 0 (got {sa.Rate}). At zero the driver loop is a busy " +
+                "spin. Unlike simple.rate this one spins against api.open-meteo.com, which " +
+                "rate-limits you with a 429, which IS retryable, which then spends every attempt of " +
+                "every run on it.");
+        }
+
+        if (sa.Jitter is < 0 or >= 1)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.jitter must be in [0, 1) (got {sa.Jitter}). The interval is " +
+                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
+        }
+
+        if (sa.Concurrency <= 0)
+        {
+            throw new ArgumentException(
+                $"simpleActivity.concurrency must be > 0 (got {sa.Concurrency}), otherwise " +
+                "every tick is skipped at capacity and the driver starts nothing at all.");
         }
     }
 }

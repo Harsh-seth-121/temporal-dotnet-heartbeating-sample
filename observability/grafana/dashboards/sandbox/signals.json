@@ -866,6 +866,123 @@
           "sort": "desc"
         }
       }
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Custom: repro simple-activity outcomes /s",
+      "description": "The WorkflowSimpleActivity case: ONE activity that sleeps, then fetches the current weather. No heartbeats, plain StartToClose plus a retry policy.\n\nIts own metric NAME rather than a second workflow_type on repro_workflow_completed. The `repro workflow outcomes` panel above queries that metric with NO workflow_type selector and STACKS the result, so sharing the name would fold this case into the heartbeat lines and falsify the outcome-split claim documented in config.yaml.\n\nONE target grouped by outcome AND source, not two targets: both labels partition the SAME counter, and stacking two decompositions of one series double-counts it.\n\nsource=\"synthetic\" means the Open-Meteo call could not be reached and the activity returned a deterministic stand-in, which is what keeps the demo scripts green with no network. AN ALL-SYNTHETIC BOARD IS NOT A BROKEN PANEL, IT IS BROKEN EGRESS.\n\noutcome=\"failed\" does NOT require simpleActivity.requireLiveWeather. The synthetic fallback covers TRANSPORT failure only, so at the shipped setting a server that ANSWERED still fails the run: a non-retryable status, a changed response schema, or a 429/5xx exhausting maximumAttempts all land here as outcome=\"failed\" source=\"none\". requireLiveWeather: true adds the unreachable case to that list. During a real upstream incident, expect failed WITHOUT touching the flag.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome, source) (rate(repro_simple_activity_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}} / {{source}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Custom: repro simple-activity latency p95",
+      "description": "FLOORED by simpleActivity.sleepDuration (5s shipped), because the activity sleeps before it fetches anything. On the completed and failed series a p95 under 5000 ms therefore means the sleep is not happening or the buckets are wrong. The canceled series is the exception and legitimately sits below it: a cancel is recorded the instant it lands, mid-sleep, which is what 1000/2500/4000 are for.\n\nREQUIRES a HistogramBucketOverrides row: Core's catch-all tops out at 10 s, so a 5.2 s run interpolates to a plausible constant inside it rather than reading no-data. The boundaries at 5100/5250/5500/6000 exist so the Open-Meteo round trip sitting on TOP of the sleep is a visible shoulder.\n\nSplit by outcome only, not by source -- though the source IS visible here: a refused endpoint lands near 5.02 s, a live fetch near 5.77 s, and a blackholed route near 8 s. The split lives on the outcomes panel instead, where sum by (source) answers it once. For \"how slow is Open-Meteo\" specifically, read WeatherReading.HttpElapsedMs out of the result payload.\n\nA p95 near 8 s is the BLACKHOLED case (one attempt, full httpTimeout, synthetic), not retries. Retries need a server that answered and push past 15 s.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 54
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(repro_simple_activity_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
     }
   ]
 }

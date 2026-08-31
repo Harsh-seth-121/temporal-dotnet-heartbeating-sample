@@ -5,9 +5,14 @@ using Xunit;
 namespace Repro.Tests;
 
 /// <summary>
-/// These cover the three places where a mistake is SILENT rather than loud. The Go
-/// original shipped no tests, and mostly did not need them; these three earn their
-/// place because each guards a failure that looks like a working system.
+/// These cover the places where a mistake is SILENT rather than loud: Go-duration parsing,
+/// bind-address normalization, flag parsing, and config load plus startup validation. The Go
+/// original shipped no tests, and mostly did not need them; every class here earns its place
+/// because each guards a failure that looks like a working system.
+/// <para>
+/// The telemetry equivalents live in TelemetryTests.cs, and the one branch that can turn a
+/// failure into a green run lives in WeatherActivitiesTests.cs.
+/// </para>
 /// </summary>
 public class GoDurationTests
 {
@@ -74,7 +79,7 @@ public class BindAddressTests
         // These reached s[..-1] and threw a raw ArgumentOutOfRangeException reading
         // "length ('-1') must be a non-negative value", which named neither the option
         // nor the value. ArgumentOutOfRangeException DERIVES from ArgumentException, and
-        // Assert.Throws matches the exact type -- so this assertion is what pins the fix.
+        // Assert.Throws matches the exact type, so this assertion is what pins the fix.
         Assert.Throws<ArgumentException>(() => BindAddress.Normalize(input, "test"));
 
     [Fact]
@@ -122,8 +127,8 @@ public class FlagsTests
     [InlineData("--no-cancel-on-interrupt=no")]
     public void SwitchRejectsAnyValue(string arg) =>
         // Go's flag package accepts -restart=false, so people type it. Storing the text
-        // and testing ContainsKey turned every one of these ON, silently -- including
-        // the ones that spell out "off". A misused flag is a hard error here.
+        // and testing ContainsKey turned every one of these ON, silently, including the
+        // ones that spell out "off". A misused flag is a hard error here.
         Assert.Throws<ArgumentException>(() => Flags.Parse([arg]));
 
     [Fact]
@@ -146,11 +151,27 @@ public class FlagsTests
     [Fact]
     public void NoSimpleIsASwitchOnEveryBinary()
     {
-        // Known and Switches are GLOBAL to all four exes, so a flag added for the loadgen
-        // is silently a hard error in the other three until it is registered here.
+        // The flag sets are static and therefore GLOBAL to all four exes, so a flag the
+        // loadgen wants but nobody registered in Switches is an unknown-flag hard error in
+        // every binary, loadgen included.
         Assert.True(Flags.Parse(["--no-simple"]).Switch("--no-simple"));
         Assert.False(Flags.Parse([]).Switch("--no-simple"));
         Assert.Throws<ArgumentException>(() => Flags.Parse(["--no-simple=false"]));
+    }
+
+    [Fact]
+    public void NoSimpleActivityIsASwitchOnEveryBinary()
+    {
+        Assert.True(Flags.Parse(["--no-simple-activity"]).Switch("--no-simple-activity"));
+        Assert.False(Flags.Parse([]).Switch("--no-simple-activity"));
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--no-simple-activity=false"]));
+
+        // Known and Switches are matched EXACTLY, not by prefix, and --no-simple is a
+        // string prefix of --no-simple-activity. If Flags ever grows prefix matching,
+        // these two are the assertions that catch "I turned off the wrong driver and the
+        // logs looked fine".
+        Assert.False(Flags.Parse(["--no-simple"]).Switch("--no-simple-activity"));
+        Assert.False(Flags.Parse(["--no-simple-activity"]).Switch("--no-simple"));
     }
 }
 
@@ -161,6 +182,24 @@ public class ConfigLoaderTests
         var path = Path.Combine(Path.GetTempPath(), $"repro-{Guid.NewGuid():N}.yaml");
         File.WriteAllText(path, yaml);
         return path;
+    }
+
+    /// <summary>Write <paramref name="yaml"/>, run <paramref name="body"/>, always delete.</summary>
+    /// <remarks>
+    /// Every temp-config test wants exactly this, and hand-writing the try/finally six times
+    /// is six chances to leave a file in TMPDIR on an assertion failure.
+    /// </remarks>
+    private static void WithTempConfig(string yaml, Action<string> body)
+    {
+        var path = WriteTemp(yaml);
+        try
+        {
+            body(path);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
     }
 
     [Fact]
@@ -183,18 +222,13 @@ public class ConfigLoaderTests
     [Fact]
     public void OmittedKeysKeepDefaults()
     {
-        var path = WriteTemp("address: example:7233\n");
-        try
+        WithTempConfig("address: example:7233\n", path =>
         {
             var config = ConfigLoader.Load(path);
             Assert.Equal("example:7233", config.Address);
             Assert.Equal("repro-task-queue", config.TaskQueue);   // default survived
             Assert.Equal(60, config.Job.Steps);
-        }
-        finally
-        {
-            File.Delete(path);
-        }
+        });
     }
 
     [Fact]
@@ -202,15 +236,9 @@ public class ConfigLoaderTests
     {
         // The whole "a typo is a crash, not a default" argument rests on
         // DeserializerBuilder NOT having IgnoreUnmatchedProperties.
-        var path = WriteTemp("fault:\n  failurRate: 0.4\n");
-        try
-        {
-            Assert.ThrowsAny<Exception>(() => ConfigLoader.Load(path));
-        }
-        finally
-        {
-            File.Delete(path);
-        }
+        WithTempConfig(
+            "fault:\n  failurRate: 0.4\n",
+            path => Assert.ThrowsAny<Exception>(() => ConfigLoader.Load(path)));
     }
 
     [Fact]
@@ -219,15 +247,9 @@ public class ConfigLoaderTests
         // `latency:` with nothing after it is an EMPTY SCALAR, not an absent key: the
         // property IS assigned, so returning TimeSpan.Zero replaced the POCO default and
         // the fault injection quietly stopped adding latency.
-        var path = WriteTemp("fault:\n  latency:\n");
-        try
-        {
-            Assert.ThrowsAny<Exception>(() => ConfigLoader.Load(path));
-        }
-        finally
-        {
-            File.Delete(path);
-        }
+        WithTempConfig(
+            "fault:\n  latency:\n",
+            path => Assert.ThrowsAny<Exception>(() => ConfigLoader.Load(path)));
     }
 
     [Fact]
@@ -262,32 +284,127 @@ public class ConfigLoaderTests
     [InlineData("simple:\n  raceRate: -0.5\n")]
     // All-zero weights divide by zero in the ending picker.
     [InlineData("simple:\n  stopWeight: 0\n  cancelWeight: 0\n  expireWeight: 0\n")]
-    public void RejectsUnusableSimpleConfig(string yaml)
-    {
-        var path = WriteTemp(yaml);
-        try
-        {
-            Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path));
-        }
-        finally
-        {
-            File.Delete(path);
-        }
-    }
+    public void RejectsUnusableSimpleConfig(string yaml) =>
+        WithTempConfig(yaml, path => Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path)));
 
     [Fact]
     public void RejectsHeartbeatTimeoutLongerThanStartToClose()
     {
         // Otherwise the attempt always dies of start-to-close first and no heartbeat
-        // timeout is ever observed -- the panel just stays empty.
-        var path = WriteTemp("activity:\n  heartbeatTimeout: 30s\n  startToCloseTimeout: 10s\n");
-        try
-        {
-            Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path));
-        }
-        finally
-        {
-            File.Delete(path);
-        }
+        // timeout is ever observed. The panel just stays empty.
+        WithTempConfig(
+            "activity:\n  heartbeatTimeout: 30s\n  startToCloseTimeout: 10s\n",
+            path => Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path)));
     }
+
+    [Fact]
+    public void LoadsTheCommittedSimpleActivityBlock()
+    {
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var sa = config.SimpleActivity;
+
+        Assert.True(sa.Enabled);
+        Assert.Equal(TimeSpan.FromSeconds(5), sa.SleepDuration);
+        Assert.Equal(TimeSpan.FromSeconds(30), sa.StartToCloseTimeout);
+        Assert.Equal(TimeSpan.FromSeconds(3), sa.HttpTimeout);
+        Assert.Equal(3, sa.Retry.MaximumAttempts);
+        Assert.Equal(47.6062, sa.Latitude);
+        Assert.Equal(-122.3321, sa.Longitude);
+        Assert.StartsWith("https://", sa.BaseUrl, StringComparison.Ordinal);
+        Assert.False(sa.RequireLiveWeather);
+        Assert.Equal(TimeSpan.FromSeconds(15), sa.Rate);
+        Assert.Equal(0.5, sa.Jitter);
+        Assert.Equal(4, sa.Concurrency);
+    }
+
+    [Fact]
+    public void SimpleActivityWorstCaseRunFitsTheDrainBudget()
+    {
+        // demo-down.sh derives DRAIN_TIMEOUT = worker.gracefulShutdownTimeout + 15. A run
+        // that can outlive it gets SIGKILLed mid-flight instead of drained, and the only
+        // symptom is a teardown that looks slow. This is the constraint the simple.maxDuration
+        // comment asserts in prose and nothing checked until now.
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var sa = config.SimpleActivity;
+
+        // The attempts themselves.
+        var attempts = sa.Retry.MaximumAttempts * (sa.SleepDuration + sa.HttpTimeout);
+
+        // Plus the gaps BETWEEN them, which the previous version of this test omitted and was
+        // therefore blind to. ValidateSimpleActivity bounds the retry intervals only from
+        // below, so raising initialInterval or maximumInterval pushes the real worst case past
+        // the budget. Without this term the tripwire reported 24s and passed anyway.
+        var backoff = TimeSpan.Zero;
+        for (var i = 0; i < sa.Retry.MaximumAttempts - 1; i++)
+        {
+            var interval = sa.Retry.InitialInterval * Math.Pow(sa.Retry.BackoffCoefficient, i);
+            backoff += interval < sa.Retry.MaximumInterval ? interval : sa.Retry.MaximumInterval;
+        }
+
+        var worstCase = attempts + backoff;
+        var budget = config.Worker.GracefulShutdownTimeout + TimeSpan.FromSeconds(15);
+
+        // At the shipped config this is 3 x (5s + 3s) + (1s + 2s) = 27s against a 45s budget,
+        // which is the figure config.yaml states. MEASURED: a server that answered and
+        // then stalled its body ran 27.13s before ending timed_out.
+        Assert.True(
+            worstCase < budget,
+            $"simpleActivity worst case {worstCase} ({attempts} of attempts + {backoff} of " +
+            $"backoff) must stay under the {budget} drain budget");
+    }
+
+    [Theory]
+    // jitter 1.0 puts the low end of rate x [1-j, 1+j] at zero, and the driver loop spins,
+    // here against api.open-meteo.com, which rate-limits you for it.
+    [InlineData("simpleActivity:\n  jitter: 1.0\n")]
+    [InlineData("simpleActivity:\n  jitter: -0.1\n")]
+    // A zero or negative rate is the same spin.
+    [InlineData("simpleActivity:\n  rate: 0\n")]
+    // At zero concurrency every tick is skipped at capacity and the driver starts nothing.
+    [InlineData("simpleActivity:\n  concurrency: 0\n")]
+    // A zero sleep removes the only thing that makes this case slow enough to watch, and
+    // turns repro_simple_activity_latency's 5s shoulder into a lie.
+    [InlineData("simpleActivity:\n  sleepDuration: 0\n")]
+    // An unbounded HTTP call outlives the drain budget on a blackholed route, where the
+    // connect never fails fast the way a downed interface does.
+    [InlineData("simpleActivity:\n  httpTimeout: 0\n")]
+    // startToClose must clear sleep + httpTimeout + 2s of headroom, or every attempt dies
+    // of start-to-close before the activity can return and the retry policy is exhausted
+    // against a perfectly healthy network.
+    [InlineData("simpleActivity:\n  sleepDuration: 5s\n  httpTimeout: 3s\n  startToCloseTimeout: 9s\n")]
+    // 0 means UNLIMITED in Temporalio.Common.RetryPolicy, not "no retries". Unlimited
+    // retries of a 5s-plus-HTTP activity against a third party park the loadgen past the
+    // drain budget.
+    [InlineData("simpleActivity:\n  retry:\n    maximumAttempts: 0\n")]
+    [InlineData("simpleActivity:\n  retry:\n    maximumAttempts: -1\n")]
+    // A backoff coefficient under 1 SHRINKS the interval on every retry, which is a retry
+    // storm wearing a retry policy's clothes.
+    [InlineData("simpleActivity:\n  retry:\n    backoffCoefficient: 0.5\n")]
+    // A maximum below the initial makes backoffCoefficient do nothing at all.
+    [InlineData("simpleActivity:\n  retry:\n    initialInterval: 10s\n    maximumInterval: 1s\n")]
+    // Open-Meteo answers 400 for out-of-range coordinates, and the synthetic fallback would
+    // mask that forever. The panel would read all-synthetic and blame your egress.
+    [InlineData("simpleActivity:\n  latitude: 91.0\n")]
+    [InlineData("simpleActivity:\n  longitude: -181.0\n")]
+    // An unusable baseUrl fails inside a fire-and-forget run body, so the only symptom is
+    // the driver's failure counter climbing.
+    //
+    // The guard has TWO clauses, TryCreate then the http/https scheme test, and the
+    // first two rows both die on TryCreate, leaving the scheme test uncovered. MEASURED:
+    // with the scheme clause deleted the whole suite still passed. The last two rows are
+    // absolute URIs that .NET accepts, so each one reaches the second clause. The
+    // host:port form is the dangerous one: it parses with Scheme "api.open-meteo.com" and
+    // an EMPTY host, which is a plausible paste from a curl line, and HttpClient then
+    // throws NotSupportedException, which IsTransportFailure does not treat as transport,
+    // so it burns the retry budget instead of failing fast.
+    [InlineData("simpleActivity:\n  baseUrl: \"\"\n")]
+    [InlineData("simpleActivity:\n  baseUrl: \"api.open-meteo.com/v1/forecast\"\n")]
+    [InlineData("simpleActivity:\n  baseUrl: \"api.open-meteo.com:443/v1/forecast\"\n")]
+    [InlineData("simpleActivity:\n  baseUrl: \"ftp://api.open-meteo.com/v1/forecast\"\n")]
+    public void RejectsUnusableSimpleActivityConfig(string yaml) =>
+        WithTempConfig(
+            yaml,
+            // The exact type matters: it pins the failure to Validate rather than to
+            // GoDuration.Parse or the YAML deserializer.
+            path => Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path)));
 }

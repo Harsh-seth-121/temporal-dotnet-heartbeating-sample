@@ -4,12 +4,63 @@
 temporal workflow show --workflow-id repro-workflow --output json > history/heartbeat-job.json
 dotnet run --project src/Repro.Replay -- --history history/heartbeat-job.json
 
-# Both committed fixtures at once. `history/` holds heartbeat-job.json and
-# simple-no-activity.json; the latter carries WORKFLOW_EXECUTION_UPDATE_ACCEPTED and
-# _UPDATE_COMPLETED events, and MEASURED, HistoryJsonFixer handles those enum
-# shorthands from `workflow show --output json` with no help.
+# All THREE committed fixtures at once. `history/` holds heartbeat-job.json,
+# simple-no-activity.json and workflow-simple-activity.json. The second carries
+# WORKFLOW_EXECUTION_UPDATE_ACCEPTED and _UPDATE_COMPLETED events, and MEASURED,
+# HistoryJsonFixer handles those enum shorthands from `workflow show --output json` with
+# no help.
 dotnet run --project src/Repro.Replay -- --history history/
 ```
+
+`Repro.Replay` must be given every workflow type it might meet. It FAILS on a history
+whose type it was not registered with. The failure is loud and specific, not a disguised
+nondeterminism error. MEASURED, with `WorkflowSimpleActivity` unregistered:
+
+```
+replay OK: history/heartbeat-job.json
+replay OK: history/simple-no-activity.json
+replay FAILED: history/workflow-simple-activity.json
+  Temporalio.Exceptions.InvalidWorkflowOperationException: LangFail: ...
+  "Workflow type WorkflowSimpleActivity is not registered on this worker,
+   available workflows: HeartbeatWorkflow, SimpleNoActivity"
+  ApplicationFailureInfo type "NotFoundError"
+```
+
+Note what that shows: the registered fixtures still pass, only the unregistered one fails,
+and the message names both the missing type and the available ones. There is no
+`WorkflowNondeterminismException` and no `TMPRL1100`, which are the two markers of a REAL
+nondeterminism error, the same discriminator this file gives further down.
+
+## Capturing the simple-activity fixture
+
+`workflow-simple-activity.json` is 11 events with one
+`ACTIVITY_TASK_SCHEDULED` / `_STARTED` / `_COMPLETED` triple at eventIds 5/6/7, and the gap
+between `_STARTED` and `_COMPLETED` is the activity's 5s sleep. `heartbeat-job.json` has the
+same 11-event shape and the same triple, so that is not what makes this one worth keeping.
+
+What is new is what the triple CARRIES: a `ScheduleActivityTask` with no `heartbeatTimeout`
+and no `scheduleToCloseTimeout` -- the minimal options object, where the heartbeat fixture
+has 5s and 3600s, and an `ActivityTaskCompleted` payload holding a `WeatherReading`, whose
+name-keyed fields are the replay contract described in `SimpleActivityJob.cs`.
+
+Every `SimpleActivityInput` parameter has a default, so a fixed ID needs no input JSON
+beyond `{}` and there is nothing to grep out of `workflow list`:
+
+```bash
+temporal workflow execute \
+  --task-queue repro-task-queue \
+  --type WorkflowSimpleActivity \
+  --workflow-id repro-weather-fixture \
+  --input '{}'
+
+temporal workflow show --workflow-id repro-weather-fixture --output json \
+  > history/workflow-simple-activity.json
+```
+
+Capture the LIVE path, not the synthetic fallback. The two produce structurally identical
+histories, because the fallback is inside the activity so only the `ActivityTaskCompleted`
+payload differs. A fixture carrying a real temperature is self-documenting, though. Payload
+property names are PascalCase; the .NET converter does not camel-case them.
 
 `--history` also accepts a directory, and replays every `*.json` in it.
 

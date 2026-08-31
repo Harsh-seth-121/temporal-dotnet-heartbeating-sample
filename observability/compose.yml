@@ -1,6 +1,6 @@
 # Temporal sandbox: server 1.31.2 + PostgreSQL + Web UI, Prometheus metrics enabled.
 #
-# The .NET worker, loadgen, starter and replay processes run on the HOST, not here --
+# The .NET worker, loadgen, starter and replay processes run on the HOST, not here.
 # same topology as the Go original. Prometheus reaches them over host.docker.internal.
 # That is why there is no app service and no stop_grace_period tuning in this file:
 # worker drain is governed by TemporalWorkerOptions.GracefulShutdownTimeout, in-process.
@@ -13,10 +13,10 @@
 # keeps 5432 from colliding with a local Postgres. Container-to-container traffic is
 # unaffected: that goes over the compose network by service name.
 #
-# All images verified multi-arch (linux/amd64 + linux/arm64) -- no platform overrides.
+# All images verified multi-arch, linux/amd64 and linux/arm64, so no platform overrides.
 # No top-level `version:` key: obsolete in Compose v2+.
 #
-# Run these from this directory, or from the repo root -- ../compose.yml `include`s
+# Run these from this directory, or from the repo root, where ../compose.yml `include`s
 # this file and pins the same project name, so both resolve to one stack.
 #
 #   docker compose up -d
@@ -88,7 +88,7 @@ services:
       # Do NOT set PROMETHEUS_TIMER_TYPE: deprecated and ignored in 1.31
       # (timers are always histograms).
       - PROMETHEUS_ENDPOINT=0.0.0.0:8000
-      # REQUIRED -- see the dynamicconfig file header for why.
+      # REQUIRED. See the dynamicconfig file header for why.
       - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/config/dynamicconfig/development-sql.yaml
       - LOG_LEVEL=info
     networks: [temporal-network]
@@ -156,14 +156,14 @@ services:
       # first 2h, ~24k active series). The Go original's 7d would be ~78 GB, which is
       # not a thing to leave running on a laptop. A repro session is hours, not days.
       - --storage.tsdb.retention.time=2d
-      # Hard ceiling regardless of the time window -- whichever limit is hit first
+      # Hard ceiling regardless of the time window. Whichever limit is hit first
       # wins. This is the one that actually protects the disk.
       - --storage.tsdb.retention.size=8GB
       # enables: curl -XPOST localhost:9090/-/reload
       #
       # It ALSO enables an unauthenticated POST /-/quit that shuts Prometheus down.
       # Verified: it returns 200 and the process exits. That is acceptable only
-      # because every port in this file is published on 127.0.0.1 -- do not widen
+      # because every port in this file is published on 127.0.0.1. Do not widen
       # any of them without dropping this flag first.
       - --web.enable-lifecycle
     ports:
@@ -173,7 +173,7 @@ services:
       - prometheus-data:/prometheus
     extra_hosts:
       # Required on Linux Docker Engine. On Docker Desktop for Mac the embedded DNS
-      # already resolves host.docker.internal -- redundant but harmless, keeps this
+      # already resolves host.docker.internal, so it is redundant but harmless and keeps this
       # file portable.
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -188,7 +188,7 @@ services:
     image: prom/pushgateway:v1.11.3
     container_name: dotnet-sandbox-pushgateway
     restart: unless-stopped
-    # NO --persistence.file, deliberately, and this is a change from the Go original.
+    # NO --persistence.file, deliberately. That is a change from the Go original.
     #
     # Persistence makes a pushed group outlive `docker compose down`, and the
     # Pushgateway then keeps SERVING it: Prometheus scrapes a fresh sample every 5s
@@ -197,9 +197,11 @@ services:
     # change keeps its old `le` layout, and `sum by (le, operation)` silently merges
     # two incompatible bucket sets.
     #
-    # The Go original's justification -- "so a starter run from minutes ago is still
-    # visible" -- does not need persistence: Prometheus already scraped those samples
-    # and keeps them for its own 7d retention. Dropping the group just lets the series
+    # The Go original's justification, "so a starter run from minutes ago is still
+    # visible", does not need persistence: Prometheus already scraped those samples
+    # and keeps them for its own retention window, which this file sets to 2d below.
+    # (DEFAULT_NAMESPACE_RETENTION above is 7d and is a different thing entirely.)
+    # Dropping the group just lets the series
     # go stale, which is the truthful outcome when nothing is pushing.
     #
     # Clear a group without restarting:
@@ -242,7 +244,7 @@ services:
 
 networks:
   # SERVICE names (temporal, prometheus, pushgateway, grafana) are what compose DNS
-  # resolves, and they are deliberately unchanged -- TEMPORAL_ADDRESS=temporal:7233
+  # resolves, and they are deliberately unchanged: TEMPORAL_ADDRESS=temporal:7233
   # and the prometheus target temporal:8000 still work. Only the container_name and
   # network `name:` values are prefixed, because THOSE are global to the Docker
   # daemon and would collide with the Go sandbox.

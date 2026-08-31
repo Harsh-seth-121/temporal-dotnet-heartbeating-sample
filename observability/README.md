@@ -52,7 +52,7 @@ project.
 |---|---|---|---|
 | Temporal server (container) | scraped | 8000 | 233 metric families, 27 of them `temporal_*` from its own embedded Go SDK workers |
 | `Repro.Worker` (host) | scraped | 8077 | SDK metrics + `repro_*` custom metrics |
-| `Repro.LoadGen` (host) | scraped | 8078 | same, under continuous traffic |
+| `Repro.LoadGen` (host) | scraped | 8078 | same, under continuous traffic from THREE start loops |
 | `Repro.Starter` (host) | pushes on exit | 9091 | SDK **client** metrics only |
 | `Repro.Replay` (host) | opt-in `--metrics` | 8079 | **nothing**, 200 with an empty body |
 
@@ -69,8 +69,8 @@ second worker on this host without fighting the first one for :8077. See
 
 ## Before you debug this stack
 
-- [../docs/GOTCHAS.md](../docs/GOTCHAS.md) lists 25 behaviors that look exactly like
+- [../docs/GOTCHAS.md](../docs/GOTCHAS.md) lists 29 behaviors that look exactly like
   bugs, worst first. Absent counters, integer-millisecond histograms, label-value
   asymmetry, the mandatory dynamicconfig mount.
 - [../docs/DASHBOARDS.md](../docs/DASHBOARDS.md) covers `probe-dashboards.py`, the
-  `82/82` result, and which imported panels are known-empty and why.
+  every-target-renders result, and which imported panels are known-empty and why.

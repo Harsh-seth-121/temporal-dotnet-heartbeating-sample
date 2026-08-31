@@ -14,7 +14,7 @@ worker.
 That is why `or vector(0)` is load-bearing on this stack in a way it was not in the Go
 original, where tally registered metrics immediately. PromQL arithmetic collapses
 silently too: `sum(rate(hit)) + sum(rate(miss))` is EMPTY, not `hit`, when `miss` has
-never fired. Guard every term you add, not just the outer expression.
+never fired. Guard every term you add, the outer expression included.
 
 The Go original's opposite gotcha, "fresh series read 0 for up to 1 second" because
 tally flushed on a timer, does not apply. Core's exporter reads its registry at scrape
@@ -56,8 +56,8 @@ p95 to a flat ~47 ms forever. Same for schedule-to-start (flat ~99 ms) and for a
 execution latency, whose top default bucket is 60 s while the seed activity
 deliberately runs longer.
 
-`HistogramBuckets.cs` overrides eight metrics for this reason, six SDK ones plus the
-two `repro_*` histograms. Two traps in that mechanism: Core matches override keys by
+`HistogramBuckets.cs` overrides ten metrics for this reason, six SDK ones plus the
+four `repro_*` histograms. Two traps in that mechanism: Core matches override keys by
 **substring** against the already-prefixed name and iterates them in nondeterministic
 order, so keys must be disjoint and prefixed. And changing `MetricPrefix` breaks Core's
 own default-bucket lookup, which strips a hard-coded `"temporal_"`.
@@ -116,7 +116,7 @@ with `EndedBy="stopped"`, and a real `CANCELED` comes only from a client calling
 `handle.CancelAsync()`. The workflow sees that because
 `Workflow.WaitConditionAsync`'s `cancellationToken` argument **defaults to
 `Workflow.CancellationToken`** when you leave it unset, so the cancel raises straight
-out of the wait — and the `catch` rethrows, because swallowing it would report
+out of the wait, and the `catch` rethrows, because swallowing it would report
 `COMPLETED` for a run somebody explicitly cancelled.
 
 ## `IsCanceledException` does NOT recognise a cancelled workflow at the client
@@ -145,7 +145,7 @@ catch (WorkflowFailedException e) when (e.InnerException is CanceledFailureExcep
 ```
 
 Matching the shape rather than catching broadly also keeps **shutdown** out of that
-bucket — when your own token cancels `GetResultAsync` you get an
+bucket. When your own token cancels `GetResultAsync` you get an
 `OperationCanceledException`, which is not a cancelled workflow.
 
 ## There is no heartbeat metric in any Core SDK, and the RPC rate is not your call rate
@@ -235,7 +235,7 @@ Core attaches `service_name="temporal-core-sdk"`, the server's embedded workers 
 original tally's suffix kept them apart by accident. Every SDK selector on every
 authored board pins `service_name`.
 
-## The Pushgateway does NOT persist, and that is deliberate
+## The Pushgateway does NOT persist, deliberately
 
 The Go original ran it with `--persistence.file`, so a pushed group outlived
 `docker compose down` and the gateway kept serving it. Prometheus scraped a fresh
@@ -244,7 +244,9 @@ sample every 5s for a starter that was not running.
 Worse here specifically: a group pushed before a `HistogramBucketOverrides` change
 keeps its old `le` layout, and `sum by (le, operation)` silently merges two
 incompatible bucket sets. Persistence is not needed to see an old run, because
-Prometheus already scraped those samples and keeps them for its own 7d retention.
+Prometheus already scraped those samples and keeps them for its own 2d retention
+(`--storage.tsdb.retention.time=2d` in observability/compose.yml; the 7d in the
+namespace-retention section below is a different, unrelated setting).
 Clear a group without restarting:
 `dotnet run --project src/Repro.Starter -- --delete-push-group`.
 

@@ -81,7 +81,7 @@ and what every other .NET user sees:
   (...) or vector(0)` returns a series with no x, which renders as a blank
   legend and cannot join anything.
 
-* Core's default histogram buckets are coarse for a laptop sandbox. Five of the
+* Core's default histogram buckets are coarse for a laptop sandbox. Six of the
   latency panels here require PrometheusOptions.HistogramBucketOverrides in the
   worker/loadgen runtime config; without them they do not read "no data", they
   read a plausible CONSTANT, which is worse. Each affected panel says so in its
@@ -99,17 +99,21 @@ OUT = pathlib.Path(__file__).resolve().parent / "dashboards/sandbox"
 
 # ---------------------------------------------------------------------------
 # APPLICATION INPUTS. These four strings must match src/ exactly. A typo here
-# produces a silently empty panel, never an error -- which is why they are
+# produces a silently empty panel, never an error, which is why they are
 # centralized instead of inlined into 80 expressions.
 # ---------------------------------------------------------------------------
 CUSTOM = "repro_"              # prefix on this repo's own metrics. NOT applied by
-                               # MetricPrefix -- Core does not prefix custom names,
+                               # MetricPrefix. Core does not prefix custom names,
                                # so this is a literal part of the metric name.
 TASK_QUEUE = "repro-task-queue"   # for docs/legends only; panels group by label.
                                       # The dash is deliberate: see the sanitization
                                       # note in the docstring.
-WORKFLOW_TYPE = "HeartbeatWorkflow"
-ACTIVITY_TYPE = "ProcessBatch"        # [Activity] on ProcessBatchAsync TRIMS "Async"
+# Documentation only: grep shows ZERO expressions reference these, because every panel
+# groups by the label rather than selecting one value. They are here so a reader can check
+# the spellings against src/ -- which is also why they had to become plural once there
+# were three workflow types and two activity classes.
+WORKFLOW_TYPES = ("HeartbeatWorkflow", "SimpleNoActivity", "WorkflowSimpleActivity")
+ACTIVITY_TYPES = ("ProcessBatch", "FetchWeather")   # [Activity] TRIMS the "Async" suffix
 
 # Units: s=seconds, ms=milliseconds, percent=0-100, percentunit=0-1,
 # short=plain number, reqps=rate.
@@ -174,10 +178,10 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",)):
             "datasource": DS,
             # temporal_request, not temporal_request_total: Core does not suffix
             # counters. This query is also the cheapest way to prove the worker's
-            # exporter is being scraped at all -- if the dropdown is empty, the
+            # exporter is being scraped at all. If the dropdown is empty, the
             # Prometheus target is down, not the dashboard.
             # The service_name pin is the same pin sdk() applies, and for the same
-            # reason -- this selector just cannot call sdk(), which would pin
+            # reason, but this selector cannot call sdk(), which would pin
             # namespace="$namespace" to the variable being defined. Unpinned, this
             # dropdown lists the SERVER's internal namespaces too (_unknown_,
             # system, temporal_system), because the server's own embedded Go SDK
@@ -250,7 +254,7 @@ def grid(specs):
 def sdk(*extra):
     """Label selector for SDK (Core) metrics.
 
-    service_name is NOT decoration. With Core's default naming the worker's series
+    service_name is NOT optional here. With Core's default naming the worker's series
     names are byte-identical to the ones the server's own embedded Go SDK workers
     emit on :8000. namespace alone usually separates them (system workers live in
     `temporal-system`), but not always, and "usually" is not a property you want in
@@ -344,8 +348,8 @@ worker = grid([
          exprs=[('histogram_quantile(0.95, sum by (le, workflow_type) (rate(temporal_workflow_endtoend_latency_bucket%s[$__rate_interval])))' % SDK, "{{workflow_type}}")]),
     dict(title="Task slot saturation", unit=PCT, minval=0,
          desc="used / (used + available). Sustained 100% means add slots or workers.",
-         # No `or vector(0)` on either operand, deliberately, and this is the one
-         # ratio on any of these boards that does not need one: the slot gauges are
+         # No `or vector(0)` on either operand, deliberately. This is the one ratio
+         # on any of these boards that does not need one: the slot gauges are
          # registered when the worker starts, not on first use, so every worker_type
          # is present reading 0 from the first scrape (LocalActivityWorker proves it
          # -- this repo never runs one). A fallback would also be actively wrong
@@ -557,13 +561,13 @@ signals = grid([
               "MaxCachedWorkflows next.",
          # Every `or vector(0)` here is load-bearing, not decorative. Core creates
          # a metric on first increment, so on a worker that has never had a cache
-         # miss temporal_sticky_cache_miss does not exist at all -- and in PromQL
+         # miss temporal_sticky_cache_miss does not exist at all, and in PromQL
          # `A + B` where B is empty yields EMPTY, not A. Without the fallback the
          # whole ratio silently vanishes on exactly the healthy worker you would
          # expect to read 1.0. The HIT term needs it just as much and in both
          # positions: a worker whose cache has only ever missed (cold start, or
          # MaxCachedWorkflows=0) has no hit series, and an empty NUMERATOR empties
-         # the division too -- blanking the panel on the one worker whose 0.0 you
+         # the division too, blanking the panel on the one worker whose 0.0 you
          # most wanted to see.
          exprs=[('(sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) or vector(0)) / clamp_min((sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) or vector(0)) + (sum(rate(temporal_sticky_cache_miss%s[$__rate_interval])) or vector(0)), 1e-9)' % (SDK, SDK, SDK), "hit ratio")]),
     dict(title="Sticky cache hits and misses /s", unit=RPS,
@@ -623,11 +627,64 @@ signals = grid([
               "fault.failureRate is raised in config.yaml.",
          exprs=[('sum(rate(%sactivity_failed%s[$__rate_interval])) or vector(0)' % (CUSTOM, SDK), "injected failures/s"),
                 ('sum(rate(%sactivity_started%s[$__rate_interval])) or vector(0)' % (CUSTOM, sdk('retried="true"')), "retried attempts/s")]),
+
+    # APPENDED, deliberately, rather than inserted next to the other two Custom panels.
+    # grid() assigns id and gridPos sequentially per board, so inserting mid-list
+    # renumbers and repositions every later panel and turns a small addition into several
+    # hundred lines of churn in signals.json.
+    dict(title="Custom: repro simple-activity outcomes /s", unit=RPS, stack=True,
+         desc="The WorkflowSimpleActivity case: ONE activity that sleeps, then "
+              "fetches the current weather. No heartbeats, plain StartToClose plus "
+              "a retry policy.\n\n"
+              "Its own metric NAME rather than a second workflow_type on "
+              "repro_workflow_completed. The `repro workflow outcomes` panel above "
+              "queries that metric with NO workflow_type selector and STACKS the "
+              "result, so sharing the name would fold this case into the heartbeat "
+              "lines and falsify the outcome-split claim documented in config.yaml.\n\n"
+              "ONE target grouped by outcome AND source, not two targets: both "
+              "labels partition the SAME counter, and stacking two decompositions "
+              "of one series double-counts it.\n\n"
+              "source=\"synthetic\" means the Open-Meteo call could not be reached "
+              "and the activity returned a deterministic stand-in, which is what "
+              "keeps the demo scripts green with no network. AN ALL-SYNTHETIC BOARD "
+              "IS NOT A BROKEN PANEL, IT IS BROKEN EGRESS.\n\n"
+              "outcome=\"failed\" does NOT require simpleActivity.requireLiveWeather. "
+              "The synthetic fallback covers TRANSPORT failure only, so at the shipped "
+              "setting a server that ANSWERED still fails the run: a non-retryable "
+              "status, a changed response schema, or a 429/5xx exhausting "
+              "maximumAttempts all land here as outcome=\"failed\" source=\"none\". "
+              "requireLiveWeather: true adds the unreachable case to that list. During "
+              "a real upstream incident, expect failed WITHOUT touching the flag.",
+         exprs=[('sum by (outcome, source) (rate(%ssimple_activity_completed%s[$__rate_interval])) or vector(0)' % (CUSTOM, SDK), "{{outcome}} / {{source}}")]),
+
+    dict(title="Custom: repro simple-activity latency p95", unit=MS, minval=0,
+         desc="FLOORED by simpleActivity.sleepDuration (5s shipped), because the "
+              "activity sleeps before it fetches anything. On the completed and "
+              "failed series a p95 under 5000 ms therefore means the sleep is not "
+              "happening or the buckets are wrong. The canceled series is the "
+              "exception and legitimately sits below it: a cancel is recorded the "
+              "instant it lands, mid-sleep, which is what 1000/2500/4000 are "
+              "for.\n\n"
+              "REQUIRES a HistogramBucketOverrides row: Core's catch-all tops out "
+              "at 10 s, so a 5.2 s run interpolates to a plausible constant inside "
+              "it rather than reading no-data. The boundaries at 5100/5250/5500/6000 "
+              "exist so the Open-Meteo round trip sitting on TOP of the sleep is a "
+              "visible shoulder.\n\n"
+              "Split by outcome only, not by source -- though the source IS visible "
+              "here: a refused endpoint lands near 5.02 s, a live fetch near 5.77 s, "
+              "and a blackholed route near 8 s. The split lives on the outcomes panel "
+              "instead, where sum by (source) answers it once. For \"how slow is "
+              "Open-Meteo\" specifically, read WeatherReading.HttpElapsedMs out of the "
+              "result payload.\n\n"
+              "A p95 near 8 s is the BLACKHOLED case (one attempt, full httpTimeout, "
+              "synthetic), not retries. Retries need a server that answered and push "
+              "past 15 s.",
+         exprs=[('histogram_quantile(0.95, sum by (le, outcome) (rate(%ssimple_activity_latency_bucket%s[$__rate_interval])))' % (CUSTOM, SDK), "{{outcome}}")]),
 ])
 
 # ------------------------------------------------------------- heartbeat board
 # The board the Go original had no reason to exist. Heartbeating is this repo's
-# seed case, and there is NO dedicated heartbeat metric in any Core SDK -- so
+# seed case, and there is NO dedicated heartbeat metric in any Core SDK, so
 # every panel here is either a proxy (the RecordActivityTaskHeartbeat RPC), a
 # server-side consequence (activity_task_timeout), or something this repo emits
 # itself. Say which, in every description.
@@ -711,7 +768,7 @@ heartbeat = grid([
                 # divides by zero, but that is the bug, not the fix: when
                 # heartbeats stop the guard yields ~1e12 ms and Grafana's
                 # autoscale flattens A, B and C. `and rate > 0` yields NO SERIES
-                # instead -- the honest answer to "what is the mean gap between
+                # instead. That is the honest answer to "what is the mean gap between
                 # events that did not happen".
                 ('(1000 * sum(temporal_worker_task_slots_used%s) / sum(rate(temporal_request%s[$__rate_interval]))) and (sum(rate(temporal_request%s[$__rate_interval])) > 0)' % (sdk('worker_type="ActivityWorker"'), sdk('operation="RecordActivityTaskHeartbeat"'), sdk('operation="RecordActivityTaskHeartbeat"')), "D: observed gap per activity (lower bound on B)")]),
 
@@ -753,7 +810,7 @@ heartbeat = grid([
               "without opening the Web UI -- the workflow-side exception looks "
               "similar in both cases (ActivityFailureException wrapping "
               "TimeoutFailureException) and only TimeoutType tells them apart.",
-         # ONE counter, split by the timeout_type label -- not four separate metrics.
+         # ONE counter, split by the timeout_type label, not four separate metrics.
          exprs=[('sum by (timeout_type) (rate(activity_task_timeout%s[$__rate_interval])) or vector(0)' % srv('operation="TimerActiveTaskActivityTimeout"'), "{{timeout_type}}")]),
 
     dict(title="Activity attempt outcomes, server view", unit=RPS, stack=True,
@@ -811,7 +868,7 @@ heartbeat = grid([
               "ctx.Info.HeartbeatDetails.Count > 0 and tags this counter with the "
               "answer. HeartbeatDetailAtAsync<T>(0) throws if you skip the check.",
          # Guarding only the denominator was not enough. resumed="true" is a LABEL
-         # VALUE, and Core registers a series on first increment -- so with
+         # VALUE, and Core registers a series on first increment, so with
          # fault.failureRate 0 nothing ever increments it and the numerator series
          # does not exist. Empty / anything is EMPTY in PromQL, so the panel read
          # "No data" in precisely the healthy state whose 0 the description above

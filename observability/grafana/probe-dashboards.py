@@ -6,7 +6,7 @@ both directions:
 
   shipped  the expression exactly as the panel runs it. An expression ending in
            `or vector(0)` ALWAYS returns a row, so this proves only that the panel
-           does not ERROR -- never that the metric exists.
+           does not ERROR. Never that the metric exists.
   strict   the same expression with the `or vector(0)` fallbacks removed. This is
            what proves the underlying series is real.
 
@@ -16,8 +16,8 @@ Each target lands in one of four states:
   FALLBACK  shipped returns data, strict does not. The panel renders (usually 0)
             off its `or vector(0)`, because the series genuinely has not been
             created yet. This is EXPECTED for anything that only appears once
-            something goes wrong -- failures, timeouts, cancellations,
-            non-determinism -- and it is the correct design: a blank panel reads
+            something goes wrong: failures, timeouts, cancellations,
+            non-determinism. That is the correct design, because a blank panel reads
             as "broken", a zero reads as "healthy".
   NODATA    neither mode returns data and there is no fallback. Either the stack
             is not in the state this panel needs, or the metric name is WRONG.
@@ -26,7 +26,7 @@ Each target lands in one of four states:
 
 Note that FALLBACK is not a weaker OK. Core creates a metric on FIRST INCREMENT,
 so a counter that has never fired is absent from /metrics entirely rather than
-reading 0 -- which is exactly why those fallbacks are load-bearing here in a way
+reading 0, which is exactly why those fallbacks are load-bearing here in a way
 they were not in the Go original.
 
 --------------------------------------------------------------------------
@@ -50,7 +50,7 @@ TWO KINDS OF BOARD, PROBED FOR TWO DIFFERENT REASONS
 Usage:
   python3 probe-dashboards.py                  # the authored sandbox boards
   python3 probe-dashboards.py worker signals   # named boards, by file stem
-  python3 probe-dashboards.py --vendored       # the three upstream boards
+  python3 probe-dashboards.py --vendored       # the four upstream boards
   python3 probe-dashboards.py --all            # both
 """
 
@@ -222,7 +222,7 @@ def main():
     for kind, (tally, (panels, rendering)) in totals.items():
         summarize(kind, tally, panels, rendering)
 
-    # Vendored boards are upstream's, pinned at a SHA, and not ours to fix -- their
+    # Vendored boards are upstream's, pinned at a SHA, and not ours to fix. Their
     # NODATA is a statement about this sandbox's workload, not about this repo.
     # Only the authored boards gate the exit code.
     return 1 if totals.get("authored", ({"ERROR": 0}, None))[0]["ERROR"] else 0

@@ -4,13 +4,13 @@ namespace Repro.Core.Telemetry;
 
 /// <summary>Histogram bucket overrides, in MILLISECONDS.</summary>
 /// <remarks>
-/// Without these, five latency panels do not read "no data" — they read a
+/// Without these, six latency panels do not read "no data". They read a
 /// plausible CONSTANT, which is the worst failure mode this repo has. Example:
 /// loopback gRPC is 0-5ms and Core's default first bucket for request_latency is
 /// le=50, so every observation lands in one bucket and histogram_quantile
 /// interpolates p95 to a flat ~47ms forever.
 /// <para>
-/// ONE table, ONE key shape — the PREFIXED name — but TWO match semantics, and a
+/// ONE table, ONE key shape, the PREFIXED name, but TWO match semantics, and a
 /// key has to satisfy both at once.
 /// </para>
 /// <para>
@@ -24,10 +24,10 @@ namespace Repro.Core.Telemetry;
 /// </para>
 /// <para>
 /// PUSH (prometheus-net MeterAdapterOptions.ResolveHistogramBuckets). Matching is
-/// EXACT, on Instrument.Name — which is the name CORE handed the custom meter, so
+/// EXACT, on Instrument.Name, which is the name CORE handed the custom meter, so
 /// it carries "temporal_" as well. The design here once assumed otherwise: set
 /// MetricPrefix = "" and the names would arrive bare. Measured, that is
-/// unexpressible — string.Empty reads as UNSET and falls back to Core's default
+/// unexpressible. string.Empty reads as UNSET and falls back to Core's default
 /// "temporal_" (see PushMetrics). So both paths present the same key, and both
 /// lookups below are derived from ONE dictionary on purpose: while they were built
 /// separately they silently disagreed, every non-custom push-path entry missed, and
@@ -35,7 +35,7 @@ namespace Repro.Core.Telemetry;
 /// </para>
 /// <para>
 /// Custom metrics bypass prefixing on both paths and otherwise fall into Core's
-/// catch-all. Never use a bare "repro_" as a scrape key — substring matching would
+/// catch-all. Never use a bare "repro_" as a scrape key. Substring matching would
 /// capture every custom histogram at once.
 /// </para>
 /// </remarks>
@@ -84,11 +84,51 @@ public static class HistogramBuckets
 
         // MANDATORY, not tuning. Without a row here this falls to Core's catch-all
         // [50,100,500,1000,2500,10000] ms, which tops out at 10s while simple.maxDuration
-        // ships at 30s -- every `expired` run lands in the +Inf bucket and p95 reads a flat
+        // ships at 30s. Every `expired` run lands in the +Inf bucket and p95 reads a flat
         // ~9.9s forever. That is the exact failure this file's header describes.
         // The 30_000 boundary is there so `expired` shows up as a visible shoulder.
         ("repro_simple_latency", true,
             [100, 250, 500, 1000, 2500, 5000, 10_000, 20_000, 30_000, 45_000, 60_000, 90_000]),
+
+        // MANDATORY, not tuning, and the boundaries turn on ONE fact: the activity sleeps
+        // simpleActivity.sleepDuration (5s shipped) BEFORE it does anything, so 5000ms is
+        // a FLOOR, not a middle. Core's catch-all [50,100,500,1000,2500,10000] puts every
+        // healthy run in le=10000 and pins p95 at a flat ~9.9s. repro_simple_latency's set
+        // above is no better here: its next boundary past 5000 is 10000, and the entire
+        // interesting signal, the Open-Meteo round trip sitting on TOP of the sleep, lives
+        // between 5000 and 6000.
+        //
+        // Every boundary below is backed by a MEASURED run at the shipped config. There are
+        // four distinct modes, not two, and the middle two are why this row is 13 boundaries
+        // rather than 6.
+        //
+        // 5100/5250/5500/6000 separate the two FAST modes, and they land in different
+        // buckets, which is why they are there.
+        //   connection REFUSED -> synthetic. Measured 21ms of HTTP, so ~5.02s -> le=5100.
+        //   LIVE fetch         -> real reading. Measured 696ms of HTTP, so ~5.77s -> le=6000.
+        // Three boundaries apart. Do not describe the source difference as "inside one
+        // bucket": the committed fixture alone (HttpElapsedMs 600) already crosses 5100,
+        // 5250 and 5500.
+        //
+        // 7500/10_000 are the BLACKHOLED mode, and they are the boundaries most easily
+        // mistaken for dead weight. A route that neither answers nor refuses consumes the
+        // whole httpTimeout (3s shipped) before the linked CTS fires, so the run completes
+        // synthetic at ~8s in ONE attempt with zero retries. That is exactly the case
+        // simpleActivity.httpTimeout exists for, and the one documented at
+        // docs/DASHBOARDS.md's stub-baseUrl row. A reader at p95 ~8s who has been told the
+        // only thing past 6s is retries will go looking at a flat-zero retry panel.
+        //
+        // 15_000/30_000/60_000 are for RETRIES, which need a server that ANSWERED (or
+        // requireLiveWeather: true). An unreachable endpoint returns synthetic and never
+        // retries. Measured: a server answering 200 then stalling its body failed after 3
+        // attempts at 27.1s -> le=30_000.
+        //
+        // 1000/2500/4000 are NOT dead weight either. A cancelled run records the instant the
+        // cancel lands, well before the sleep finishes, so outcome="canceled" is the only
+        // thing below 5000 and without these it all piles into le=5000. Reachable by hand
+        // (`temporal workflow cancel`), not by the loadgen, which sends no cancels.
+        ("repro_simple_activity_latency", true,
+            [1000, 2500, 4000, 5000, 5100, 5250, 5500, 6000, 7500, 10_000, 15_000, 30_000, 60_000]),
 
         // LEFT AT CORE DEFAULTS ON PURPOSE, do not add:
         //   workflow_task_execution_latency, workflow_task_replay_latency
