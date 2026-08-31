@@ -68,8 +68,15 @@ foreach (var file in files)
     // FromJson consumes `temporal workflow show --output json` directly: it runs
     // HistoryJsonFixer over the CLI's enum shorthands and parses with
     // IgnoreUnknownFields. The top-level JSON must be an OBJECT ({"events":[...]}),
-    // not a bare array.
-    var history = WorkflowHistory.FromJson("repro-workflow", await File.ReadAllTextAsync(file));
+    // not a bare array. MEASURED: the fixer handles the WORKFLOW_EXECUTION_UPDATE_*
+    // shorthands too, so a history containing accepted updates replays as-is.
+    //
+    // The id is bookkeeping only -- it labels the run in replay errors and does not have
+    // to match the original execution. Taking it from the FILE NAME beats a hard-coded
+    // "repro-workflow": with two fixtures in history/ that literal made every failure
+    // report name the wrong one.
+    var history = WorkflowHistory.FromJson(
+        Path.GetFileNameWithoutExtension(file), await File.ReadAllTextAsync(file));
 
     // throwOnReplayFailure: false so a directory of fixtures reports ALL failures
     // rather than stopping at the first. Note the SDK's defaults differ by overload:
