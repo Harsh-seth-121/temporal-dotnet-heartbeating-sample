@@ -232,6 +232,10 @@ Killing the parent leaves the child running and holding :8077, and the next work
 start fails with `Address already in use (os error 48)`. For any kill test, run the
 built binary directly and kill it by port: `kill -9 $(lsof -ti tcp:8077)`.
 
+This is why `scripts/demo-up.sh` launches the built binaries and never `dotnet run`:
+the pid in the pid file has to be the pid holding the port. `demo-down.sh` also sweeps
+both ports afterwards, so it cleans up orphans left by the manual path.
+
 ## And use `-9`, unless the drain is what you are testing
 
 A plain SIGTERM starts a graceful shutdown, and the worker keeps :8077 for as long as
@@ -246,6 +250,10 @@ worker draining; checkpointing at step 3
 That is `worker.gracefulShutdownTimeout` before `ctx.CancellationToken` even fires, and
 then however long the activity takes to unwind. Restarting into that window is the
 `Address already in use` above, arriving from the direction you were not watching.
+
+`scripts/demo-down.sh` derives its SIGTERM-to-SIGKILL budget from that field plus 15s
+of unwind, and does not return until both ports are actually free. `--force` skips the
+drain when it is not what you are testing.
 
 ## Grafana state is disposable, so a blank board is never a lost volume
 

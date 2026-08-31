@@ -27,7 +27,7 @@ an afternoon spent staring at a flat panel.
 | `activity.startToCloseTimeout` | `10m` | per attempt. **Validated, not applied** |
 | `activity.scheduleToCloseTimeout` | `1h` | all attempts. **Read by nothing today** |
 | `activity.retry.*` | `1s` / `2.0` / `10s` / `5` | initial, coefficient, max interval, max attempts. **Read by nothing today** |
-| `worker.gracefulShutdownTimeout` | `30s` | SDK default is `0s`; see the fault table in [HEARTBEATING.md](HEARTBEATING.md) |
+| `worker.gracefulShutdownTimeout` | `30s` | SDK default is `0s`; see the fault table in [HEARTBEATING.md](HEARTBEATING.md). `demo-down.sh` reads this field and drains for it plus 15s before SIGKILL |
 | `worker.maxHeartbeatThrottleInterval` | `60s` | upper bound on the throttle |
 | `worker.defaultHeartbeatThrottleInterval` | `30s` | used when the timeout is unset |
 | `worker.maxCachedWorkflows` | `0` (SDK default 10000) | set to `1` to force evictions and replay storms |
