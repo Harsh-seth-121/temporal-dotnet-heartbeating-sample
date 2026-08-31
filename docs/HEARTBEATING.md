@@ -149,9 +149,23 @@ The worker stays running, so the `temporal` CLI reaches in-flight runs:
 ```bash
 temporal workflow describe -w repro-workflow
 temporal workflow cancel   -w repro-workflow
-temporal workflow signal   -w repro-workflow --name <signal> --input '"payload"'
-temporal workflow query    -w repro-workflow --type <query>
 ```
+
+`HeartbeatWorkflow` has no signals, queries or updates, so `workflow signal` and
+`workflow query` have nothing to reach on `repro-workflow`. `SimpleNoActivity` is the one
+that answers messages, and the loadgen's second loop keeps a handful of them open. Grab an
+ID from `temporal workflow list --query 'WorkflowType="SimpleNoActivity"'`, then:
+
+```bash
+temporal workflow signal -w <id> --name Poke   --input '{"Note":"hi"}'
+temporal workflow signal -w <id> --name Stop
+temporal workflow query  -w <id> --type GetStatus
+temporal workflow update execute -w <id> --name Add --input '{"A":1,"B":2}'
+```
+
+Payload property names are PascalCase; the .NET converter does not camel-case them. Wire
+names drop the `Async` suffix on signals and updates but not on queries. Handler list and
+the rest of the shape in [WORKFLOWS.md](WORKFLOWS.md).
 
 For a heartbeating activity the interesting verbs are the activity ones:
 

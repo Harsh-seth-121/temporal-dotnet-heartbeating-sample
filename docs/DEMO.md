@@ -28,6 +28,28 @@ keep holding :8077 and :8078.
 Phase 7 comes before phase 8 on purpose. The seed run blocks for over a minute and can
 fail, and the table is the output you are waiting for.
 
+The phase 8 seed run is one `HeartbeatWorkflow`. The loadgen started in phase 5 is what
+produces continuous traffic, and it drives all three workflow types on three independent
+start loops. [WORKFLOWS.md](WORKFLOWS.md) compares them.
+
+| Loop | Workflow | Shape |
+|---|---|---|
+| first | `HeartbeatWorkflow` | `loadgen.rate` on a metronome, `loadgen.concurrency` in flight |
+| second | `SimpleNoActivity` | `simple.rate` jittered, random signals and updates, injected overflow and post-close races |
+| third | `WorkflowSimpleActivity` | `simpleActivity.rate` jittered, one Open-Meteo call per run |
+
+`demo-up.sh` has no pass-through flag for the second and third loops, so turn them off in
+the config the demo is running: `simple.enabled: false` and
+`simpleActivity.enabled: false`. The binary switches `--no-simple` and
+`--no-simple-activity` do the same thing on the manual path, and they are distinct and
+matched exactly, so `--no-simple` does **not** touch the simple-activity loop.
+
+The third loop is the only thing in the repo that calls a third party. At the shipped
+`15s x 4` that is roughly 4 requests a minute, so a stack left up overnight stays inside
+Open-Meteo's free tier. With no egress it falls back to a synthetic reading and stays
+green rather than failing the run, which is why `demo-up.sh` passes on a plane. See
+[CONFIG.md](CONFIG.md).
+
 ## What down does
 
 | Phase | Does |

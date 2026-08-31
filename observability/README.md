@@ -74,3 +74,6 @@ second worker on this host without fighting the first one for :8077. See
   asymmetry, the mandatory dynamicconfig mount.
 - [../docs/DASHBOARDS.md](../docs/DASHBOARDS.md) covers `probe-dashboards.py`, the
   every-target-renders result, and which imported panels are known-empty and why.
+- [../docs/WORKFLOWS.md](../docs/WORKFLOWS.md) lists all 16 `repro_*` metrics with their
+  kinds, tags and tag values, and which of the three workflows emits each one. Check a
+  selector there before assuming a panel is broken.
