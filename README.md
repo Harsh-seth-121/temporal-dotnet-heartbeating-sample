@@ -71,6 +71,13 @@ then `./scripts/demo-down.sh --keep-stack && ./scripts/demo-up.sh` to restart th
 processes without rebooting Temporal. See
 [docs/HEARTBEATING.md](docs/HEARTBEATING.md).
 
+The other two workflows have their own levers. `simple.overflowRate` and
+`simple.raceRate` ship on, so rejected updates and post-close message races are already
+in the numbers. Point `simpleActivity.baseUrl` at `http://127.0.0.1:1/forecast` to make
+`source="synthetic"` appear on Bug Signals, and add `simpleActivity.requireLiveWeather:
+true` to turn that into `outcome="failed"` instead. Full list in
+[docs/DASHBOARDS.md](docs/DASHBOARDS.md).
+
 ## Start a new repro
 
 ```bash
@@ -80,6 +87,13 @@ git checkout main && git checkout -b repro/<short-name>
 Then edit `HeartbeatWorkflow.workflow.cs` and `HeartbeatActivities.cs`. Adjust
 `config.yaml` for the task queue, workflow ID, job shape and faults. Commit the history
 JSON that demonstrates the bug. It is the artifact worth keeping.
+
+`HeartbeatWorkflow` is the seed case and the one to edit, but it is not always the right
+starting point. Two others ship registered on the same worker and task queue:
+`SimpleNoActivity` if the bug is about signals, queries, updates or cancellation, and
+`WorkflowSimpleActivity` if it is about a plain non-heartbeating activity, its retry
+policy or its start-to-close timeout. [docs/WORKFLOWS.md](docs/WORKFLOWS.md) puts all
+three next to each other.
 
 ## Reset
 
@@ -100,6 +114,7 @@ dotnet clean && rm -rf src/*/bin src/*/obj tests/*/bin tests/*/obj
 
 | File | What is in it |
 |---|---|
+| [docs/WORKFLOWS.md](docs/WORKFLOWS.md) | The three workflows side by side, their message handlers and outcome vocabularies, and all 16 `repro_*` metrics with their tags |
 | [docs/DEMO.md](docs/DEMO.md) | The two scripts: every phase, flag and exit code, and the six things they do differently from the manual path |
 | [docs/HEARTBEATING.md](docs/HEARTBEATING.md) | The throttle, stale checkpoints, the `kill -9` resume test, the three fault knobs, the `temporal activity` verbs |
 | [docs/GOTCHAS.md](docs/GOTCHAS.md) | 29 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
@@ -137,7 +152,7 @@ src/Repro.Replay    replays a history JSON or a directory, exits 1 on mismatch
 tests/Repro.Tests   config, duration, bind-address and flag parsing, histogram bucket
                     key collisions, dashboard metric names
 scripts/            demo-up.sh, demo-down.sh, and the bash 3.2 library they share
-docs/               the six topic files above
+docs/               the seven topic files above
 history/            captured histories (committed)
 compose.yml         root entry point; includes observability/compose.yml
 observability/      compose stack, Prometheus, Grafana, dashboards
