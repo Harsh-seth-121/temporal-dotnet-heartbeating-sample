@@ -106,9 +106,11 @@ public sealed class PiActivities
         // is fired by ActivityWorker.NotifyShutdown() with no local/non-local distinction, so
         // it is the one expected to actually fire here.
         //
-        // Both are polled anyway. Watching only the token this comment predicts would make the
-        // prediction unfalsifiable, and a cancel requested through the workflow still arrives
-        // on the first one.
+        // Both are polled, and SEPARATELY, because they turned out to mean different things far
+        // more often than expected. MEASURED: in one run of the demo, 17 burns were cut short
+        // and every single one was ctx.CancellationToken firing at ~64s against a 1m workflow
+        // task heartbeat timeout -- i.e. the workflow task timing out, not a drain. Folding the
+        // two into one `||` made the activity misreport all seventeen as worker drains.
         var cancellation = ctx.CancellationToken;
         var workerShutdown = ctx.WorkerShutdownToken;
 
@@ -140,9 +142,19 @@ public sealed class PiActivities
 
             iterations += CheckEvery;
 
-            if (workerShutdown.IsCancellationRequested || cancellation.IsCancellationRequested)
+            // CHECKED SEPARATELY, not with a single ||, and the distinction was earned the
+            // hard way. Folded together, the first version of this activity logged "worker
+            // drain cut the burn short" seventeen times in a demo where nothing had drained:
+            // every one of those was a WORKFLOW TASK TIMEOUT arriving on the other token.
+            if (workerShutdown.IsCancellationRequested)
             {
                 endedBy = MetricNames.Endings.Shutdown;
+                break;
+            }
+
+            if (cancellation.IsCancellationRequested)
+            {
+                endedBy = MetricNames.Endings.Canceled;
                 break;
             }
 
@@ -172,6 +184,20 @@ public sealed class PiActivities
             log.LogWarning(
                 "worker drain cut the burn short at {ElapsedMs}ms of {RequestedMs}ms; returning a "
                 + "SHORT estimate from {Iterations} samples",
+                elapsedMs, input.DurationMs, iterations);
+        }
+        else if (endedBy == MetricNames.Endings.Canceled)
+        {
+            // The ordinary ending for this case rather than an exceptional one: at the shipped
+            // config two-thirds of runs draw a duration longer than the workflow task heartbeat
+            // timeout, and every execution of those is cut here. MEASURED at ~64s against a 1m
+            // timeout. The elapsed time is logged rather than described because it is the thing
+            // that identifies WHICH cancellation this was -- a burn cut at the timeout looks
+            // nothing like one cut by a hand `temporal workflow cancel`.
+            log.LogWarning(
+                "burn CANCELLED at {ElapsedMs}ms of {RequestedMs}ms after {Iterations} samples; if "
+                + "this is near the workflow task heartbeat timeout the task timed out and this "
+                + "entire burn is about to be repeated from zero",
                 elapsedMs, input.DurationMs, iterations);
         }
         else

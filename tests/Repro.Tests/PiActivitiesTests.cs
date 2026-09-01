@@ -106,6 +106,25 @@ public class PiActivitiesTests
 
         Assert.Equal(MetricNames.Endings.Shutdown, result.EndedBy);
 
+        // THE ONLY PLACE the RequestedMs/ElapsedMs swap is actually catchable, which is why
+        // this assertion lives in the shutdown test rather than next to the other one.
+        //
+        // MEASURED against a real run: a 40,124ms burn reported ElapsedMs 40124 exactly. The
+        // loop only overshoots by one batch, and at the ~93M iterations/s this machine manages
+        // that batch is under a millisecond, so the overshoot rounds away entirely. The two
+        // adjacent ints are therefore EQUAL on any healthy completing run, and a positional
+        // swap of them would pass every assertion in
+        // ReportsTheRequestedAndMeasuredDurationsSeparately.
+        //
+        // A cut-short burn is the one case where they genuinely differ, by orders of
+        // magnitude.
+        Assert.Equal(60_000, result.RequestedMs);
+        Assert.True(
+            result.ElapsedMs < result.RequestedMs / 2,
+            $"ElapsedMs {result.ElapsedMs} is not meaningfully below the requested "
+            + $"{result.RequestedMs}; if these two are equal on a burn that was cut short, they "
+            + "are probably the same value and PiEstimate was constructed positionally");
+
         // Generous by two orders of magnitude against the 60s it was asked for. The claim is
         // "it noticed and stopped", not "it stopped in exactly 150ms" -- the loop only checks
         // on a batch boundary and a loaded machine makes batches longer.
@@ -122,16 +141,22 @@ public class PiActivitiesTests
     [Fact]
     public async Task StopsEarlyOnActivityCancellation()
     {
-        // The other token, which is the one that carries a cancel requested through the
-        // workflow. Watched alongside WorkerShutdownToken so that neither path depends on the
-        // other being the right guess.
+        // The other token, and in production it is the BUSY one. Measured against the live
+        // stack: every burn cut short in a demo run was this token firing at ~64s against a 1m
+        // workflow task heartbeat timeout, i.e. the workflow task timing out underneath the
+        // activity -- not a drain, and not a user cancel.
+        //
+        // It must report `canceled` and not `shutdown`. The two were folded into one check
+        // originally, and the result was an activity that logged "worker drain cut the burn
+        // short" seventeen times during a demo in which nothing had drained.
         var env = new ActivityEnvironment();
         env.CancellationTokenSource.CancelAfter(TimeSpan.FromMilliseconds(150));
 
         var result = await env.RunAsync(
             () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: 60_000, Seed: 4)));
 
-        Assert.Equal(MetricNames.Endings.Shutdown, result.EndedBy);
+        Assert.Equal(MetricNames.Endings.Canceled, result.EndedBy);
+        Assert.NotEqual(MetricNames.Endings.Shutdown, result.EndedBy);
         Assert.True(result.ElapsedMs < 10_000);
     }
 

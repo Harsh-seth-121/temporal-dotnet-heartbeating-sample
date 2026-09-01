@@ -202,8 +202,34 @@ public static class MetricNames
         /// <summary>The burn ran its full requested duration.</summary>
         public const string Completed = "completed";
 
-        /// <summary>A worker drain cut it short. See PiActivities on which token fires.</summary>
+        /// <summary>A worker drain cut it short: <c>WorkerShutdownToken</c> fired.</summary>
         public const string Shutdown = "shutdown";
+
+        /// <summary>
+        /// The activity was cancelled mid-burn: <c>ActivityExecutionContext.CancellationToken</c>
+        /// fired. In this case that overwhelmingly means the WORKFLOW TASK TIMED OUT.
+        /// </summary>
+        /// <remarks>
+        /// MEASURED, and it is the finding this case turned up that no doc predicted. Across 17
+        /// cut-short burns in one run of the demo, EVERY ONE ended between 64.0s and 64.2s
+        /// against a 1m history.workflowTaskHeartbeatTimeout -- never at the requested duration
+        /// and never at a drain. So a local activity IS told when the workflow task it lives
+        /// inside times out, roughly four seconds after the server's timeout fires, rather than
+        /// running on obliviously to its full length.
+        /// <para>
+        /// It changes nothing about the outcome. The workflow task is already gone, so the
+        /// estimate this activity returns is discarded and the next dispatch starts the burn
+        /// again from zero. What it does change is the CPU arithmetic: a doomed run burns about
+        /// 64s per execution rather than its full drawn duration.
+        /// </para>
+        /// <para>
+        /// Distinguished from <see cref="Shutdown"/> because the two are the same shape and
+        /// wildly different events, and folding them together is how the first version of this
+        /// activity came to log "worker drain cut the burn short" seventeen times during a demo
+        /// in which nothing had drained.
+        /// </para>
+        /// </remarks>
+        public const string Canceled = "canceled";
     }
 
     /// <summary>
