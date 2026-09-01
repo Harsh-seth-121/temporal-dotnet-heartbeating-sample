@@ -192,7 +192,7 @@ if [ -n "${TEMPORAL_API_KEY:-}" ] || [ -n "${TEMPORAL_TLS_CLIENT_CERT_PATH:-}" ]
 fi
 case "${TEMPORAL_NAMESPACE:-}" in
     ''|default) ;;
-    *) pf_warn "TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE} overrides config.yaml; this stack only creates \"default\"" ;;
+    *) pf_warn "TEMPORAL_NAMESPACE=${TEMPORAL_NAMESPACE} overrides config.yaml; this stack creates \"default\" and \"repro-local-activity\" and nothing else" ;;
 esac
 
 for tool in curl lsof nc; do
@@ -305,14 +305,42 @@ fi
 
 demo_phase 4 $PHASES "readiness gates"
 
-if ! demo_gate "default namespace" 180 dotnet-temporal \
+if ! demo_gate "namespaces registered" 180 dotnet-temporal \
         demo_container_exited_ok dotnet-temporal-create-namespace; then
     docker logs --tail 30 dotnet-temporal-create-namespace >&2 || true
-    demo_die 5 "the default namespace was never registered. create-namespace.sh retries for 150s of its own, so this budget is 180s."
+    demo_die 5 "the namespaces were never registered. create-namespace.sh retries for 150s of its own, so this budget is 180s."
 fi
 
 demo_gate "frontend on :7233" 30 dotnet-temporal demo_tcp_ok 127.0.0.1 7233 \
     || demo_die 5 "the server's healthcheck passes inside the container but 127.0.0.1:7233 is not reachable from this host."
+
+# BOTH namespaces, checked by EXISTENCE rather than by the container's exit code, and that
+# distinction is the whole reason this gate exists separately from the one above.
+#
+# create-namespace.sh skips a namespace that already exists and exits 0, which is correct. But
+# it means the exit-code gate above passes just as happily when the script created two
+# namespaces, one, or none at all. Before this stack grew a second namespace that was
+# harmless: there was only one, and if it was missing nothing else worked either. Now the
+# common case is a stack created before the local-activity feature, where `default` exists,
+# the script has nothing to do for it, and repro-local-activity may or may not have been made.
+# Without this probe the first symptom is the loadgen failing its 45s readiness gate two
+# phases later with an opaque namespace-not-found, pointing at the wrong thing entirely.
+#
+# Skipped rather than failed when the host CLI is absent: `temporal` is a documented
+# prerequisite, but demo-up.sh's other optional-CLI use (see the tail of this script) treats a
+# missing one as "not checkable", not as "broken", and a gate that hard-fails on a missing
+# tool would be the only one here that does.
+if command -v temporal >/dev/null 2>&1; then
+    for ns in default repro-local-activity; do
+        if ! demo_gate "namespace ${ns}" 30 dotnet-temporal \
+                temporal operator namespace describe -n "${ns}" --address 127.0.0.1:7233; then
+            docker logs --tail 30 dotnet-temporal-create-namespace >&2 || true
+            demo_die 5 "namespace \"${ns}\" does not exist. create-namespace.sh creates both and skips any that is already there; if only one is missing, that container ran against an older copy of the script. \`docker compose up --force-recreate temporal-create-namespace\` re-runs it."
+        fi
+    done
+else
+    pf_warn "temporal CLI not on PATH; skipping the namespace existence check (the create-namespace container still exited 0)"
+fi
 
 demo_gate "pushgateway" 60 dotnet-sandbox-pushgateway \
     demo_http_ok "http://127.0.0.1:9091/-/ready" \

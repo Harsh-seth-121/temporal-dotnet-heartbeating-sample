@@ -92,7 +92,7 @@ demo_phase() {
 
 demo_url_table() {
     cat <<'EOF'
-  http://localhost:3000            Grafana, 8 dashboards, anonymous Admin
+  http://localhost:3000            Grafana, 9 dashboards, anonymous Admin
   http://localhost:8080            Temporal Web UI
   http://localhost:9090/targets    Prometheus target health
   http://localhost:9091            Pushgateway

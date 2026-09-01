@@ -107,6 +107,69 @@ running activity it was cancelled, so a client `CancelAsync` records the **workf
 discarded. Measured: workflow closed at `T+1s`, activity finished at `T+6s` with a real
 reading nobody used. Worker shutdown does still reach it, because that token is local.
 
+## `localActivity`, and the second namespace
+
+The only block that carries a `namespace` and a `taskQueue` of its own, and that is not
+organisation. `history.workflowTaskHeartbeatTimeout` is declared server-side as
+`NewNamespaceDurationSetting`: it filters by **namespace and nothing finer** — not task
+queue, not workflow type. Dropping it from its 30m default to 1m in a namespace of its own is
+the only way to make `WorkflowLocalActivity`'s re-execution loop reachable in a demo while the
+other three workflows keep stock behaviour.
+
+The override itself is not in this file. It lives in
+`observability/dynamicconfig/development-sql.yaml`, constrained to that namespace, and the
+namespace is created by `observability/scripts/create-namespace.sh` from an env var in
+`observability/compose.yml`. **Four files have to agree and nothing cross-checks them.** A
+mismatch is silent in both directions: a wrong namespace in `config.yaml` fails at worker
+connect time with an opaque not-found, and a wrong one in the dynamicconfig constraint leaves
+the override applying to nothing at all while looking correct.
+
+Two names are checked against the rest of the file at load. `localActivity.namespace` must
+differ from `namespace`, because sharing one applies the 1m heartbeat override to the other
+three workflows, which have no local activities, so heartbeat behaviour appears in workflows
+that cannot cause it. `localActivity.taskQueue` and `taskQueue` must not be a **prefix** of one
+another in either direction — not merely unequal. Task queues are namespace-scoped, so the
+server accepts a collision and nothing fails at startup; what breaks is every lookup that
+matches on queue name without a namespace, which is most of them: `temporal task-queue
+describe`, a log grep, a dashboard selector.
+
+`ConfigLoader` refuses `localActivity.namespace` equal to the top-level `namespace`, which is
+the one part of that agreement it *can* check.
+
+### The timeout ladder is mostly decorative, on purpose
+
+Three of the four rungs cannot fire at the shipped config. They are documented as unreachable
+rather than dressed up as guards, because a rung that looks like a bound and is not is worse
+than no rung:
+
+| Field | Shipped | Fires? |
+|---|---|---|
+| `startToCloseTimeout` | 2m30s | No. Required by the SDK; the workflow task dies at 1m first. |
+| `scheduleToCloseTimeout` | 5m | No. Its clock restarts on every workflow-task re-dispatch. |
+| `retry.maximumAttempts` | 1 | Not applicable. A re-execution is a fresh attempt-1 execution, outside the retry policy. Must still be non-zero: unset means retry **forever** for a local activity. |
+| `runTimeout` | 6m | **Yes. The only one.** Server-enforced. |
+
+Set `scheduleToCloseTimeout` **below** 1m to flip this case from the failure to its
+documented fix. Validation deliberately does not forbid that, which is why there is no
+`scheduleToCloseTimeout > startToCloseTimeout` rule — such a rule would have made the fix
+unconfigurable while looking like ordinary hygiene.
+
+### The knobs that actually change what you see
+
+- `minDuration` / `maxDuration` — the per-run draw, made client-side and then **fixed in the
+  workflow input**, which is what keeps a doomed run doomed. At 30s..2m against a 1m timeout,
+  exactly `(120-60)/(120-30)` = two-thirds of runs re-execute.
+- `concurrency` — 3. A doomed run holds its slot for the whole `runTimeout`, so expect most
+  ticks to skip; measured 6 started against 11 skipped in one demo run.
+- `maxConcurrentLocalActivities` — 4, against an SDK default of 100. Not politeness: workflow
+  activations run on the same thread pool these CPU burns occupy, and the SDK fails a workflow
+  task that does not yield within 2 seconds. A saturated pool produces evicted runs and
+  retried workflow tasks that look exactly like this case's real failure and are not it.
+
+`--no-local-activity` turns the loop off, and with it every dependency this process has on the
+second namespace existing — useful against a stack created before this feature, where
+`create-namespace.sh` has not run in its two-namespace form.
+
 ## Metrics addresses
 
 Listen addresses must be a full `IP:port` that is **not** loopback. Go's `":8077"` is

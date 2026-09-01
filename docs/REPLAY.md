@@ -4,7 +4,7 @@
 temporal workflow show --workflow-id repro-workflow --output json > history/heartbeat-job.json
 dotnet run --project src/Repro.Replay -- --history history/heartbeat-job.json
 
-# All THREE committed fixtures at once. `history/` holds heartbeat-job.json,
+# All FIVE committed fixtures at once. `history/` holds heartbeat-job.json,
 # simple-no-activity.json and workflow-simple-activity.json. The second carries
 # WORKFLOW_EXECUTION_UPDATE_ACCEPTED and _UPDATE_COMPLETED events, and MEASURED,
 # HistoryJsonFixer handles those enum shorthands from `workflow show --output json` with
@@ -109,3 +109,24 @@ curl -sS -o /dev/null -w '%{http_code} %{size_download}\n' localhost:8079/metric
 ```
 
 Do not spend time instrumenting replay.
+
+## The local-activity fixtures replay too, and they look nothing like the others
+
+`history/workflow-local-activity.json` is a completed run. Its history contains a
+`MarkerRecorded` event (marker name `core_local_activity`) and **no** `ActivityTaskScheduled`,
+`ActivityTaskStarted` or `ActivityTaskCompleted` at all, because a local activity never
+produces them.
+
+`history/workflow-local-activity-wft-timeout.json` is the interesting one: 134 events, 8
+`WorkflowTaskTimedOut`, 44 `WorkflowTaskScheduled`, and **zero** `MarkerRecorded`. The local
+activity in it executed eight times over six minutes and never once completed, so nothing
+was ever written for it. The run ends `WorkflowExecutionTimedOut`.
+
+Both replay clean. That is worth stating because it is the check that keeps the claim in
+[WORKFLOWS.md](WORKFLOWS.md) honest: a history with no markers and eight timed-out workflow
+tasks is exactly what "the burn starts again from zero" produces, and replay is where that
+description stops being prose.
+
+Note the replayer never connects, so a fixture captured from the `repro-local-activity`
+namespace needs no second client and no namespace flag. Namespace is a client property; a
+history JSON on disk has already forgotten it mattered.

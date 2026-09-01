@@ -1,6 +1,6 @@
 namespace Repro.Core.Telemetry;
 
-/// <summary>The 16 custom metric names, their tag keys, and the outcome values.</summary>
+/// <summary>The 19 custom metric names, their tag keys, and the outcome values.</summary>
 /// <remarks>
 /// These exist so a typo is a compile error instead of an empty Grafana panel.
 /// Nothing at runtime would catch "repro_hearbeat_sent": Core accepts any name
@@ -80,6 +80,58 @@ public static class MetricNames
     public const string SimpleActivityCompleted = "repro_simple_activity_completed";
     public const string SimpleActivityLatency = "repro_simple_activity_latency";
 
+    /// <summary>WorkflowLocalActivity's outcome counter and end-to-end latency.</summary>
+    /// <remarks>
+    /// The FOURTH separate pair, for the same reason <see cref="SimpleCompleted"/> is the
+    /// second and <see cref="SimpleActivityCompleted"/> the third: the panel titled
+    /// "Custom: repro workflow outcomes /s" queries repro_workflow_completed with NO
+    /// workflow_type selector and STACKS it.
+    /// <para>
+    /// READ THIS BEFORE BUILDING A PANEL ON IT. Unlike the other three, this counter does not
+    /// account for every run. Two-thirds of runs at the shipped config end by
+    /// WorkflowOptions.RunTimeout, and the server closes a run-timed-out workflow by calling
+    /// TimeoutWorkflow directly, WITHOUT scheduling a workflow task. Workflow code therefore
+    /// never runs again and cannot record anything -- not `timed_out`, not any other value.
+    /// Those runs are simply absent here.
+    /// </para>
+    /// <para>
+    /// That is why <see cref="PiAttemptStarted"/> exists and why it, not this, is the primary
+    /// signal for the local-activity case. The timeout COUNT comes from the server's own
+    /// workflow_timeout in that namespace.
+    /// </para>
+    /// <para>
+    /// SUBSTRING-COLLISION CHECK, because HistogramBuckets matches override keys with
+    /// metric_name.Contains(key) in nondeterministic order.
+    /// "repro_local_activity_latency" and "repro_simple_activity_latency" diverge at index 6,
+    /// "l" against "s", so neither contains the other. The SDK key added alongside them,
+    /// "temporal_local_activity_execution_latency", does NOT contain
+    /// "temporal_activity_execution_latency" either: the byte before "activity_execution" is
+    /// the "l" of "local_", not the "_" of "temporal_". TelemetryTests turns all of that into
+    /// a test rather than leaving it as this paragraph.
+    /// </para>
+    /// </remarks>
+    public const string LocalActivityCompleted = "repro_local_activity_completed";
+    public const string LocalActivityLatency = "repro_local_activity_latency";
+
+    /// <summary>One increment per REAL execution of the Pi burn, re-executions included.</summary>
+    /// <remarks>
+    /// THE POINT OF THE WHOLE CASE, and the only metric in this repo emitted from activity
+    /// code for a reason other than convenience.
+    /// <para>
+    /// Workflow.MetricMeter is replay-suppressed, which is exactly wrong here: a local activity
+    /// re-executed after a workflow task timeout is not a replay, it is a second real burn of
+    /// CPU, and a replay-suppressed counter would hide precisely the waste this case exists to
+    /// show. Activity code does not replay, so counting here counts executions.
+    /// </para>
+    /// <para>
+    /// Divided by the completion rate of <see cref="LocalActivityCompleted"/> it gives wasted
+    /// executions per useful result. At the shipped draw the expected steady state is about 13
+    /// attempts per completed run: per three runs, one completer contributing a single attempt
+    /// and two doomed runs contributing six each before runTimeout closes them.
+    /// </para>
+    /// </remarks>
+    public const string PiAttemptStarted = "repro_pi_attempt_started";
+
     /// <remarks>
     /// Do NOT add namespace/task_queue/workflow_type/activity_type here. Both
     /// Workflow.MetricMeter and ActivityExecutionContext.MetricMeter arrive
@@ -138,9 +190,52 @@ public static class MetricNames
         public const string None = "none";
     }
 
+    /// <summary>Values of <c>PiEstimate.EndedBy</c>. A PAYLOAD field, not a tag.</summary>
+    /// <remarks>
+    /// Not a metric dimension on purpose. It answers "did this burn finish or was it cut
+    /// short by a worker drain", which is a per-run diagnostic worth having in
+    /// `temporal workflow show`, and which would add a second low-cardinality split to a
+    /// counter that already carries one for no question anybody asks of the board.
+    /// </remarks>
+    public static class Endings
+    {
+        /// <summary>The burn ran its full requested duration.</summary>
+        public const string Completed = "completed";
+
+        /// <summary>A worker drain cut it short: <c>WorkerShutdownToken</c> fired.</summary>
+        public const string Shutdown = "shutdown";
+
+        /// <summary>
+        /// The activity was cancelled mid-burn: <c>ActivityExecutionContext.CancellationToken</c>
+        /// fired. In this case that overwhelmingly means the WORKFLOW TASK TIMED OUT.
+        /// </summary>
+        /// <remarks>
+        /// MEASURED, and it is the finding this case turned up that no doc predicted. Across 17
+        /// cut-short burns in one run of the demo, EVERY ONE ended between 64.0s and 64.2s
+        /// against a 1m history.workflowTaskHeartbeatTimeout -- never at the requested duration
+        /// and never at a drain. So a local activity IS told when the workflow task it lives
+        /// inside times out, roughly four seconds after the server's timeout fires, rather than
+        /// running on obliviously to its full length.
+        /// <para>
+        /// It changes nothing about the outcome. The workflow task is already gone, so the
+        /// estimate this activity returns is discarded and the next dispatch starts the burn
+        /// again from zero. What it does change is the CPU arithmetic: a doomed run burns about
+        /// 64s per execution rather than its full drawn duration.
+        /// </para>
+        /// <para>
+        /// Distinguished from <see cref="Shutdown"/> because the two are the same shape and
+        /// wildly different events, and folding them together is how the first version of this
+        /// activity came to log "worker drain cut the burn short" seventeen times during a demo
+        /// in which nothing had drained.
+        /// </para>
+        /// </remarks>
+        public const string Canceled = "canceled";
+    }
+
     /// <summary>
     /// Values of the <c>outcome</c> tag: four on repro_workflow_completed and
-    /// repro_simple_activity_completed, three on repro_simple_completed.
+    /// repro_simple_activity_completed, three on repro_simple_completed, and three of a
+    /// possible four on repro_local_activity_completed.
     /// </summary>
     /// <remarks>
     /// repro_workflow_completed uses completed / failed / canceled / timed_out.
@@ -148,6 +243,22 @@ public static class MetricNames
     /// repro_simple_activity_completed uses completed / failed / canceled / timed_out, and
     /// timed_out THERE is TimeoutType.StartToClose, never Heartbeat, because that
     /// workflow sets no heartbeat timeout at all.
+    /// <para>
+    /// repro_local_activity_completed is the one that does not fit the pattern, and reading it
+    /// as if it did is the mistake this paragraph exists to prevent. WorkflowLocalActivity's
+    /// Classify can return all four, but at the SHIPPED config only three are reachable:
+    /// timed_out requires localActivity.scheduleToCloseTimeout to sit BELOW the workflow task
+    /// heartbeat timeout, which is the documented mitigation rather than the default.
+    /// </para>
+    /// <para>
+    /// Worse, the majority case records NOTHING. The two-thirds of runs whose burn outlives the
+    /// 1m heartbeat timeout end at RunTimeout, and the server closes a run on RunTimeout WITHOUT
+    /// scheduling a workflow task -- so the workflow's catch never executes and no outcome is
+    /// ever tagged. This counter therefore undercounts runs by design, and a dashboard that
+    /// divides by it is measuring the wrong denominator. Count the missing ones with the
+    /// server's workflow_timeout in the repro-local-activity namespace, or with
+    /// <see cref="PiAttemptStarted"/>, which the ACTIVITY emits and which survives.
+    /// </para>
     /// </remarks>
     public static class Outcomes
     {

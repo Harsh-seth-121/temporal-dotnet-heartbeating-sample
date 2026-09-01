@@ -152,6 +152,48 @@ else
         "simple-activity: OFF (simpleActivity.enabled is false, or --no-simple-activity was passed)");
 }
 
+// FOURTH LOOP, and the only one that needs a client, a worker and a namespace of its own.
+//
+// Everything about it is constructed HERE, after the readiness banner, and that placement is
+// not stylistic. demo-lib.sh gates loadgen readiness on the literal substring
+// "loadgen: 1 workflow every" with a 45s budget, so anything that can THROW before that line
+// is logged turns a working start into a demo-up.sh timeout. This block can throw for a very
+// ordinary reason: connecting to repro-local-activity fails outright if
+// create-namespace.sh has not created it, which is the state of every stack that predates
+// this feature. The rule the other loops follow as "construct the driver after the banner" is
+// therefore "construct the CLIENT and the WORKER after the banner" here.
+//
+// The whole block is also gated on the loop being enabled, so --no-local-activity leaves this
+// process with no dependency on the second namespace existing at all.
+var localOn = config.LocalActivity.Enabled && !flags.Switch("--no-local-activity");
+TemporalWorker? laWorker = null;
+var laWorkerTask = Task.CompletedTask;
+var localTask = Task.CompletedTask;
+
+if (localOn)
+{
+    // Role "loadgen-la", not "loadgen". Identity is role@machine:pid, so two clients in one
+    // process sharing a role are indistinguishable in `temporal workflow describe`.
+    var laClient = await ClientFactory.ConnectAsync(
+        config, runtime, "loadgen-la", loggerFactory, config.LocalActivity.Namespace);
+
+    // Same options object as Repro.Worker builds, from Repro.Core, so the two processes
+    // cannot drift; see LocalActivityWorkerOptions for why that is worth a file.
+    laWorker = new TemporalWorker(laClient, LocalActivityWorkerOptions.For(config));
+    laWorkerTask = laWorker.ExecuteAsync(shutdown.Token);
+
+    var localDriver = new LocalActivityDriver(
+        laClient, config.LocalActivity, loggerFactory.CreateLogger("local-activity"));
+
+    localTask = localDriver.RunAsync(shutdown.Token);
+}
+else
+{
+    log.LogInformation(
+        "local-activity: OFF (localActivity.enabled is false, or --no-local-activity was passed); " +
+        "this process makes no connection to the local-activity namespace");
+}
+
 var started = 0;
 var input = new JobInput(
     steps,
@@ -237,12 +279,31 @@ catch (Exception e)
 
 try
 {
-    await workerTask;
+    await localTask;
+}
+catch (Exception e)
+{
+    log.LogWarning("local-activity driver ended in error: {Message}", e.Message);
+}
+
+try
+{
+    // Task.WhenAll, NOT one await then the other, and the difference is a SIGKILL. Each worker
+    // waits for its own executing activities on shutdown; awaited in sequence the second would
+    // not start draining until the first had finished, serialising two gracefulShutdownTimeout
+    // windows into 60s against demo-down.sh's budget of gracefulShutdownTimeout + 15 = 45s.
+    // Concurrently the two windows overlap. laWorkerTask is Task.CompletedTask when the
+    // local-activity loop is off, so this is unchanged for --no-local-activity.
+    await Task.WhenAll(workerTask, laWorkerTask);
 }
 catch (OperationCanceledException)
 {
     // Expected, and kept narrow on purpose: this one really is the shutdown token, and a
     // worker fault SHOULD reach the runtime rather than be logged and swallowed.
+}
+finally
+{
+    laWorker?.Dispose();
 }
 
 return 0;

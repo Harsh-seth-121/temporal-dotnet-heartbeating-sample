@@ -173,6 +173,22 @@ public class FlagsTests
         Assert.False(Flags.Parse(["--no-simple"]).Switch("--no-simple-activity"));
         Assert.False(Flags.Parse(["--no-simple-activity"]).Switch("--no-simple"));
     }
+
+    [Fact]
+    public void NoLocalActivityIsASwitchOnEveryBinary()
+    {
+        Assert.True(Flags.Parse(["--no-local-activity"]).Switch("--no-local-activity"));
+        Assert.False(Flags.Parse([]).Switch("--no-local-activity"));
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--no-local-activity=false"]));
+
+        // The near-homograph, and the reason this assertion is here rather than assumed.
+        // --no-local-activity and --no-simple-activity differ by one word in the middle and
+        // turn off different loops; neither is a prefix of the other, so nothing but exact
+        // matching keeps them apart. Somebody will type the wrong one.
+        Assert.False(Flags.Parse(["--no-simple-activity"]).Switch("--no-local-activity"));
+        Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-simple-activity"));
+        Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-simple"));
+    }
 }
 
 public class ConfigLoaderTests
@@ -407,4 +423,81 @@ public class ConfigLoaderTests
             // The exact type matters: it pins the failure to Validate rather than to
             // GoDuration.Parse or the YAML deserializer.
             path => Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path)));
+
+    [Fact]
+    public void LoadsTheCommittedLocalActivityBlock()
+    {
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var la = config.LocalActivity;
+
+        // The namespace and queue are the two values the second worker, the second client,
+        // create-namespace.sh, compose.yml and the dynamic-config override all have to agree
+        // on. Nothing in the .NET build catches a drift between them and the YAML, so it is
+        // pinned here.
+        Assert.Equal("repro-local-activity", la.Namespace);
+        Assert.Equal("repro-la-queue", la.TaskQueue);
+
+        // 30s..2m against the 1m workflowTaskHeartbeatTimeout is what makes exactly two thirds
+        // of runs re-execute. docs/WORKFLOWS.md quotes (120-60)/(120-30); if either bound moves
+        // that number is wrong and this assertion is how you find out.
+        Assert.Equal(TimeSpan.FromSeconds(30), la.MinDuration);
+        Assert.Equal(TimeSpan.FromMinutes(2), la.MaxDuration);
+
+        // RunTimeout is the only rung that actually ends a run whose burn outlives the
+        // heartbeat timeout, so it is the one number here that cannot be allowed to go missing.
+        Assert.Equal(TimeSpan.FromMinutes(6), la.RunTimeout);
+
+        // Not 0 and not unset. Both of those mean retry FOREVER on a local activity, which is
+        // an unbounded chain of two-minute CPU burns rather than a slow test.
+        Assert.Equal(1, la.Retry.MaximumAttempts);
+    }
+
+    // ValidateLocalActivity, which until now had no test of any kind. Every row is a config a
+    // careless edit produces and that the server would otherwise accept.
+    [Theory]
+    // The whole reason this workflow has a second namespace is that
+    // history.workflowTaskHeartbeatTimeout is namespace-scoped. Collapsing the two applies this
+    // case's 1m override to the other three workflows, which have no local activities, so
+    // heartbeat behaviour appears from nowhere in workflows that cannot cause it.
+    [InlineData("localActivity:\n  namespace: default\n")]
+    // Prefix collision, tested in BOTH directions because the check is symmetric and a
+    // one-directional implementation passes the first row and fails the second.
+    [InlineData("localActivity:\n  taskQueue: repro-task-queue\n")]
+    [InlineData("localActivity:\n  taskQueue: repro-task-queue-la\n")]
+    [InlineData("taskQueue: repro-la\n")]
+    // At a zero or inverted draw the driver's uniform draw over a closed interval throws
+    // inside a fire-and-forget run body, so the only symptom is a counter climbing.
+    [InlineData("localActivity:\n  minDuration: 0s\n")]
+    [InlineData("localActivity:\n  maxDuration: 10s\n")]
+    // Start-to-close below the longest possible burn turns the case into an ordinary activity
+    // timeout and the workflow task never times out at all, which is a different bug entirely.
+    [InlineData("localActivity:\n  startToCloseTimeout: 1m\n")]
+    // Zero means UNLIMITED in Temporalio.Common.RetryPolicy, so this is the config that gives
+    // an unbounded chain of two-minute CPU burns.
+    [InlineData("localActivity:\n  retry:\n    maximumAttempts: 0\n")]
+    // jitter is multiplied into the delay, so at 1.0 the low end of the draw is zero and the
+    // driver spins against the frontend.
+    [InlineData("localActivity:\n  jitter: 1.0\n")]
+    [InlineData("localActivity:\n  rate: 0s\n")]
+    [InlineData("localActivity:\n  concurrency: 0\n")]
+    public void RejectsUnusableLocalActivityConfig(string yaml) =>
+        WithTempConfig(
+            yaml,
+            path => Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path)));
+
+    [Fact]
+    public void AllowsScheduleToCloseBelowStartToClose()
+    {
+        // NOT a rejection, and this test exists so nobody adds the rule that would make it one.
+        // Dropping scheduleToCloseTimeout below the 1m workflow task heartbeat timeout is the
+        // DOCUMENTED MITIGATION for this whole case: the local activity then fails with a
+        // timeout the workflow catches, and the workflow task is never re-executed. Ordering it
+        // against startToCloseTimeout looks like an obvious missing validation and would make
+        // the fix unconfigurable.
+        WithTempConfig(
+            "localActivity:\n  scheduleToCloseTimeout: 45s\n",
+            path => Assert.Equal(
+                TimeSpan.FromSeconds(45),
+                ConfigLoader.Load(path).LocalActivity.ScheduleToCloseTimeout));
+    }
 }

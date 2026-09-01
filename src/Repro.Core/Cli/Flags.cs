@@ -7,7 +7,7 @@ namespace Repro.Core.Cli;
 /// Hand-rolled arg parser. Supports both <c>--flag value</c> and <c>--flag=value</c>.
 /// </summary>
 /// <remarks>
-/// Twelve flags do not justify System.CommandLine. Note also that samples-dotnet and
+/// Thirteen flags do not justify System.CommandLine. Note also that samples-dotnet and
 /// omes still pin System.CommandLine 2.0.0-beta4, whose API differs substantially
 /// from the 2.0.11 stable release: copying their AddOption/SetHandler code into a
 /// net10 repo does not compile. Fifty lines here, zero surprises.
@@ -20,11 +20,15 @@ public sealed class Flags
 {
     /// <summary>Flags that take no value. Everything else consumes the next argv entry.</summary>
     /// <remarks>
-    /// <c>--no-simple</c> and <c>--no-simple-activity</c> are DISTINCT and matched EXACTLY.
+    /// <c>--no-simple</c>, <c>--no-simple-activity</c> and <c>--no-local-activity</c> are all
+    /// DISTINCT and matched EXACTLY. The first is a string PREFIX of the second, and the third
+    /// is a near-homograph of it: <c>--no-local-activity</c> turns off the LOCAL activity loop
+    /// and <c>--no-simple-activity</c> the ordinary one, and somebody will reach for the wrong
+    /// one.
     /// Parse looks up the text before any '=' in these hash sets, never by prefix. So
     /// <c>--no-simple</c> does NOT turn off the simple-activity loop, and someone will type it
-    /// expecting that. Both belong to every binary, the loadgen included: these sets are
-    /// static, so all four exes share one registration.
+    /// expecting that. All three belong to every binary, the loadgen included: these sets
+    /// are static, so all four exes share one registration.
     /// <para>
     /// Register a switch HERE ONLY. <see cref="Known"/> is DERIVED from this set plus
     /// <see cref="ValueFlags"/>, which is what makes the two old failures unreachable: a
@@ -35,7 +39,7 @@ public sealed class Flags
     private static readonly HashSet<string> Switches = new(StringComparer.Ordinal)
     {
         "--restart", "--no-cancel-on-interrupt", "--delete-push-group", "--no-simple",
-        "--no-simple-activity",
+        "--no-simple-activity", "--no-local-activity",
     };
 
     /// <summary>Flags that CONSUME the next argv entry. Register a value flag here only.</summary>

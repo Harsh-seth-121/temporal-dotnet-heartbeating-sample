@@ -1,5 +1,6 @@
 using System.Runtime.InteropServices;
 using Microsoft.Extensions.Logging;
+using Repro.Core;
 using Repro.Core.Activities;
 using Repro.Core.Cli;
 using Repro.Core.Config;
@@ -96,21 +97,57 @@ using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
 });
 
 using var worker = new TemporalWorker(client, options);
+
+// SECOND CLIENT, SECOND WORKER, SECOND NAMESPACE, for WorkflowLocalActivity alone.
+//
+// A namespace is a CLIENT property and a worker binds one client, so this is the price of
+// putting that workflow somewhere else -- and it has to be somewhere else, because
+// history.workflowTaskHeartbeatTimeout is declared server-side as NewNamespaceDurationSetting
+// and filters by namespace and nothing finer. Dropping it to 1m in its own namespace is the
+// only way to make that case reproducible without changing behaviour for the other three.
+//
+// Same runtime, deliberately. ReproRuntime's guard counts runtime CONSTRUCTIONS, not client
+// bindings, so N clients on one runtime is legal by design and is what keeps both namespaces'
+// series on the one :8077 exporter. Building a second runtime here would bind nothing and
+// serve an empty registry.
+//
+// Role is "worker-la", not "worker". Identity is role@machine:pid, so two clients in one
+// process sharing a role produce a byte-identical identity and `temporal workflow describe`
+// stops being able to tell you which one holds a run.
+var laClient = await ClientFactory.ConnectAsync(
+    config, runtime, "worker-la", loggerFactory, config.LocalActivity.Namespace);
+
+// Options come from Repro.Core so this process and Repro.LoadGen cannot drift apart; see
+// LocalActivityWorkerOptions for the copied-knobs failure that motivated pulling them out.
+using var laWorker = new TemporalWorker(laClient, LocalActivityWorkerOptions.For(config));
+
 log.LogInformation(
     "worker polling {TaskQueue} on {Address}/{Namespace} (graceful shutdown {Grace})",
     config.TaskQueue, config.Address, config.Namespace,
     GoDuration.ToGoString(config.Worker.GracefulShutdownTimeout));
+log.LogInformation(
+    "worker polling {TaskQueue} on {Address}/{Namespace} for local activities " +
+    "(up to {MaxLocal} concurrent)",
+    config.LocalActivity.TaskQueue, config.Address, config.LocalActivity.Namespace,
+    config.LocalActivity.MaxConcurrentLocalActivities);
 
 try
 {
-    // Never succeeds, only fails or is cancelled. On shutdown it waits for EVERY
-    // executing activity to return. An activity that swallows cancellation makes
-    // this never come back, which is exactly what fault.ignoreCancellation shows.
-    await worker.ExecuteAsync(shutdown.Token);
+    // Task.WhenAll, NOT two sequential awaits, and the difference is a SIGKILL.
+    //
+    // Neither call succeeds; both only fail or are cancelled. On shutdown each waits for its
+    // own executing activities to return. Awaited one after the other, the second worker would
+    // not even begin draining until the first had finished, serialising two
+    // gracefulShutdownTimeout windows into 60s against demo-down.sh's budget of
+    // gracefulShutdownTimeout + 15 = 45s. Run concurrently the two windows overlap and the
+    // teardown drains instead of being killed.
+    await Task.WhenAll(
+        worker.ExecuteAsync(shutdown.Token),
+        laWorker.ExecuteAsync(shutdown.Token));
 }
 catch (OperationCanceledException)
 {
-    log.LogInformation("worker stopped");
+    log.LogInformation("workers stopped");
 }
 
 return 0;

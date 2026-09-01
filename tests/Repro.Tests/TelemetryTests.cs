@@ -18,6 +18,19 @@ namespace Repro.Tests;
 /// </remarks>
 public class HistogramBucketsTests
 {
+    /// <summary>
+    /// The workflow task heartbeat timeout this stack ships, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <c>history.workflowTaskHeartbeatTimeout</c> in
+    /// observability/dynamicconfig/development-sql.yaml, which overrides the server's own 30m
+    /// default. It is duplicated here rather than parsed out of that YAML because the file is
+    /// read by the SERVER, not by this process, and a test that parsed it would be asserting
+    /// its own parser. The dynamicconfig file names this constant in a comment so the pair
+    /// stays visible from both sides.
+    /// </remarks>
+    private const double HeartbeatTimeoutMs = 60_000;
+
     [Fact]
     public void NoScrapeKeyIsASubstringOfAnother()
     {
@@ -45,6 +58,7 @@ public class HistogramBucketsTests
     [InlineData(MetricNames.SimpleLatency)]
     [InlineData(MetricNames.SimpleActivityLatency)]
     [InlineData(MetricNames.HeartbeatStaleness)]
+    [InlineData(MetricNames.LocalActivityLatency)]
     public void CustomHistogramsHaveTheirOwnRow(string name) =>
         // A missing row does not read "no data", it reads a plausible CONSTANT out of
         // Core's catch-all, which tops out at 10s while all four of these run longer.
@@ -81,6 +95,54 @@ public class HistogramBucketsTests
         Assert.DoesNotContain(
             HistogramBuckets.ScrapeOverrides.Keys,
             k => k.StartsWith("temporal_repro_", StringComparison.Ordinal));
+
+        // And the mirror image, which is the one that got through. A NON-custom row whose
+        // Name already carries the "temporal_" prefix is prefixed a second time, producing
+        // temporal_temporal_*. That key matches nothing on either path, so the metric falls
+        // silently to Core's catch-all.
+        //
+        // MEASURED before this assertion existed: the row for local_activity_execution_latency
+        // was written as "temporal_local_activity_execution_latency" and the entire suite
+        // stayed green. NoScrapeKeyIsASubstringOfAnother could not see it, because a
+        // double-prefixed key collides with nothing; the loop above could not see it, because
+        // it only inspects repro_ keys. The only symptom was a live scrape returning
+        // DefaultMs, which looks like a working panel.
+        Assert.DoesNotContain(
+            HistogramBuckets.ScrapeOverrides.Keys,
+            k => k.StartsWith("temporal_temporal_", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void LocalActivityBucketsResolveBelowTheDurationFloorAndAtTheHeartbeatTimeout()
+    {
+        // TWO separate failures, one at each end of the row, and neither reads "no data".
+        //
+        // BELOW THE FLOOR. localActivity.minDuration floors every run that gets to record a
+        // sample at all, but not every run does so at its full length: CancellationType
+        // defaults to TryCancel, so a hand `temporal workflow cancel` records at ~T+1s, and
+        // maximumAttempts is 1 so a throwing activity ends the run immediately. With no
+        // boundary under the floor those pile into the floor bucket and p95 for them reads a
+        // plausible constant just under it. This is the same trap
+        // SimpleActivityBucketsStraddleTheSleepFloor guards from the other direction.
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var floorMs = config.LocalActivity.MinDuration.TotalMilliseconds;
+
+        var buckets = HistogramBuckets.ForInstrument(MetricNames.LocalActivityLatency);
+
+        Assert.Contains(floorMs, buckets);
+        Assert.True(
+            buckets.Count(b => b < floorMs) >= 3,
+            $"repro_local_activity_latency needs boundaries BELOW the {floorMs}ms duration floor: " +
+            "a cancelled or immediately-failed run records well under it, and without them " +
+            "every such run lands in the floor bucket and p95 pins just below the floor " +
+            "forever");
+
+        // AT THE TIMEOUT. The workflow task heartbeat timeout is what separates the runs that
+        // complete from the runs that are re-executed, so the boundary has to exist for the
+        // split to be resolvable at all. It is asserted against the dynamic-config value this
+        // repo actually ships rather than against a literal, so lowering one and not the other
+        // is a test failure instead of a silently unreadable panel.
+        Assert.Contains(HeartbeatTimeoutMs, buckets);
     }
 
     [Fact]
@@ -178,8 +240,21 @@ public class DashboardMetricNameTests
 
                 foreach (var t in targets.EnumerateArray())
                 {
-                    if (t.TryGetProperty("expr", out var expr) && expr.GetString() is { } text)
+                    if (t.TryGetProperty("expr", out var expr) && expr.GetString() is { } rawExpr)
                     {
+                        // STRIP QUOTED LABEL VALUES FIRST. In PromQL a label value is always
+                        // double-quoted and a metric name never is, so everything inside
+                        // quotes is by definition not a metric name.
+                        //
+                        // This is not hygiene. The local-activity case runs in a namespace
+                        // called repro-local-activity, and the SERVER sanitizes label values
+                        // while the SDK does not, so its server-side panels carry
+                        // namespace="repro_local_activity" -- which the pattern below cannot
+                        // tell apart from a metric name. Without this line the test fails on
+                        // a namespace, names it as an unknown metric, and the obvious "fix"
+                        // is to add a bogus constant to MetricNames.
+                        var text = Regex.Replace(rawExpr, "\"[^\"]*\"", "\"\"");
+
                         foreach (Match m in Regex.Matches(text, "repro_[a-z0-9_]+"))
                         {
                             // Prometheus appends _bucket / _count / _sum to a HISTOGRAM's
@@ -237,8 +312,8 @@ public class DashboardMetricNameTests
 
         Assert.True(
             bareHistograms.Count == 0,
-            "dashboard expressions select a histogram by its bare name, which matches no "
-            + $"series and renders a flat zero line: {string.Join(", ", bareHistograms)}");
+            "dashboard expressions select a histogram by its bare name, which matches no " +
+            $"series and renders a flat zero line: {string.Join(", ", bareHistograms)}");
 
         var orphans = referenced.Where(n => !known.Contains(n)).ToList();
         Assert.True(

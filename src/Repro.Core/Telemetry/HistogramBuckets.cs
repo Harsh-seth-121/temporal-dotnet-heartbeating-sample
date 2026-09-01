@@ -4,7 +4,7 @@ namespace Repro.Core.Telemetry;
 
 /// <summary>Histogram bucket overrides, in MILLISECONDS.</summary>
 /// <remarks>
-/// Without these, six latency panels do not read "no data". They read a
+/// Without these, latency panels do not read "no data". They read a
 /// plausible CONSTANT, which is the worst failure mode this repo has. Example:
 /// loopback gRPC is 0-5ms and Core's default first bucket for request_latency is
 /// le=50, so every observation lands in one bucket and histogram_quantile
@@ -129,6 +129,65 @@ public static class HistogramBuckets
         // (`temporal workflow cancel`), not by the loadgen, which sends no cancels.
         ("repro_simple_activity_latency", true,
             [1000, 2500, 4000, 5000, 5100, 5250, 5500, 6000, 7500, 10_000, 15_000, 30_000, 60_000]),
+
+        // MANDATORY, not tuning, and the boundary set is asymmetric on purpose at BOTH ends.
+        //
+        // BELOW THE FLOOR. localActivity.minDuration is 30s, so 30_000 is a floor in the same
+        // way 5000 is for repro_simple_activity_latency. The four boundaries under it are not
+        // padding, and the reason is the one that row already documents: a run can end well
+        // before its burn finishes. LocalActivityOptions.CancellationType defaults to
+        // TryCancel, so a hand `temporal workflow cancel` makes the workflow's await throw
+        // immediately and records at T+~1s; a throwing activity ends the run on attempt 1
+        // because maximumAttempts is 1. Without 1000/5000/10_000/20_000 every one of those
+        // lands in le=30000 and p95 for those outcomes reads a flat ~29.9s forever, which is
+        // the plausible-constant failure this file's header calls the worst one here.
+        //
+        // ABOVE 60_000 IS NOT DEAD WEIGHT, and this row's first draft got that exactly
+        // backwards. The reasoning was: only runs whose burn beats the 1m heartbeat timeout
+        // ever record a sample, so nothing above ~60s can exist and the boundaries can stop
+        // there.
+        //
+        // MEASURED, and it is wrong. This histogram times the WORKFLOW, not the burn, and a
+        // workflow also waits for a local-activity slot -- there are only
+        // localActivity.maxConcurrentLocalActivities of them and each is held for up to a
+        // minute. A run whose burn is comfortably under the timeout can therefore take far
+        // longer end to end. Over one demo run the five recorded samples landed at <=5s, in
+        // (30s, 40s], in (45s, 50s], in (55s, 60s] and in (60s, 90s]. The last of those is
+        // the one the original boundaries would have called impossible.
+        //
+        // So the tail runs to runTimeout, not to the heartbeat timeout, and the boundaries
+        // now say so. Without 120_000 upward, a queued run lands in +Inf and p95 pins.
+        ("repro_local_activity_latency", true,
+            [1000, 5000, 10_000, 20_000, 30_000, 40_000, 45_000, 50_000, 55_000, 60_000,
+             90_000, 120_000, 180_000, 300_000]),
+
+        // Core's own local-activity latency, which is a DIFFERENT measurement from the row
+        // above: it times one execution of the burn, where repro_local_activity_latency times
+        // the whole workflow. On a re-executed run the SDK records several of these and the
+        // workflow records none.
+        //
+        // The substring hazard here is the one this file's header uses as its example, so it
+        // is worth restating as a fact rather than a warning:
+        // "temporal_local_activity_execution_latency".Contains("temporal_activity_execution_latency")
+        // is FALSE, because the byte preceding "activity_execution_latency" is the "l" of
+        // "local_" rather than the "_" of "temporal_". The two rows are independent.
+        //
+        // NOT "temporal_local_activity_execution_latency". Custom=false means the Table
+        // PREPENDS CorePrefix, so the name here is the UNPREFIXED one, exactly like
+        // request_latency and activity_execution_latency above. Writing the prefixed name
+        // produced the key temporal_temporal_local_activity_execution_latency, which matches
+        // no emitted series and no lookup on either path.
+        //
+        // MEASURED, and it is worth recording how it presented, because it is this file's own
+        // headline failure arriving from a direction the tests did not cover. The build stayed
+        // green. NoScrapeKeyIsASubstringOfAnother passed, because a double-prefixed key
+        // collides with nothing. EveryCustomHistogramRowIsReachableUnderItsOwnName passed,
+        // because it only checks repro_ keys. The only symptom was on a live scrape: this
+        // metric came back with le=[50,100,500,1000,2500,10000,+Inf], which is DefaultMs --
+        // a plausible-looking bucket set, a populated panel, and a p95 pinned under 10s
+        // against a metric whose whole point is that it runs for a minute.
+        ("local_activity_execution_latency", false,
+            [1000, 5000, 10_000, 30_000, 60_000, 90_000, 120_000, 180_000, 300_000]),
 
         // LEFT AT CORE DEFAULTS ON PURPOSE, do not add:
         //   workflow_task_execution_latency, workflow_task_replay_latency

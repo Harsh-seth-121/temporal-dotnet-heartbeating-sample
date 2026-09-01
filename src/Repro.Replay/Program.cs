@@ -22,12 +22,14 @@ using var loggerFactory = LoggerFactory.Create(b => b
     .SetMinimumLevel(LogLevel.Information));
 var log = loggerFactory.CreateLogger("replay");
 
-// All THREE types, because the replayer FAILS on a history whose workflow type it was not
+// All FOUR types, because the replayer FAILS on a history whose workflow type it was not
 // given. No activity registration: the replayer does not execute them.
 //
 // The failure is LOUD, which is worth knowing because the previous wording here claimed the
-// opposite. MEASURED with WorkflowSimpleActivity unregistered: the two registered fixtures
-// still report "replay OK" and only the third fails, with
+// opposite. MEASURED with WorkflowSimpleActivity unregistered, back when three types existed
+// in total -- so the available-workflows list quoted below is that run's and not what you
+// would see today: the two registered fixtures still report "replay OK" and only the third
+// fails, with
 // InvalidWorkflowOperationException carrying "Workflow type WorkflowSimpleActivity is not
 // registered on this worker, available workflows: HeartbeatWorkflow, SimpleNoActivity" and
 // ApplicationFailureInfo type NotFoundError. No WorkflowNondeterminismException, no
@@ -35,7 +37,17 @@ var log = loggerFactory.CreateLogger("replay");
 var options = new WorkflowReplayerOptions()
     .AddWorkflow<HeartbeatWorkflow>()
     .AddWorkflow<SimpleNoActivity>()
-    .AddWorkflow<WorkflowSimpleActivity>();
+    .AddWorkflow<WorkflowSimpleActivity>()
+    // WorkflowLocalActivity replays like the others even though its histories look nothing
+    // like them: a local activity leaves a MarkerRecorded (marker name core_local_activity)
+    // rather than the ActivityTaskScheduled/Started/Completed triple, and a history captured
+    // from a run whose workflow task timed out carries WorkflowTaskTimedOut events and SEVERAL
+    // executions of the same local activity. Replay is exactly where a claim about that shape
+    // stops being a comment and becomes checkable.
+    //
+    // Note the namespace is irrelevant here. The replayer never connects; it reads a history
+    // JSON off disk, so a fixture from repro-local-activity replays with no second client.
+    .AddWorkflow<WorkflowLocalActivity>();
 options.LoggerFactory = loggerFactory;
 
 // MEASURED: the .NET replayer emits NOTHING through this runtime.

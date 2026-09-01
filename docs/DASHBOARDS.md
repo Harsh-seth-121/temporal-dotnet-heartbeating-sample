@@ -1,10 +1,10 @@
 # Dashboards
 
-Grafana on <http://localhost:3000>, no login. Three folders, eight dashboards:
+Grafana on <http://localhost:3000>, no login. Three folders, nine dashboards:
 
-- `sandbox/` holds the boards written for this topology: 4 dashboards, 57 panels, 84
-  targets. Every one of the 84 has been probed against a live stack, including the two
-  `simple-activity` panels; see the measurement below.
+- `sandbox/` holds the boards written for this topology: 5 dashboards, 68 panels, 99
+  targets. Every one has been probed against a live stack, including all 15 on the new
+  local-activity board; see the measurement below.
 - `temporal-server/` and `temporal-sdk/` hold boards imported from
   [temporalio/dashboards](https://github.com/temporalio/dashboards) as-is, for breadth,
   pinned to commit `4994df2` in `grafana/dashboards/UPSTREAM_SHA`.
@@ -156,3 +156,68 @@ them.
 
 The `$Service` and `$Client` variables on `server-general` are decorative. They appear
 only in panel titles, never in any expression.
+
+## Repro / Local Activity
+
+Its own board, and the reason is mechanical rather than editorial: the `$namespace`
+variable is **single-select** and this case runs in `repro-local-activity` while everything
+else runs in `default`. Panels for both cannot coexist on one board — pointing the variable
+at one namespace blanks every panel selecting the other. So this board ships with its
+variable defaulting to `repro-local-activity` and a **3h** default window instead of 30m.
+
+The window matters. A doomed run holds its concurrency slot for the whole 6m `runTimeout`,
+so events arrive roughly every three or four minutes. On a 30m window Grafana resolves
+`$__rate_interval` to about 5m, and measured, `rate(...[5m])` returned **0** over the same
+data where `rate(...[15m])` returned 0.0045. The two histogram panels therefore use
+`[$__range]` rather than `$__rate_interval`; a sparse rate window renders `NaN`, not a flat
+line.
+
+Start at **Executions /s vs completions /s**. The gap between the two lines is CPU burnt on
+local activities that were thrown away. Measured at the shipped config: about **14
+executions per completed run**.
+
+### Two panels that need reading carefully
+
+**Custom: repro local-activity outcomes /s** does *not* account for every run, unlike the
+equivalent panel for the other three workflows. A run killed by `runTimeout` is closed
+without a workflow task, so workflow code never resumes and the counter never increments —
+not even as `timed_out`. The **Workflow outcomes, server view** panel beside it is the only
+place those runs appear.
+
+**Core's local activity execution latency** times one execution of the burn; the workflow
+latency panel beside it times the whole workflow. On a re-executed run the SDK records
+several of the former and none of the latter, so one keeps moving while the other goes
+quiet.
+
+### Server metrics here need the other spelling
+
+The server sanitizes label values and the SDK does not, so this one namespace is spelled two
+ways in one TSDB, on two different label keys:
+
+```
+:8077   namespace="repro-local-activity"   task_queue="repro-la-queue"
+:8000   namespace="repro_local_activity"   taskqueue="repro_la_queue"
+```
+
+`srv()` hard-pins `namespace="default"`, so a server panel for this case built with it
+matches nothing, forever, with no error. `srv_ns()` exists for that and takes the sanitized
+spelling.
+
+### A bucket-override bug this board caught
+
+Worth recording because the tests could not see it and the panel looked fine.
+
+The row for `temporal_local_activity_execution_latency` was written with the `temporal_`
+prefix already in the name, while `Custom=false` makes `HistogramBuckets` prepend it — so
+the key became `temporal_temporal_local_activity_execution_latency` and matched nothing. The
+build stayed green, the substring-collision test passed (a double-prefixed key collides with
+nothing), and the reachability test passed (it only inspects `repro_` keys). The only symptom
+was a live scrape returning `le=[50,100,500,1000,2500,10000,+Inf]` — Core's catch-all, a
+populated panel, and a p95 capped under 10s on a metric that runs for a minute.
+
+`TelemetryTests` now asserts no scrape key starts with `temporal_temporal_`.
+
+One consequence outlives the fix: Prometheus keeps the old `le` layout for its full 2d
+retention, so `sum by (le)` merges two incompatible bucket sets and reports **negative**
+per-bucket counts until the old series age out. If a quantile on this metric reads a flat
+value pinned to a boundary, check for that before believing it.

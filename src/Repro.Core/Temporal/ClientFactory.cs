@@ -13,16 +13,43 @@ public static class ClientFactory
     /// The process's single runtime. Passing null here is how metrics get silently
     /// lost, so it is required rather than optional — see <c>ReproRuntime</c>.
     /// </param>
-    /// <param name="role">worker / loadgen / starter / replay. Becomes part of the client identity.</param>
+    /// <param name="role">
+    /// worker / loadgen / starter / replay. Becomes part of the client identity.
+    /// <para>
+    /// MUST BE DISTINCT PER CLIENT WITHIN A PROCESS, which stopped being automatic when the
+    /// local-activity case introduced a second namespace. Identity is
+    /// <c>role@machine:pid</c>, so two clients in one process sharing a role produce a
+    /// byte-identical identity and `temporal workflow describe` can no longer tell you which
+    /// one is holding a run -- which is the entire reason this field is set. The worker and
+    /// loadgen pass <c>worker-la</c> and <c>loadgen-la</c> for their second client.
+    /// </para>
+    /// </param>
     /// <param name="loggerFactory">Logger factory for SDK-level logging.</param>
+    /// <param name="namespaceOverride">
+    /// Connect to this namespace instead of <see cref="ReproConfig.Namespace"/>.
+    /// <para>
+    /// A namespace is a CLIENT property and a worker binds one client, so this is what makes
+    /// <c>WorkflowLocalActivity</c> able to live somewhere else. It has to: the setting that
+    /// case depends on, <c>history.workflowTaskHeartbeatTimeout</c>, is declared server-side as
+    /// NewNamespaceDurationSetting and filters by namespace and nothing finer.
+    /// </para>
+    /// <para>
+    /// An OVERRIDE rather than a second connect method, so the API key, TLS and runtime paths
+    /// below stay shared. Those are the parts that are easy to get subtly wrong twice.
+    /// </para>
+    /// </param>
     public static async Task<ITemporalClient> ConnectAsync(
-        ReproConfig config, TemporalRuntime runtime, string role, ILoggerFactory loggerFactory)
+        ReproConfig config,
+        TemporalRuntime runtime,
+        string role,
+        ILoggerFactory loggerFactory,
+        string? namespaceOverride = null)
     {
         ArgumentNullException.ThrowIfNull(config);
 
         var options = new TemporalClientConnectOptions(config.Address)
         {
-            Namespace = config.Namespace,
+            Namespace = string.IsNullOrEmpty(namespaceOverride) ? config.Namespace : namespaceOverride,
             Runtime = runtime,
             LoggerFactory = loggerFactory,
 
