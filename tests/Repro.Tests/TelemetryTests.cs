@@ -95,6 +95,21 @@ public class HistogramBucketsTests
         Assert.DoesNotContain(
             HistogramBuckets.ScrapeOverrides.Keys,
             k => k.StartsWith("temporal_repro_", StringComparison.Ordinal));
+
+        // And the mirror image, which is the one that got through. A NON-custom row whose
+        // Name already carries the "temporal_" prefix is prefixed a second time, producing
+        // temporal_temporal_*. That key matches nothing on either path, so the metric falls
+        // silently to Core's catch-all.
+        //
+        // MEASURED before this assertion existed: the row for local_activity_execution_latency
+        // was written as "temporal_local_activity_execution_latency" and the entire suite
+        // stayed green. NoScrapeKeyIsASubstringOfAnother could not see it, because a
+        // double-prefixed key collides with nothing; the loop above could not see it, because
+        // it only inspects repro_ keys. The only symptom was a live scrape returning
+        // DefaultMs, which looks like a working panel.
+        Assert.DoesNotContain(
+            HistogramBuckets.ScrapeOverrides.Keys,
+            k => k.StartsWith("temporal_temporal_", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -225,8 +240,21 @@ public class DashboardMetricNameTests
 
                 foreach (var t in targets.EnumerateArray())
                 {
-                    if (t.TryGetProperty("expr", out var expr) && expr.GetString() is { } text)
+                    if (t.TryGetProperty("expr", out var expr) && expr.GetString() is { } raw_)
                     {
+                        // STRIP QUOTED LABEL VALUES FIRST. In PromQL a label value is always
+                        // double-quoted and a metric name never is, so everything inside
+                        // quotes is by definition not a metric name.
+                        //
+                        // This is not hygiene. The local-activity case runs in a namespace
+                        // called repro-local-activity, and the SERVER sanitizes label values
+                        // while the SDK does not, so its server-side panels carry
+                        // namespace="repro_local_activity" -- which the pattern below cannot
+                        // tell apart from a metric name. Without this line the test fails on
+                        // a namespace, names it as an unknown metric, and the obvious "fix"
+                        // is to add a bogus constant to MetricNames.
+                        var text = Regex.Replace(raw_, "\"[^\"]*\"", "\"\"");
+
                         foreach (Match m in Regex.Matches(text, "repro_[a-z0-9_]+"))
                         {
                             // Prometheus appends _bucket / _count / _sum to a HISTOGRAM's

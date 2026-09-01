@@ -1,0 +1,686 @@
+{
+  "uid": "sandbox-localactivity",
+  "title": "Repro / Local Activity",
+  "description": "The local-activity case, on its own board and in its own namespace. A local activity runs INSIDE the workflow task, so it writes a MarkerRecorded event instead of an activity task, takes a LocalActivityWorker slot, and cannot heartbeat. history.workflowTaskHeartbeatTimeout is dropped from 30m to 1m here, so two-thirds of runs outlive it and re-execute their burn from zero. Start at 'Executions /s vs completions /s': the gap is wasted CPU.",
+  "tags": [
+    "sandbox",
+    "localactivity"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "SDK namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "sandbox-prometheus"
+        },
+        "query": "label_values(temporal_request{service_name=\"temporal-core-sdk\"}, namespace)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "repro-local-activity",
+          "value": "repro-local-activity",
+          "selected": true
+        },
+        "description": "Values are NOT sanitized by the .NET SDK; dashes survive."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Local activity executions (range)",
+      "description": "Real executions of the Pi burn, re-executions included. Emitted from ACTIVITY code, which does not replay, so this counts CPU actually spent. Workflow.MetricMeter is replay-suppressed and would have hidden exactly the waste this board exists to show. Summed across both workers: :8077 and :8078 both poll repro-la-queue.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(repro_pi_attempt_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__range])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "executions"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Completed runs (range)",
+      "description": "Runs that reached WorkflowExecutionCompleted. MEASURED at the shipped config: about ONE of these per FOURTEEN executions on the left. That ratio is the whole point of the board -- the difference is CPU burnt on local activities that were thrown away when their workflow task timed out.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(repro_local_activity_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",outcome=\"completed\"}[$__range])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "completed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Workflow task heartbeat timeouts (range)",
+      "description": "The authoritative signal, from the server. Each one is a workflow task that was kept alive by SDK heartbeats until history.workflowTaskHeartbeatTimeout (1m here, against a 30m server default) ran out. Every one of these threw away an in-flight local activity. SERVER metric, so the namespace is spelled with UNDERSCORES; see srv_ns.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(increase(workflow_task_heartbeat_timeout_count{namespace=\"repro_local_activity\"}[$__range])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "WFT heartbeat timeouts"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Executions /s vs completions /s",
+      "description": "THE panel. The gap between the two lines is wasted CPU. They should be roughly equal for a healthy local activity; here they are about 14 to 1 by design, because two-thirds of runs draw a burn longer than the workflow task heartbeat timeout and every one of those repeats from zero until runTimeout closes the run at 6m.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(repro_pi_attempt_started{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "executions/s"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(repro_local_activity_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",outcome=\"completed\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "completions/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Workflow outcomes, server view",
+      "description": "SERVER-sourced, and it has to be. A run killed by RunTimeout is closed by TimeoutWorkflow WITHOUT scheduling a workflow task, so workflow code never resumes and repro_local_activity_completed never increments for it. This is the only place the timed-out two-thirds are visible at all.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 6
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(workflow_success{namespace=\"repro_local_activity\",workflowType=\"WorkflowLocalActivity\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "success"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(rate(workflow_timeout{namespace=\"repro_local_activity\",workflowType=\"WorkflowLocalActivity\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "timeout"
+        },
+        {
+          "refId": "C",
+          "expr": "sum(rate(workflow_failed{namespace=\"repro_local_activity\",workflowType=\"WorkflowLocalActivity\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "failed"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Workflow task heartbeat timeouts /s",
+      "description": "The rate version of the stat above. Each spike is one local activity thrown away mid-burn. MEASURED: the activity is notified about four seconds later, so burns cut this way all end at ~64s against the 1m timeout -- unlike a worker drain, which cuts every in-flight burn at the same WALL-CLOCK instant with unrelated elapsed values.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(workflow_task_heartbeat_timeout_count{namespace=\"repro_local_activity\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "WFT heartbeat timeouts/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Custom: repro local-activity outcomes /s",
+      "description": "DOES NOT ACCOUNT FOR EVERY RUN, unlike the other three workflows' outcome counters, and reading it as if it did is the trap this board exists to prevent. Only runs whose workflow code actually resumed are here. Compare against the server view to its left. `timed_out` appears only if you set localActivity.scheduleToCloseTimeout BELOW the heartbeat timeout, which is the documented mitigation.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(repro_local_activity_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Workflow latency p95",
+      "description": "End to end, from workflow start, and only for runs whose workflow code actually resumed -- the two-thirds killed by runTimeout are absent entirely. Note this times the WORKFLOW, not the burn: a run also waits for one of the four local-activity slots, so it can sit well above its own burn length. MEASURED samples at <=5s, 30-40s, 45-50s, 55-60s and 60-90s. Uses [$__range], not $__rate_interval: completed runs arrive every few minutes and a 5m rate window over them is frequently empty, which renders NaN rather than a flat line.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, outcome) (rate(repro_local_activity_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__range])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Core's local activity execution latency p95",
+      "description": "A DIFFERENT measurement from the panel to its left: this times ONE execution of the burn, where that one times the whole workflow. On a re-executed run the SDK records several of these and the workflow records none, which is why this panel keeps moving while that one goes quiet. Expect a dense band at ~64s, the point at which a workflow task timeout cuts a burn. [$__range] for the same sparseness reason as the panel to its left. If this reads a flat value pinned to a bucket boundary, check for MIXED BUCKET LAYOUTS before believing it: this metric's override key was wrong once, and Prometheus keeps the old le layout for its full retention, so sum by (le) merges two incompatible sets and produces negative per-bucket counts.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_local_activity_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__range])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Local activity slots",
+      "description": "Local activities have their OWN slot type: worker_type=\"LocalActivityWorker\", separate from ActivityWorker, so this does not come out of worker.maxConcurrentActivities. Capped at localActivity.maxConcurrentLocalActivities (4) against an SDK default of 100. The low cap is deliberate: workflow activations run on the same thread pool these CPU burns occupy, and the SDK fails a workflow task that does not yield within 2 seconds, so a saturated pool manufactures a failure that looks exactly like this board's real one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(temporal_worker_task_slots_available{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"LocalActivityWorker\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "available"
+        },
+        {
+          "refId": "B",
+          "expr": "sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"LocalActivityWorker\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "used"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Workflow task attempts p99",
+      "description": "Pinned to THIS namespace, which the identically-named panel on Bug Signals is not. Above 1 means workflow tasks are being retried. Here that is the designed behaviour rather than a symptom, and it is exactly why this panel is repeated on its own board: left unpinned on a shared board, this case's re-execution loop would dominate the reading and make some unrelated workflow look stuck.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(workflow_task_attempt_bucket{namespace=\"repro_local_activity\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p99 attempts"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}

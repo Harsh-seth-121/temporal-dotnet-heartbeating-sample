@@ -42,7 +42,7 @@ second worker.
 
 | URL | What |
 |---|---|
-| <http://localhost:3000> | Grafana, 8 dashboards |
+| <http://localhost:3000> | Grafana, 9 dashboards |
 | <http://localhost:8080> | Temporal Web UI |
 | <http://localhost:9090/targets> | Prometheus target health, all 6 should be UP |
 | <http://localhost:9091> | Pushgateway |
@@ -51,7 +51,7 @@ second worker.
 
 ## Dashboards
 
-The `sandbox` folder holds 4 boards written for this topology, 57 panels, 84 targets.
+The `sandbox` folder holds 5 boards written for this topology, 68 panels, 99 targets.
 
 | Dashboard | Source | What it answers |
 |---|---|---|
@@ -59,6 +59,7 @@ The `sandbox` folder holds 4 boards written for this topology, 57 panels, 84 tar
 | Repro / Server and Persistence | server | Frontend RPS and latency, persistence latency, backlog, sync-match ratio |
 | Repro / Bug Signals | both | Non-determinism, workflow task retries, sticky cache, replay pressure, injected faults, simple-activity outcomes and weather source |
 | **Repro / Heartbeating** | both | Heartbeat RPC rate vs call rate, the throttle, checkpoint staleness, cancellation reasons, timeouts |
+| **Repro / Local Activity** | both | Executions vs completions (the gap is wasted CPU), workflow task heartbeat timeouts, local-activity slots. Opens on the `repro-local-activity` namespace and a 3h window |
 
 Four more boards are imported from
 [temporalio/dashboards](https://github.com/temporalio/dashboards) as-is, pinned to

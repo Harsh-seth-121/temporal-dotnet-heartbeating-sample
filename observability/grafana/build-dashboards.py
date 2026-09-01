@@ -168,7 +168,8 @@ def panel(pid, title, exprs, unit=NUM, kind="timeseries", w=12, h=8, x=0, y=0,
     return p
 
 
-def dashboard(uid, title, desc, panels, tags, variables=("namespace",)):
+def dashboard(uid, title, desc, panels, tags, variables=("namespace",),
+              namespace_default="default", default_from="now-30m"):
     tmpl = []
     if "namespace" in variables:
         tmpl.append({
@@ -191,7 +192,15 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",)):
             "refresh": 1,
             "includeAll": False,
             "multi": False,
-            "current": {"text": "default", "value": "default", "selected": True},
+            # PARAMETERIZED, because this stack now runs two namespaces and the
+            # dropdown is single-select. A board whose panels select
+            # repro-local-activity must OPEN on it: left at "default" every panel
+            # renders blank, and switching the variable to fix that blanks every
+            # panel on the other three boards at once. One board cannot show both,
+            # which is why the local-activity case has a board of its own rather
+            # than panels bolted onto Bug Signals.
+            "current": {"text": namespace_default, "value": namespace_default,
+                        "selected": True},
             # Core does NOT sanitize label values (Go+tally did). A namespace or
             # task queue with a dash keeps its dash here. The SERVER still
             # sanitizes, so the same name can be spelled two ways in one TSDB.
@@ -218,7 +227,13 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",)):
         "version": 1,
         "editable": True,
         "graphTooltip": 1,  # shared crosshair
-        "time": {"from": "now-30m", "to": "now"},
+        # PARAMETERIZED because the local-activity board needs a wider default. Its
+        # events arrive roughly once every three or four minutes -- a doomed run holds
+        # its concurrency slot for the whole 6m runTimeout -- so on a 30m window
+        # Grafana resolves $__rate_interval to about 5m and every rate() over them is
+        # frequently zero. MEASURED: rate(...[5m]) returned 0 while rate(...[15m])
+        # returned 0.0045 over the same data.
+        "time": {"from": default_from, "to": "now"},
         "refresh": "10s",
         "timezone": "browser",
         "templating": {"list": tmpl},
@@ -276,8 +291,33 @@ def srv(*extra):
     return "{" + ",".join(('namespace="default"',) + extra) + "}"
 
 
+def srv_ns(ns, *extra):
+    """Server-metric selector for a namespace other than `default`.
+
+    srv() hard-pins namespace="default" and its docstring used to say "this sandbox only
+    ever runs one namespace". That stopped being true when WorkflowLocalActivity got one
+    of its own, and the failure mode is the silent one: a server panel built with srv()
+    for that workflow matches nothing, forever, with no error.
+
+    MEASURED, and it is why this takes the sanitized spelling as its argument rather than
+    reusing $namespace. The server sanitizes label VALUES and the SDK does not, so one
+    namespace is spelled two ways in one TSDB:
+
+        :8077  namespace="repro-local-activity"   task_queue="repro-la-queue"
+        :8000  namespace="repro_local_activity"   taskqueue="repro_la_queue"
+
+    Note the label KEY differs too (task_queue vs taskqueue). You cannot join them.
+    """
+    return "{" + ",".join(('namespace="%s"' % ns,) + extra) + "}"
+
+
 SDK = sdk()          # {namespace="$namespace",service_name="temporal-core-sdk"}
 SRV = srv()          # {namespace="default"}
+
+# The local-activity case's namespace, in BOTH spellings, because every panel on that
+# board needs one or the other and picking the wrong one produces an empty panel.
+LA_NS_SDK = "repro-local-activity"
+LA_NS_SRV = "repro_local_activity"
 FE = '{service_name="frontend"}'
 HI = '{service_name="history"}'
 # task_schedule_to_start_latency is ONE histogram split by task_type, so a panel
@@ -899,6 +939,106 @@ heartbeat = grid([
 ])
 
 
+localactivity = grid([
+    dict(title="Local activity executions (range)", unit=NUM, h=6, w=8, kind="stat",
+         desc="Real executions of the Pi burn, re-executions included. Emitted from "
+              "ACTIVITY code, which does not replay, so this counts CPU actually spent. "
+              "Workflow.MetricMeter is replay-suppressed and would have hidden exactly the "
+              "waste this board exists to show. Summed across both workers: :8077 and :8078 "
+              "both poll repro-la-queue.",
+         exprs=[('sum(increase(repro_pi_attempt_started%s[$__range])) or vector(0)' % SDK, "executions")]),
+    dict(title="Completed runs (range)", unit=NUM, h=6, w=8, kind="stat",
+         desc="Runs that reached WorkflowExecutionCompleted. MEASURED at the shipped "
+              "config: about ONE of these per FOURTEEN executions on the left. That ratio "
+              "is the whole point of the board -- the difference is CPU burnt on local "
+              "activities that were thrown away when their workflow task timed out.",
+         exprs=[('sum(increase(repro_local_activity_completed%s[$__range])) or vector(0)' % sdk('outcome="completed"'), "completed")]),
+    dict(title="Workflow task heartbeat timeouts (range)", unit=NUM, h=6, w=8, kind="stat",
+         desc="The authoritative signal, from the server. Each one is a workflow task that "
+              "was kept alive by SDK heartbeats until history.workflowTaskHeartbeatTimeout "
+              "(1m here, against a 30m server default) ran out. Every one of these threw "
+              "away an in-flight local activity. SERVER metric, so the namespace is spelled "
+              "with UNDERSCORES; see srv_ns.",
+         exprs=[('sum(increase(workflow_task_heartbeat_timeout_count%s[$__range])) or vector(0)' % srv_ns(LA_NS_SRV), "WFT heartbeat timeouts")]),
+
+    dict(title="Executions /s vs completions /s", unit=RPS,
+         desc="THE panel. The gap between the two lines is wasted CPU. They should be "
+              "roughly equal for a healthy local activity; here they are about 14 to 1 by "
+              "design, because two-thirds of runs draw a burn longer than the workflow task "
+              "heartbeat timeout and every one of those repeats from zero until runTimeout "
+              "closes the run at 6m.",
+         exprs=[('sum(rate(repro_pi_attempt_started%s[$__rate_interval])) or vector(0)' % SDK, "executions/s"),
+                ('sum(rate(repro_local_activity_completed%s[$__rate_interval])) or vector(0)' % sdk('outcome="completed"'), "completions/s")]),
+    dict(title="Workflow outcomes, server view", unit=RPS, stack=True,
+         desc="SERVER-sourced, and it has to be. A run killed by RunTimeout is closed by "
+              "TimeoutWorkflow WITHOUT scheduling a workflow task, so workflow code never "
+              "resumes and repro_local_activity_completed never increments for it. This is "
+              "the only place the timed-out two-thirds are visible at all.",
+         exprs=[('sum(rate(workflow_success%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV, 'workflowType="WorkflowLocalActivity"'), "success"),
+                ('sum(rate(workflow_timeout%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV, 'workflowType="WorkflowLocalActivity"'), "timeout"),
+                ('sum(rate(workflow_failed%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV, 'workflowType="WorkflowLocalActivity"'), "failed")]),
+
+    dict(title="Workflow task heartbeat timeouts /s", unit=RPS,
+         desc="The rate version of the stat above. Each spike is one local activity thrown "
+              "away mid-burn. MEASURED: the activity is notified about four seconds later, "
+              "so burns cut this way all end at ~64s against the 1m timeout -- unlike a "
+              "worker drain, which cuts every in-flight burn at the same WALL-CLOCK instant "
+              "with unrelated elapsed values.",
+         exprs=[('sum(rate(workflow_task_heartbeat_timeout_count%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV), "WFT heartbeat timeouts/s")]),
+    dict(title="Custom: repro local-activity outcomes /s", unit=RPS, stack=True,
+         desc="DOES NOT ACCOUNT FOR EVERY RUN, unlike the other three workflows' outcome "
+              "counters, and reading it as if it did is the trap this board exists to "
+              "prevent. Only runs whose workflow code actually resumed are here. Compare "
+              "against the server view to its left. `timed_out` appears only if you set "
+              "localActivity.scheduleToCloseTimeout BELOW the heartbeat timeout, which is "
+              "the documented mitigation.",
+         exprs=[('sum by (outcome) (rate(repro_local_activity_completed%s[$__rate_interval])) or vector(0)' % SDK, "{{outcome}}")]),
+
+    dict(title="Workflow latency p95", unit=MS, minval=0,
+         desc="End to end, from workflow start, and only for runs whose workflow code "
+              "actually resumed -- the two-thirds killed by runTimeout are absent entirely. "
+              "Note this times the WORKFLOW, not the burn: a run also waits for one of the "
+              "four local-activity slots, so it can sit well above its own burn length. "
+              "MEASURED samples at <=5s, 30-40s, 45-50s, 55-60s and 60-90s. Uses [$__range], "
+              "not $__rate_interval: completed runs arrive every few minutes and a 5m rate "
+              "window over them is frequently empty, which renders NaN rather than a flat "
+              "line.",
+         exprs=[('histogram_quantile(0.95, sum by (le, outcome) (rate(repro_local_activity_latency_bucket%s[$__range])))' % SDK, "{{outcome}}")]),
+    dict(title="Core's local activity execution latency p95", unit=MS, minval=0,
+         desc="A DIFFERENT measurement from the panel to its left: this times ONE execution "
+              "of the burn, where that one times the whole workflow. On a re-executed run "
+              "the SDK records several of these and the workflow records none, which is why "
+              "this panel keeps moving while that one goes quiet. Expect a dense band at "
+              "~64s, the point at which a workflow task timeout cuts a burn. [$__range] for "
+              "the same sparseness reason as the panel to its left. If this reads a flat "
+              "value pinned to a bucket boundary, check for MIXED BUCKET LAYOUTS before "
+              "believing it: this metric's override key was wrong once, and Prometheus keeps "
+              "the old le layout for its full retention, so sum by (le) merges two "
+              "incompatible sets and produces negative per-bucket counts.",
+         exprs=[('histogram_quantile(0.95, sum by (le) (rate(temporal_local_activity_execution_latency_bucket%s[$__range])))' % SDK, "p95")]),
+
+    dict(title="Local activity slots", unit=NUM, minval=0,
+         desc="Local activities have their OWN slot type: worker_type=\"LocalActivityWorker\", "
+              "separate from ActivityWorker, so this does not come out of "
+              "worker.maxConcurrentActivities. Capped at localActivity."
+              "maxConcurrentLocalActivities (4) against an SDK default of 100. The low cap "
+              "is deliberate: workflow activations run on the same thread pool these CPU "
+              "burns occupy, and the SDK fails a workflow task that does not yield within "
+              "2 seconds, so a saturated pool manufactures a failure that looks exactly "
+              "like this board's real one.",
+         exprs=[('sum(temporal_worker_task_slots_available%s) or vector(0)' % sdk('worker_type="LocalActivityWorker"'), "available"),
+                ('sum(temporal_worker_task_slots_used%s) or vector(0)' % sdk('worker_type="LocalActivityWorker"'), "used")]),
+    dict(title="Workflow task attempts p99", unit=NUM, minval=0,
+         desc="Pinned to THIS namespace, which the identically-named panel on Bug Signals "
+              "is not. Above 1 means workflow tasks are being retried. Here that is the "
+              "designed behaviour rather than a symptom, and it is exactly why this panel "
+              "is repeated on its own board: left unpinned on a shared board, this case's "
+              "re-execution loop would dominate the reading and make some unrelated "
+              "workflow look stuck.",
+         exprs=[('histogram_quantile(0.99, sum by (le) (rate(workflow_task_attempt_bucket%s[$__rate_interval])))' % srv_ns(LA_NS_SRV), "p99 attempts")]),
+])
+
+
 BOARDS = [
     ("sandbox-worker", "Repro / Worker Health", worker,
      "SDK-sourced worker health: slots, pollers, schedule-to-start, execution "
@@ -922,13 +1062,28 @@ BOARDS = [
      "consequence (activity_task_timeout), or something this repo emits itself. "
      "Start at 'Heartbeat interval: asked for vs throttled vs observed'.",
      ["sandbox", "heartbeat"]),
+    ("sandbox-localactivity", "Repro / Local Activity", localactivity,
+     "The local-activity case, on its own board and in its own namespace. A local "
+     "activity runs INSIDE the workflow task, so it writes a MarkerRecorded event "
+     "instead of an activity task, takes a LocalActivityWorker slot, and cannot "
+     "heartbeat. history.workflowTaskHeartbeatTimeout is dropped from 30m to 1m here, "
+     "so two-thirds of runs outlive it and re-execute their burn from zero. Start at "
+     "'Executions /s vs completions /s': the gap is wasted CPU.",
+     ["sandbox", "localactivity"]),
 ]
 
 OUT.mkdir(parents=True, exist_ok=True)
 total_panels = total_targets = 0
 for uid, title, panels, desc, tags in BOARDS:
     d = dashboard(uid, title, desc, panels, tags,
-                  variables=("namespace",) if uid != "sandbox-server" else ())
+                  variables=("namespace",) if uid != "sandbox-server" else (),
+                  # This board's panels select repro-local-activity, so it must OPEN on
+                  # it. The variable is single-select; a board left on "default" here
+                  # renders every panel blank.
+                  namespace_default=(LA_NS_SDK if uid == "sandbox-localactivity"
+                                     else "default"),
+                  default_from=("now-3h" if uid == "sandbox-localactivity"
+                                else "now-30m"))
     path = OUT / f"{uid.replace('sandbox-', '')}.json"
     path.write_text(json.dumps(d, indent=2) + "\n")
     n = sum(len(p["targets"]) for p in panels)

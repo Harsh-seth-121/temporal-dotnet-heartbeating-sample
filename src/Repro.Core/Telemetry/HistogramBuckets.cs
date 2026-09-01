@@ -142,19 +142,24 @@ public static class HistogramBuckets
         // lands in le=30000 and p95 for those outcomes reads a flat ~29.9s forever, which is
         // the plausible-constant failure this file's header calls the worst one here.
         //
-        // ABOVE 60_000 there is almost nothing, and that is deliberate rather than an
-        // oversight. At the shipped config a run whose burn exceeds the 1m workflow task
-        // heartbeat timeout is closed by runTimeout, and the server does that WITHOUT
-        // scheduling a workflow task, so the workflow never records a sample at all. The
-        // observations that exist are the completers, whose durations lie in [30s, ~60s].
-        // 90_000 is kept as the one boundary above the timeout so that a sample appearing
-        // there is visible as the anomaly it would be.
+        // ABOVE 60_000 IS NOT DEAD WEIGHT, and this row's first draft got that exactly
+        // backwards. The reasoning was: only runs whose burn beats the 1m heartbeat timeout
+        // ever record a sample, so nothing above ~60s can exist and the boundaries can stop
+        // there.
         //
-        // DO NOT READ THE EDGE AT 60_000 AS A SHOULDER. It is the ceiling of what can be
-        // recorded, not evidence that a timeout is being enforced at 60s. docs/DASHBOARDS.md
-        // says the same thing next to the panel.
+        // MEASURED, and it is wrong. This histogram times the WORKFLOW, not the burn, and a
+        // workflow also waits for a local-activity slot -- there are only
+        // localActivity.maxConcurrentLocalActivities of them and each is held for up to a
+        // minute. A run whose burn is comfortably under the timeout can therefore take far
+        // longer end to end. Over one demo run the five recorded samples landed at <=5s, in
+        // (30s, 40s], in (45s, 50s], in (55s, 60s] and in (60s, 90s]. The last of those is
+        // the one the original boundaries would have called impossible.
+        //
+        // So the tail runs to runTimeout, not to the heartbeat timeout, and the boundaries
+        // now say so. Without 120_000 upward, a queued run lands in +Inf and p95 pins.
         ("repro_local_activity_latency", true,
-            [1000, 5000, 10_000, 20_000, 30_000, 40_000, 45_000, 50_000, 55_000, 60_000, 90_000]),
+            [1000, 5000, 10_000, 20_000, 30_000, 40_000, 45_000, 50_000, 55_000, 60_000,
+             90_000, 120_000, 180_000, 300_000]),
 
         // Core's own local-activity latency, which is a DIFFERENT measurement from the row
         // above: it times one execution of the burn, where repro_local_activity_latency times
@@ -166,7 +171,21 @@ public static class HistogramBuckets
         // "temporal_local_activity_execution_latency".Contains("temporal_activity_execution_latency")
         // is FALSE, because the byte preceding "activity_execution_latency" is the "l" of
         // "local_" rather than the "_" of "temporal_". The two rows are independent.
-        ("temporal_local_activity_execution_latency", false,
+        // NOT "temporal_local_activity_execution_latency". Custom=false means the Table
+        // PREPENDS CorePrefix, so the name here is the UNPREFIXED one, exactly like
+        // request_latency and activity_execution_latency above. Writing the prefixed name
+        // produced the key temporal_temporal_local_activity_execution_latency, which matches
+        // no emitted series and no lookup on either path.
+        //
+        // MEASURED, and it is worth recording how it presented, because it is this file's own
+        // headline failure arriving from a direction the tests did not cover. The build stayed
+        // green. NoScrapeKeyIsASubstringOfAnother passed, because a double-prefixed key
+        // collides with nothing. EveryCustomHistogramRowIsReachableUnderItsOwnName passed,
+        // because it only checks repro_ keys. The only symptom was on a live scrape: this
+        // metric came back with le=[50,100,500,1000,2500,10000,+Inf], which is DefaultMs --
+        // a plausible-looking bucket set, a populated panel, and a p95 pinned under 10s
+        // against a metric whose whole point is that it runs for a minute.
+        ("local_activity_execution_latency", false,
             [1000, 5000, 10_000, 30_000, 60_000, 90_000, 120_000, 180_000, 300_000]),
 
         // LEFT AT CORE DEFAULTS ON PURPOSE, do not add:
