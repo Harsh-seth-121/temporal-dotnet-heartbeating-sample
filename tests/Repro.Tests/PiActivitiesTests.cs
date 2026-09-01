@@ -34,11 +34,25 @@ public class PiActivitiesTests
     /// <summary>Long enough for the estimator to converge, short enough for a test suite.</summary>
     private const int ShortBurnMs = 250;
 
+    /// <summary>Run one burn inside <paramref name="env"/> and hand back its estimate.</summary>
+    /// <remarks>
+    /// The ONE construction site for LocalActivityInput in this file, so the named arguments
+    /// its record remarks ask for are written once rather than six times.
+    /// <para>
+    /// The environment is a PARAMETER rather than something this method creates, because two
+    /// of these tests fire a token on it before the burn starts and WHICH token that is is the
+    /// entire point of the test. Every caller therefore still names the harness it runs under,
+    /// which is also the harness no test may skip.
+    /// </para>
+    /// </remarks>
+    private static Task<PiEstimate> BurnAsync(ActivityEnvironment env, int durationMs, int seed) =>
+        env.RunAsync(() => new PiActivities().EstimatePi(
+            new LocalActivityInput(DurationMs: durationMs, Seed: seed)));
+
     [Fact]
     public async Task EstimatesPiWithinToleranceOverAShortBurn()
     {
-        var result = await new ActivityEnvironment().RunAsync(
-            () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: ShortBurnMs, Seed: 42)));
+        var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 42);
 
         // Monte Carlo error falls as 1/sqrt(n), and a quarter second is millions of samples,
         // so the true error is around three decimal places. The tolerance is deliberately far
@@ -50,14 +64,36 @@ public class PiActivitiesTests
     }
 
     [Fact]
+    public async Task ReportsIsLocalFromTheActivityContext()
+    {
+        // The trap this class's remarks describe, finally exercised. ActivityEnvironment's
+        // DefaultInfo has IsLocal = FALSE, so a test that ran a plain burn and asserted
+        // IsLocal would be asserting the harness default: it would pass, and it would prove
+        // nothing about the local-activity path. Assigning Info is the only way to make the
+        // assertion mean anything.
+        var env = new ActivityEnvironment
+        {
+            Info = ActivityEnvironment.DefaultInfo with { IsLocal = true },
+        };
+
+        var local = await BurnAsync(env, durationMs: ShortBurnMs, seed: 3);
+        Assert.True(local.IsLocal, "PiEstimate.IsLocal did not follow ActivityInfo.IsLocal");
+
+        // The negative half, and it is not padding: without it this test also passes if
+        // IsLocal is hardcoded true, which is the one wrong implementation a reader would
+        // never suspect given the activity is only ever registered as a local one.
+        var plain = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 3);
+        Assert.False(plain.IsLocal, "PiEstimate.IsLocal is not reading ActivityInfo.IsLocal at all");
+    }
+
+    [Fact]
     public async Task PiIsExactlyDerivableFromInsideAndIterations()
     {
         // The one invariant that catches a swapped NAMED argument in the PiEstimate
         // construction, which is the failure that record's remarks warn about. Iterations and
         // Inside are adjacent longs, so swapping them positionally compiles clean; if they
         // were swapped this identity would not hold, because Inside is always the smaller.
-        var result = await new ActivityEnvironment().RunAsync(
-            () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: ShortBurnMs, Seed: 7)));
+        var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 7);
 
         Assert.True(result.Inside <= result.Iterations, "more points landed inside than were sampled");
         Assert.Equal(4.0 * result.Inside / result.Iterations, result.Pi, 12);
@@ -66,19 +102,21 @@ public class PiActivitiesTests
     [Fact]
     public async Task ReportsTheRequestedAndMeasuredDurationsSeparately()
     {
-        var result = await new ActivityEnvironment().RunAsync(
-            () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: ShortBurnMs, Seed: 1)));
+        var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 1);
 
         // RequestedMs and ElapsedMs are ADJACENT ints in PiEstimate, so a positional swap
         // would report the duration that was asked for as the one that was measured. That is
         // the exact number this whole case exists to show, and it would compile clean.
         Assert.Equal(ShortBurnMs, result.RequestedMs);
 
-        // The loop only checks its clock on a batch boundary, so it always overshoots slightly
-        // and can never undershoot. Asserting >= rather than a window keeps this from being a
-        // machine-speed test.
+        // The loop only checks its clock on a batch boundary, so it always overshoots and can
+        // never undershoot: it breaks only once GetElapsedTime >= budget, and ElapsedMs is
+        // read AFTER that, from a strictly later timestamp. So the bound is exact and needs no
+        // slack -- the truncation to int can only discard the fractional overshoot, never take
+        // the value below the budget. Asserting >= rather than a window keeps this from being
+        // a machine-speed test.
         Assert.True(
-            result.ElapsedMs >= ShortBurnMs - 1,
+            result.ElapsedMs >= ShortBurnMs,
             $"burn ended at {result.ElapsedMs}ms, before the {ShortBurnMs}ms it was asked for");
 
         Assert.Equal(MetricNames.Endings.Completed, result.EndedBy);
@@ -100,8 +138,7 @@ public class PiActivitiesTests
         env.WorkerShutdownTokenSource.CancelAfter(TimeSpan.FromMilliseconds(150));
 
         var startedAt = Stopwatch.GetTimestamp();
-        var result = await env.RunAsync(
-            () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: 60_000, Seed: 3)));
+        var result = await BurnAsync(env, durationMs: 60_000, seed: 3);
         var elapsed = Stopwatch.GetElapsedTime(startedAt);
 
         Assert.Equal(MetricNames.Endings.Shutdown, result.EndedBy);
@@ -121,9 +158,9 @@ public class PiActivitiesTests
         Assert.Equal(60_000, result.RequestedMs);
         Assert.True(
             result.ElapsedMs < result.RequestedMs / 2,
-            $"ElapsedMs {result.ElapsedMs} is not meaningfully below the requested "
-            + $"{result.RequestedMs}; if these two are equal on a burn that was cut short, they "
-            + "are probably the same value and PiEstimate was constructed positionally");
+            $"ElapsedMs {result.ElapsedMs} is not meaningfully below the requested " +
+            $"{result.RequestedMs}; if these two are equal on a burn that was cut short, they " +
+            "are probably the same value and PiEstimate was constructed positionally");
 
         // Generous by two orders of magnitude against the 60s it was asked for. The claim is
         // "it noticed and stopped", not "it stopped in exactly 150ms" -- the loop only checks
@@ -134,7 +171,7 @@ public class PiActivitiesTests
 
         // Still a usable estimate. A drain must not turn the result into garbage, because it
         // is returned rather than thrown and it lands in the history like any other.
-        Assert.True(result.Iterations > 0);
+        Assert.True(result.Iterations > 0, "a burn cut short by a drain recorded no samples at all");
         Assert.InRange(result.Pi, 3.0, 3.3);
     }
 
@@ -152,19 +189,22 @@ public class PiActivitiesTests
         var env = new ActivityEnvironment();
         env.CancellationTokenSource.CancelAfter(TimeSpan.FromMilliseconds(150));
 
-        var result = await env.RunAsync(
-            () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: 60_000, Seed: 4)));
+        var result = await BurnAsync(env, durationMs: 60_000, seed: 4);
 
         Assert.Equal(MetricNames.Endings.Canceled, result.EndedBy);
         Assert.NotEqual(MetricNames.Endings.Shutdown, result.EndedBy);
-        Assert.True(result.ElapsedMs < 10_000);
+
+        // The same generous bound as the shutdown test, made from the same claim: "it noticed
+        // and stopped", not "it stopped in exactly 150ms".
+        Assert.True(
+            result.ElapsedMs < 10_000,
+            $"a 60s burn ran {result.ElapsedMs}ms before it noticed activity cancellation");
     }
 
     [Fact]
     public async Task ThroughputIsConsistentWithIterationsAndElapsed()
     {
-        var result = await new ActivityEnvironment().RunAsync(
-            () => new PiActivities().EstimatePi(new LocalActivityInput(DurationMs: ShortBurnMs, Seed: 5)));
+        var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 5);
 
         // IterationsPerSecond is the third adjacent long in PiEstimate. This is the only thing
         // that would catch it being constructed from the wrong one, since any of the three is

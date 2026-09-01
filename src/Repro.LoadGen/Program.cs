@@ -177,27 +177,9 @@ if (localOn)
     var laClient = await ClientFactory.ConnectAsync(
         config, runtime, "loadgen-la", loggerFactory, config.LocalActivity.Namespace);
 
-    var laOptions = new TemporalWorkerOptions(config.LocalActivity.TaskQueue)
-        .AddWorkflow<WorkflowLocalActivity>()
-        // A local activity resolves against the registry of the worker running the WORKFLOW,
-        // so PiActivities belongs on THIS worker and not the one above.
-        .AddAllActivities(new PiActivities());
-
-    laOptions.LocalActivityWorkerOnly = true;
-    laOptions.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
-    laOptions.MaxConcurrentLocalActivities = config.LocalActivity.MaxConcurrentLocalActivities;
-
-    if (config.Worker.MaxCachedWorkflows > 0)
-    {
-        laOptions.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
-    }
-
-    if (config.Worker.MaxConcurrentWorkflowTasks > 0)
-    {
-        laOptions.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
-    }
-
-    laWorker = new TemporalWorker(laClient, laOptions);
+    // Same options object as Repro.Worker builds, from Repro.Core, so the two processes
+    // cannot drift; see LocalActivityWorkerOptions for why that is worth a file.
+    laWorker = new TemporalWorker(laClient, LocalActivityWorkerOptions.For(config));
     laWorkerTask = laWorker.ExecuteAsync(shutdown.Token);
 
     var localDriver = new LocalActivityDriver(
@@ -208,8 +190,8 @@ if (localOn)
 else
 {
     log.LogInformation(
-        "local-activity: OFF (localActivity.enabled is false, or --no-local-activity was passed); "
-        + "this process makes no connection to the local-activity namespace");
+        "local-activity: OFF (localActivity.enabled is false, or --no-local-activity was passed); " +
+        "this process makes no connection to the local-activity namespace");
 }
 
 var started = 0;

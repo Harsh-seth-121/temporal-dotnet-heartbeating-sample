@@ -26,8 +26,10 @@ var log = loggerFactory.CreateLogger("replay");
 // given. No activity registration: the replayer does not execute them.
 //
 // The failure is LOUD, which is worth knowing because the previous wording here claimed the
-// opposite. MEASURED with WorkflowSimpleActivity unregistered: the two registered fixtures
-// still report "replay OK" and only the third fails, with
+// opposite. MEASURED with WorkflowSimpleActivity unregistered, back when three types existed
+// in total -- so the available-workflows list quoted below is that run's and not what you
+// would see today: the two registered fixtures still report "replay OK" and only the third
+// fails, with
 // InvalidWorkflowOperationException carrying "Workflow type WorkflowSimpleActivity is not
 // registered on this worker, available workflows: HeartbeatWorkflow, SimpleNoActivity" and
 // ApplicationFailureInfo type NotFoundError. No WorkflowNondeterminismException, no

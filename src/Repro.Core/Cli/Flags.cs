@@ -7,7 +7,7 @@ namespace Repro.Core.Cli;
 /// Hand-rolled arg parser. Supports both <c>--flag value</c> and <c>--flag=value</c>.
 /// </summary>
 /// <remarks>
-/// Twelve flags do not justify System.CommandLine. Note also that samples-dotnet and
+/// Thirteen flags do not justify System.CommandLine. Note also that samples-dotnet and
 /// omes still pin System.CommandLine 2.0.0-beta4, whose API differs substantially
 /// from the 2.0.11 stable release: copying their AddOption/SetHandler code into a
 /// net10 repo does not compile. Fifty lines here, zero surprises.
@@ -27,8 +27,8 @@ public sealed class Flags
     /// one.
     /// Parse looks up the text before any '=' in these hash sets, never by prefix. So
     /// <c>--no-simple</c> does NOT turn off the simple-activity loop, and someone will type it
-    /// expecting that. Both belong to every binary, the loadgen included: these sets are
-    /// static, so all four exes share one registration.
+    /// expecting that. All three belong to every binary, the loadgen included: these sets
+    /// are static, so all four exes share one registration.
     /// <para>
     /// Register a switch HERE ONLY. <see cref="Known"/> is DERIVED from this set plus
     /// <see cref="ValueFlags"/>, which is what makes the two old failures unreachable: a

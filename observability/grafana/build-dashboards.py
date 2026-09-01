@@ -105,15 +105,18 @@ OUT = pathlib.Path(__file__).resolve().parent / "dashboards/sandbox"
 CUSTOM = "repro_"              # prefix on this repo's own metrics. NOT applied by
                                # MetricPrefix. Core does not prefix custom names,
                                # so this is a literal part of the metric name.
-TASK_QUEUE = "repro-task-queue"   # for docs/legends only; panels group by label.
-                                      # The dash is deliberate: see the sanitization
-                                      # note in the docstring.
+TASK_QUEUES = ("repro-task-queue",     # for docs/legends only; panels group by label.
+               "repro-la-queue")       # The dashes are deliberate: see the sanitization
+                                       # note in the docstring.
 # Documentation only: grep shows ZERO expressions reference these, because every panel
 # groups by the label rather than selecting one value. They are here so a reader can check
 # the spellings against src/ -- which is also why they had to become plural once there
-# were three workflow types and two activity classes.
-WORKFLOW_TYPES = ("HeartbeatWorkflow", "SimpleNoActivity", "WorkflowSimpleActivity")
-ACTIVITY_TYPES = ("ProcessBatch", "FetchWeather")   # [Activity] TRIMS the "Async" suffix
+# were several workflow types and several activity classes.
+WORKFLOW_TYPES = ("HeartbeatWorkflow", "SimpleNoActivity", "WorkflowSimpleActivity",
+                  "WorkflowLocalActivity")
+# [Activity] TRIMS the "Async" suffix, which is why ProcessBatchAsync and FetchWeatherAsync
+# are on the wire without it. EstimatePi is declared sync and never had one.
+ACTIVITY_TYPES = ("ProcessBatch", "FetchWeather", "EstimatePi")
 
 # Units: s=seconds, ms=milliseconds, percent=0-100, percentunit=0-1,
 # short=plain number, reqps=rate.
@@ -280,28 +283,19 @@ def sdk(*extra):
                            'service_name="temporal-core-sdk"') + extra) + "}"
 
 
-def srv(*extra):
-    """Label selector for server metrics.
+def srv(*extra, ns="default"):
+    """Label selector for server metrics, pinned to namespace `ns`.
 
-    The namespace is pinned literally, not to $namespace, for two reasons: the
-    $namespace variable is populated from SDK series and server label VALUES are
-    sanitized while SDK ones are not, so the two vocabularies are not
-    interchangeable; and this sandbox only ever runs one namespace.
-    """
-    return "{" + ",".join(('namespace="default"',) + extra) + "}"
+    The namespace is pinned to a LITERAL, never to $namespace: that variable is populated
+    from SDK series, and server label VALUES are sanitized while SDK ones are not, so the
+    two vocabularies are not interchangeable. `ns` therefore takes the SANITIZED spelling.
 
+    Pass `ns` for any board outside `default`. This sandbox stopped running a single
+    namespace when WorkflowLocalActivity got one of its own, and the failure mode is the
+    silent one: a server panel left on the default pin for that workflow matches nothing,
+    forever, with no error.
 
-def srv_ns(ns, *extra):
-    """Server-metric selector for a namespace other than `default`.
-
-    srv() hard-pins namespace="default" and its docstring used to say "this sandbox only
-    ever runs one namespace". That stopped being true when WorkflowLocalActivity got one
-    of its own, and the failure mode is the silent one: a server panel built with srv()
-    for that workflow matches nothing, forever, with no error.
-
-    MEASURED, and it is why this takes the sanitized spelling as its argument rather than
-    reusing $namespace. The server sanitizes label VALUES and the SDK does not, so one
-    namespace is spelled two ways in one TSDB:
+    MEASURED. One namespace, spelled two ways in one TSDB:
 
         :8077  namespace="repro-local-activity"   task_queue="repro-la-queue"
         :8000  namespace="repro_local_activity"   taskqueue="repro_la_queue"
@@ -316,8 +310,11 @@ SRV = srv()          # {namespace="default"}
 
 # The local-activity case's namespace, in BOTH spellings, because every panel on that
 # board needs one or the other and picking the wrong one produces an empty panel.
+# LA_NS_SDK is the board's opening value for $namespace; LA_NS_SRV feeds srv(ns=...).
 LA_NS_SDK = "repro-local-activity"
 LA_NS_SRV = "repro_local_activity"
+LA_SRV = srv(ns=LA_NS_SRV)      # {namespace="repro_local_activity"}
+LA_SRV_WF = srv('workflowType="WorkflowLocalActivity"', ns=LA_NS_SRV)
 FE = '{service_name="frontend"}'
 HI = '{service_name="history"}'
 # task_schedule_to_start_latency is ONE histogram split by task_type, so a panel
@@ -958,8 +955,8 @@ localactivity = grid([
               "was kept alive by SDK heartbeats until history.workflowTaskHeartbeatTimeout "
               "(1m here, against a 30m server default) ran out. Every one of these threw "
               "away an in-flight local activity. SERVER metric, so the namespace is spelled "
-              "with UNDERSCORES; see srv_ns.",
-         exprs=[('sum(increase(workflow_task_heartbeat_timeout_count%s[$__range])) or vector(0)' % srv_ns(LA_NS_SRV), "WFT heartbeat timeouts")]),
+              "with UNDERSCORES: repro_local_activity, not repro-local-activity.",
+         exprs=[('sum(increase(workflow_task_heartbeat_timeout_count%s[$__range])) or vector(0)' % LA_SRV, "WFT heartbeat timeouts")]),
 
     dict(title="Executions /s vs completions /s", unit=RPS,
          desc="THE panel. The gap between the two lines is wasted CPU. They should be "
@@ -974,9 +971,9 @@ localactivity = grid([
               "TimeoutWorkflow WITHOUT scheduling a workflow task, so workflow code never "
               "resumes and repro_local_activity_completed never increments for it. This is "
               "the only place the timed-out two-thirds are visible at all.",
-         exprs=[('sum(rate(workflow_success%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV, 'workflowType="WorkflowLocalActivity"'), "success"),
-                ('sum(rate(workflow_timeout%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV, 'workflowType="WorkflowLocalActivity"'), "timeout"),
-                ('sum(rate(workflow_failed%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV, 'workflowType="WorkflowLocalActivity"'), "failed")]),
+         exprs=[('sum(rate(workflow_success%s[$__rate_interval])) or vector(0)' % LA_SRV_WF, "success"),
+                ('sum(rate(workflow_timeout%s[$__rate_interval])) or vector(0)' % LA_SRV_WF, "timeout"),
+                ('sum(rate(workflow_failed%s[$__rate_interval])) or vector(0)' % LA_SRV_WF, "failed")]),
 
     dict(title="Workflow task heartbeat timeouts /s", unit=RPS,
          desc="The rate version of the stat above. Each spike is one local activity thrown "
@@ -984,7 +981,7 @@ localactivity = grid([
               "so burns cut this way all end at ~64s against the 1m timeout -- unlike a "
               "worker drain, which cuts every in-flight burn at the same WALL-CLOCK instant "
               "with unrelated elapsed values.",
-         exprs=[('sum(rate(workflow_task_heartbeat_timeout_count%s[$__rate_interval])) or vector(0)' % srv_ns(LA_NS_SRV), "WFT heartbeat timeouts/s")]),
+         exprs=[('sum(rate(workflow_task_heartbeat_timeout_count%s[$__rate_interval])) or vector(0)' % LA_SRV, "WFT heartbeat timeouts/s")]),
     dict(title="Custom: repro local-activity outcomes /s", unit=RPS, stack=True,
          desc="DOES NOT ACCOUNT FOR EVERY RUN, unlike the other three workflows' outcome "
               "counters, and reading it as if it did is the trap this board exists to "
@@ -1035,7 +1032,7 @@ localactivity = grid([
               "is repeated on its own board: left unpinned on a shared board, this case's "
               "re-execution loop would dominate the reading and make some unrelated "
               "workflow look stuck.",
-         exprs=[('histogram_quantile(0.99, sum by (le) (rate(workflow_task_attempt_bucket%s[$__rate_interval])))' % srv_ns(LA_NS_SRV), "p99 attempts")]),
+         exprs=[('histogram_quantile(0.99, sum by (le) (rate(workflow_task_attempt_bucket%s[$__rate_interval])))' % LA_SRV, "p99 attempts")]),
 ])
 
 
@@ -1075,15 +1072,15 @@ BOARDS = [
 OUT.mkdir(parents=True, exist_ok=True)
 total_panels = total_targets = 0
 for uid, title, panels, desc, tags in BOARDS:
+    # The local-activity board is the only one that overrides either default. Its panels
+    # select repro-local-activity, so it must OPEN on it -- the variable is single-select
+    # and a board left on "default" renders every panel blank -- and it must open on a
+    # window wide enough for events that arrive minutes apart. See dashboard().
+    local_activity = uid == "sandbox-localactivity"
     d = dashboard(uid, title, desc, panels, tags,
-                  variables=("namespace",) if uid != "sandbox-server" else (),
-                  # This board's panels select repro-local-activity, so it must OPEN on
-                  # it. The variable is single-select; a board left on "default" here
-                  # renders every panel blank.
-                  namespace_default=(LA_NS_SDK if uid == "sandbox-localactivity"
-                                     else "default"),
-                  default_from=("now-3h" if uid == "sandbox-localactivity"
-                                else "now-30m"))
+                  variables=() if uid == "sandbox-server" else ("namespace",),
+                  namespace_default=LA_NS_SDK if local_activity else "default",
+                  default_from="now-3h" if local_activity else "now-30m")
     path = OUT / f"{uid.replace('sandbox-', '')}.json"
     path.write_text(json.dumps(d, indent=2) + "\n")
     n = sum(len(p["targets"]) for p in panels)

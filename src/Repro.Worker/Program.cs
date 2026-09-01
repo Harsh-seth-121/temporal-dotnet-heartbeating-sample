@@ -117,45 +117,17 @@ using var worker = new TemporalWorker(client, options);
 var laClient = await ClientFactory.ConnectAsync(
     config, runtime, "worker-la", loggerFactory, config.LocalActivity.Namespace);
 
-var laOptions = new TemporalWorkerOptions(config.LocalActivity.TaskQueue)
-    .AddWorkflow<WorkflowLocalActivity>()
-    // PiActivities goes HERE and only here. A local activity is resolved against the registry
-    // of the worker running the WORKFLOW, so registering it on the other worker throws at
-    // schedule time inside the workflow task with "is not registered on this worker".
-    .AddAllActivities(new PiActivities());
-
-// This worker hosts workflows and local activities and nothing else, so it should not poll
-// for regular activity tasks that can never arrive on this queue.
-laOptions.LocalActivityWorkerOnly = true;
-laOptions.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
-
-// Local activities have their OWN slot type, so this does not come out of
-// MaxConcurrentActivities. Pinning it low is not politeness: the SDK default is 100, workflow
-// activations run on the same thread pool these CPU burns occupy, and a workflow task that
-// does not yield within 2 seconds is failed as a deadlock. A starved pool therefore produces
-// evicted runs and retried workflow tasks that look exactly like this case's real failure and
-// are not it.
-laOptions.MaxConcurrentLocalActivities = config.LocalActivity.MaxConcurrentLocalActivities;
-
-if (config.Worker.MaxCachedWorkflows > 0)
-{
-    laOptions.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
-}
-
-if (config.Worker.MaxConcurrentWorkflowTasks > 0)
-{
-    laOptions.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
-}
-
-using var laWorker = new TemporalWorker(laClient, laOptions);
+// Options come from Repro.Core so this process and Repro.LoadGen cannot drift apart; see
+// LocalActivityWorkerOptions for the copied-knobs failure that motivated pulling them out.
+using var laWorker = new TemporalWorker(laClient, LocalActivityWorkerOptions.For(config));
 
 log.LogInformation(
     "worker polling {TaskQueue} on {Address}/{Namespace} (graceful shutdown {Grace})",
     config.TaskQueue, config.Address, config.Namespace,
     GoDuration.ToGoString(config.Worker.GracefulShutdownTimeout));
 log.LogInformation(
-    "worker polling {TaskQueue} on {Address}/{Namespace} for local activities "
-    + "(up to {MaxLocal} concurrent)",
+    "worker polling {TaskQueue} on {Address}/{Namespace} for local activities " +
+    "(up to {MaxLocal} concurrent)",
     config.LocalActivity.TaskQueue, config.Address, config.LocalActivity.Namespace,
     config.LocalActivity.MaxConcurrentLocalActivities);
 

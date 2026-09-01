@@ -4,7 +4,7 @@ namespace Repro.Core.Telemetry;
 
 /// <summary>Histogram bucket overrides, in MILLISECONDS.</summary>
 /// <remarks>
-/// Without these, six latency panels do not read "no data". They read a
+/// Without these, latency panels do not read "no data". They read a
 /// plausible CONSTANT, which is the worst failure mode this repo has. Example:
 /// loopback gRPC is 0-5ms and Core's default first bucket for request_latency is
 /// le=50, so every observation lands in one bucket and histogram_quantile
@@ -171,6 +171,7 @@ public static class HistogramBuckets
         // "temporal_local_activity_execution_latency".Contains("temporal_activity_execution_latency")
         // is FALSE, because the byte preceding "activity_execution_latency" is the "l" of
         // "local_" rather than the "_" of "temporal_". The two rows are independent.
+        //
         // NOT "temporal_local_activity_execution_latency". Custom=false means the Table
         // PREPENDS CorePrefix, so the name here is the UNPREFIXED one, exactly like
         // request_latency and activity_execution_latency above. Writing the prefixed name

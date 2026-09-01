@@ -1,6 +1,6 @@
 namespace Repro.Core.Telemetry;
 
-/// <summary>The 16 custom metric names, their tag keys, and the outcome values.</summary>
+/// <summary>The 19 custom metric names, their tag keys, and the outcome values.</summary>
 /// <remarks>
 /// These exist so a typo is a compile error instead of an empty Grafana panel.
 /// Nothing at runtime would catch "repro_hearbeat_sent": Core accepts any name
@@ -234,7 +234,8 @@ public static class MetricNames
 
     /// <summary>
     /// Values of the <c>outcome</c> tag: four on repro_workflow_completed and
-    /// repro_simple_activity_completed, three on repro_simple_completed.
+    /// repro_simple_activity_completed, three on repro_simple_completed, and three of a
+    /// possible four on repro_local_activity_completed.
     /// </summary>
     /// <remarks>
     /// repro_workflow_completed uses completed / failed / canceled / timed_out.
@@ -242,6 +243,22 @@ public static class MetricNames
     /// repro_simple_activity_completed uses completed / failed / canceled / timed_out, and
     /// timed_out THERE is TimeoutType.StartToClose, never Heartbeat, because that
     /// workflow sets no heartbeat timeout at all.
+    /// <para>
+    /// repro_local_activity_completed is the one that does not fit the pattern, and reading it
+    /// as if it did is the mistake this paragraph exists to prevent. WorkflowLocalActivity's
+    /// Classify can return all four, but at the SHIPPED config only three are reachable:
+    /// timed_out requires localActivity.scheduleToCloseTimeout to sit BELOW the workflow task
+    /// heartbeat timeout, which is the documented mitigation rather than the default.
+    /// </para>
+    /// <para>
+    /// Worse, the majority case records NOTHING. The two-thirds of runs whose burn outlives the
+    /// 1m heartbeat timeout end at RunTimeout, and the server closes a run on RunTimeout WITHOUT
+    /// scheduling a workflow task -- so the workflow's catch never executes and no outcome is
+    /// ever tagged. This counter therefore undercounts runs by design, and a dashboard that
+    /// divides by it is measuring the wrong denominator. Count the missing ones with the
+    /// server's workflow_timeout in the repro-local-activity namespace, or with
+    /// <see cref="PiAttemptStarted"/>, which the ACTIVITY emits and which survives.
+    /// </para>
     /// </remarks>
     public static class Outcomes
     {

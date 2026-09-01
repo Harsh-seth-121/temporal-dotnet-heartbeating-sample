@@ -132,10 +132,10 @@ public class HistogramBucketsTests
         Assert.Contains(floorMs, buckets);
         Assert.True(
             buckets.Count(b => b < floorMs) >= 3,
-            $"repro_local_activity_latency needs boundaries BELOW the {floorMs}ms duration floor: "
-            + "a cancelled or immediately-failed run records well under it, and without them "
-            + "every such run lands in the floor bucket and p95 pins just below the floor "
-            + "forever");
+            $"repro_local_activity_latency needs boundaries BELOW the {floorMs}ms duration floor: " +
+            "a cancelled or immediately-failed run records well under it, and without them " +
+            "every such run lands in the floor bucket and p95 pins just below the floor " +
+            "forever");
 
         // AT THE TIMEOUT. The workflow task heartbeat timeout is what separates the runs that
         // complete from the runs that are re-executed, so the boundary has to exist for the
@@ -240,7 +240,7 @@ public class DashboardMetricNameTests
 
                 foreach (var t in targets.EnumerateArray())
                 {
-                    if (t.TryGetProperty("expr", out var expr) && expr.GetString() is { } raw_)
+                    if (t.TryGetProperty("expr", out var expr) && expr.GetString() is { } rawExpr)
                     {
                         // STRIP QUOTED LABEL VALUES FIRST. In PromQL a label value is always
                         // double-quoted and a metric name never is, so everything inside
@@ -253,7 +253,7 @@ public class DashboardMetricNameTests
                         // tell apart from a metric name. Without this line the test fails on
                         // a namespace, names it as an unknown metric, and the obvious "fix"
                         // is to add a bogus constant to MetricNames.
-                        var text = Regex.Replace(raw_, "\"[^\"]*\"", "\"\"");
+                        var text = Regex.Replace(rawExpr, "\"[^\"]*\"", "\"\"");
 
                         foreach (Match m in Regex.Matches(text, "repro_[a-z0-9_]+"))
                         {
@@ -312,8 +312,8 @@ public class DashboardMetricNameTests
 
         Assert.True(
             bareHistograms.Count == 0,
-            "dashboard expressions select a histogram by its bare name, which matches no "
-            + $"series and renders a flat zero line: {string.Join(", ", bareHistograms)}");
+            "dashboard expressions select a histogram by its bare name, which matches no " +
+            $"series and renders a flat zero line: {string.Join(", ", bareHistograms)}");
 
         var orphans = referenced.Where(n => !known.Contains(n)).ToList();
         Assert.True(

@@ -136,7 +136,7 @@
       "id": 3,
       "type": "stat",
       "title": "Workflow task heartbeat timeouts (range)",
-      "description": "The authoritative signal, from the server. Each one is a workflow task that was kept alive by SDK heartbeats until history.workflowTaskHeartbeatTimeout (1m here, against a 30m server default) ran out. Every one of these threw away an in-flight local activity. SERVER metric, so the namespace is spelled with UNDERSCORES; see srv_ns.",
+      "description": "The authoritative signal, from the server. Each one is a workflow task that was kept alive by SDK heartbeats until history.workflowTaskHeartbeatTimeout (1m here, against a 30m server default) ran out. Every one of these threw away an in-flight local activity. SERVER metric, so the namespace is spelled with UNDERSCORES: repro_local_activity, not repro-local-activity.",
       "datasource": {
         "type": "prometheus",
         "uid": "sandbox-prometheus"

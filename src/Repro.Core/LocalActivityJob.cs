@@ -108,7 +108,18 @@ public record LocalActivityOptionsInput(
     int RetryMaximumIntervalMs = 10_000,
     int RetryMaximumAttempts = 1)
 {
-    /// <inheritdoc cref="LocalActivityInput.From"/>
+    /// <summary>Projects the config block's timeouts and retry policy onto this record.</summary>
+    /// <remarks>
+    /// Deliberately NOT an <c>inheritdoc</c> of <see cref="LocalActivityInput.From"/>, which is
+    /// what the sibling pair in SimpleActivityJob does. That method's remarks are specifically
+    /// about taking the duration and seed as ARGUMENTS because the draw belongs to the driver;
+    /// this overload takes neither, so inheriting them stated something false.
+    /// <para>
+    /// Call it in CLIENT code. The result travels in the workflow INPUT and is recorded in
+    /// history, so a replay uses the numbers the run started with rather than today's
+    /// config.yaml.
+    /// </para>
+    /// </remarks>
     public static LocalActivityOptionsInput From(LocalActivityConfig localActivity)
     {
         ArgumentNullException.ThrowIfNull(localActivity);

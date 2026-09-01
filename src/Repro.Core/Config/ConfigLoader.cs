@@ -385,19 +385,19 @@ public static class ConfigLoader
         if (string.IsNullOrWhiteSpace(la.Namespace))
         {
             throw new ArgumentException(
-                "localActivity.namespace must not be empty. It is the namespace this workflow's "
-                + "client binds to, and an empty one is not a fallback to `default`.");
+                "localActivity.namespace must not be empty. It is the namespace this workflow's " +
+                "client binds to, and an empty one is not a fallback to `default`.");
         }
 
         if (string.Equals(la.Namespace, config.Namespace, StringComparison.Ordinal))
         {
             throw new ArgumentException(
-                $"localActivity.namespace must differ from namespace (both are \"{la.Namespace}\"). "
-                + "The whole point of the second namespace is that "
-                + "history.workflowTaskHeartbeatTimeout is namespace-scoped: sharing one silently "
-                + "applies this case's 1m override to the other three workflows too, and they have "
-                + "no local activities, so it would look like heartbeat behaviour appearing from "
-                + "nowhere.");
+                $"localActivity.namespace must differ from namespace (both are \"{la.Namespace}\"). " +
+                "The whole point of the second namespace is that " +
+                "history.workflowTaskHeartbeatTimeout is namespace-scoped: sharing one silently " +
+                "applies this case's 1m override to the other three workflows too, and they have " +
+                "no local activities, so it would look like heartbeat behaviour appearing from " +
+                "nowhere.");
         }
 
         if (string.IsNullOrWhiteSpace(la.TaskQueue))
@@ -405,20 +405,37 @@ public static class ConfigLoader
             throw new ArgumentException("localActivity.taskQueue must not be empty.");
         }
 
+        // PREFIX-disjoint, not merely unequal. Task queues are namespace-scoped, so the server
+        // would happily accept the same name in both namespaces; the cost is paid entirely by
+        // humans, and a shared PREFIX costs almost as much as a shared name. This repo tells its
+        // two workers apart by queue name first, in `temporal task-queue describe`, in the
+        // worker logs and in every dashboard selector -- none of which carry a namespace unless
+        // you remember to add one.
+        if (la.TaskQueue.StartsWith(config.TaskQueue, StringComparison.Ordinal) ||
+            config.TaskQueue.StartsWith(la.TaskQueue, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"localActivity.taskQueue (\"{la.TaskQueue}\") and taskQueue " +
+                $"(\"{config.TaskQueue}\") must not be a prefix of one another, in either " +
+                "direction. They name queues in DIFFERENT namespaces, so the server permits it " +
+                "and nothing fails at startup; what breaks is every human-facing lookup that " +
+                "matches on queue name without a namespace.");
+        }
+
         if (la.MinDuration <= TimeSpan.Zero)
         {
             throw new ArgumentException(
-                $"localActivity.minDuration must be > 0 (got {la.MinDuration}). At zero the burn "
-                + "loop exits before its first clock check and every run reports an estimate of Pi "
-                + "computed from no samples.");
+                $"localActivity.minDuration must be > 0 (got {la.MinDuration}). At zero the burn " +
+                "loop exits before its first clock check and every run reports an estimate of Pi " +
+                "computed from no samples.");
         }
 
         if (la.MaxDuration < la.MinDuration)
         {
             throw new ArgumentException(
-                $"localActivity.maxDuration ({la.MaxDuration}) must be >= minDuration "
-                + $"({la.MinDuration}). The driver draws uniformly on the closed interval, which "
-                + "throws on an inverted one.");
+                $"localActivity.maxDuration ({la.MaxDuration}) must be >= minDuration " +
+                $"({la.MinDuration}). The driver draws uniformly on the closed interval, which " +
+                "throws on an inverted one.");
         }
 
         // The burn is wall-clock capped at maxDuration, so start-to-close must clear it with
@@ -429,68 +446,68 @@ public static class ConfigLoader
         if (la.StartToCloseTimeout < floor)
         {
             throw new ArgumentException(
-                $"localActivity.startToCloseTimeout must be >= maxDuration + 30s = {floor} (got "
-                + $"{la.StartToCloseTimeout}). Below that the longest draws die of start-to-close "
-                + "on a healthy worker, which is a different failure from the one this case "
-                + "demonstrates and is indistinguishable from it on the board.");
+                $"localActivity.startToCloseTimeout must be >= maxDuration + 30s = {floor} (got " +
+                $"{la.StartToCloseTimeout}). Below that the longest draws die of start-to-close " +
+                "on a healthy worker, which is a different failure from the one this case " +
+                "demonstrates and is indistinguishable from it on the board.");
         }
 
         if (la.ScheduleToCloseTimeout <= TimeSpan.Zero)
         {
             throw new ArgumentException(
-                $"localActivity.scheduleToCloseTimeout must be > 0 (got {la.ScheduleToCloseTimeout}). "
-                + "It is deliberately NOT ordered against startToCloseTimeout: setting it below the "
-                + "workflow task heartbeat timeout is the documented fix for this failure mode, and "
-                + "a rule forbidding that would make the fix unconfigurable.");
+                $"localActivity.scheduleToCloseTimeout must be > 0 (got {la.ScheduleToCloseTimeout}). " +
+                "It is deliberately NOT ordered against startToCloseTimeout: setting it below the " +
+                "workflow task heartbeat timeout is the documented fix for this failure mode, and " +
+                "a rule forbidding that would make the fix unconfigurable.");
         }
 
         if (la.RunTimeout <= la.MaxDuration)
         {
             throw new ArgumentException(
-                $"localActivity.runTimeout ({la.RunTimeout}) must be > maxDuration "
-                + $"({la.MaxDuration}). It is the ONLY bound that actually ends a run whose local "
-                + "activity keeps being re-executed, so at or below the burn length every run is "
-                + "killed by it, including the ones that would have completed.");
+                $"localActivity.runTimeout ({la.RunTimeout}) must be > maxDuration " +
+                $"({la.MaxDuration}). It is the ONLY bound that actually ends a run whose local " +
+                "activity keeps being re-executed, so at or below the burn length every run is " +
+                "killed by it, including the ones that would have completed.");
         }
 
         if (la.Retry.MaximumAttempts <= 0)
         {
             throw new ArgumentException(
-                $"localActivity.retry.maximumAttempts must be > 0 (got {la.Retry.MaximumAttempts}). "
-                + "0 means UNLIMITED in Temporalio.Common.RetryPolicy, and an unset RetryPolicy on a "
-                + "LOCAL activity means retry forever, so both routes to \"no policy\" give an "
-                + "unbounded chain of multi-minute CPU burns. Write 1 for \"do not retry\".");
+                $"localActivity.retry.maximumAttempts must be > 0 (got {la.Retry.MaximumAttempts}). " +
+                "0 means UNLIMITED in Temporalio.Common.RetryPolicy, and an unset RetryPolicy on a " +
+                "LOCAL activity means retry forever, so both routes to \"no policy\" give an " +
+                "unbounded chain of multi-minute CPU burns. Write 1 for \"do not retry\".");
         }
 
         if (la.Rate <= TimeSpan.Zero)
         {
             throw new ArgumentException(
-                $"localActivity.rate must be > 0 (got {la.Rate}). At zero the driver loop is a busy "
-                + "spin that starts a CPU-bound workflow every iteration.");
+                $"localActivity.rate must be > 0 (got {la.Rate}). At zero the driver loop is a busy " +
+                "spin that starts a CPU-bound workflow every iteration.");
         }
 
         if (la.Jitter is < 0 or >= 1)
         {
             throw new ArgumentException(
-                $"localActivity.jitter must be in [0, 1) (got {la.Jitter}). The interval is "
-                + "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
+                $"localActivity.jitter must be in [0, 1) (got {la.Jitter}). The interval is " +
+                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
         }
 
         if (la.Concurrency <= 0)
         {
             throw new ArgumentException(
-                $"localActivity.concurrency must be > 0 (got {la.Concurrency}), otherwise every tick "
-                + "is skipped at capacity and the driver starts nothing at all.");
+                $"localActivity.concurrency must be > 0 (got {la.Concurrency}), otherwise every tick " +
+                "is skipped at capacity and the driver starts nothing at all.");
         }
 
         if (la.MaxConcurrentLocalActivities <= 0)
         {
             throw new ArgumentException(
-                "localActivity.maxConcurrentLocalActivities must be > 0 (got "
-                + $"{la.MaxConcurrentLocalActivities}). It is applied verbatim to "
-                + "TemporalWorkerOptions, which rejects a non-positive value, and 0 is not a "
-                + "\"leave the SDK default\" sentinel here the way worker.maxConcurrentActivities "
-                + "treats it.");
+                "localActivity.maxConcurrentLocalActivities must be > 0 (got " +
+                $"{la.MaxConcurrentLocalActivities}). It is applied verbatim to " +
+                "TemporalWorkerOptions, which rejects a non-positive value, and 0 is not a " +
+                "\"leave the SDK default\" sentinel here the way worker.maxConcurrentActivities " +
+                "treats it.");
         }
     }
 }

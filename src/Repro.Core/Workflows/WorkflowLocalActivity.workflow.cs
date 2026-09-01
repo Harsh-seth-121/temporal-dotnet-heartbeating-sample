@@ -1,10 +1,10 @@
 using Microsoft.Extensions.Logging;
 using Repro.Core.Activities;
+using Repro.Core.Telemetry;
 using Temporalio.Api.Enums.V1;
 using Temporalio.Common;
 using Temporalio.Exceptions;
 using Temporalio.Workflows;
-using Repro.Core.Telemetry;
 
 namespace Repro.Core.Workflows;
 
@@ -160,8 +160,8 @@ public class WorkflowLocalActivity
         }
 
         Workflow.Logger.LogInformation(
-            "pi ~ {Pi} from {Iterations} samples in {ElapsedMs}ms of a requested {RequestedMs}ms "
-            + "(attempt {Attempt}, isLocal {IsLocal}, endedBy {EndedBy})",
+            "pi ~ {Pi} from {Iterations} samples in {ElapsedMs}ms of a requested {RequestedMs}ms " +
+            "(attempt {Attempt}, isLocal {IsLocal}, endedBy {EndedBy})",
             estimate.Pi, estimate.Iterations, estimate.ElapsedMs, estimate.RequestedMs,
             estimate.Attempt, estimate.IsLocal, estimate.EndedBy);
 

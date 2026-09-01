@@ -87,8 +87,8 @@ public sealed class PiActivities
         // task queue it reports. IsLocal also reaches the returned payload, so the history
         // carries the answer too.
         log.LogInformation(
-            "estimating pi for {DurationMs}ms with seed {Seed} (isLocal {IsLocal}, attempt "
-            + "{Attempt}, taskQueue {TaskQueue})",
+            "estimating pi for {DurationMs}ms with seed {Seed} (isLocal {IsLocal}, attempt " +
+            "{Attempt}, taskQueue {TaskQueue})",
             input.DurationMs, input.Seed, ctx.Info.IsLocal, ctx.Info.Attempt, ctx.Info.TaskQueue);
 
         // WHICH TOKEN FIRES IS THE WHOLE QUESTION, so both are watched.
@@ -167,9 +167,12 @@ public sealed class PiActivities
         var elapsed = Stopwatch.GetElapsedTime(startedAt);
         var elapsedMs = (int)elapsed.TotalMilliseconds;
 
-        // Guarded because a burn cut short in its first batch can round to zero milliseconds,
-        // and a division by it would end the activity with a DivideByZeroException whose real
-        // cause is buried under an ActivityFailure chain.
+        // Guarded because a burn cut short in its first batch can measure vanishingly little,
+        // and note what the guard is NOT buying. This is DOUBLE division, so dividing by a zero
+        // elapsed would not throw: it yields +Infinity, and the cast of that to long produces a
+        // meaningless number that goes straight into PiEstimate, the history, and
+        // `temporal workflow show`. The guard trades a plausible-looking garbage throughput for
+        // an obvious 0, which is the failure mode this repo cares about.
         var perSecond = elapsed > TimeSpan.Zero
             ? (long)(iterations / elapsed.TotalSeconds)
             : 0;
@@ -182,8 +185,8 @@ public sealed class PiActivities
             // result on a run that was cut short, and the only thing distinguishing it in the
             // history is PiEstimate.EndedBy.
             log.LogWarning(
-                "worker drain cut the burn short at {ElapsedMs}ms of {RequestedMs}ms; returning a "
-                + "SHORT estimate from {Iterations} samples",
+                "worker drain cut the burn short at {ElapsedMs}ms of {RequestedMs}ms; returning a " +
+                "SHORT estimate from {Iterations} samples",
                 elapsedMs, input.DurationMs, iterations);
         }
         else if (endedBy == MetricNames.Endings.Canceled)
@@ -195,9 +198,9 @@ public sealed class PiActivities
             // that identifies WHICH cancellation this was -- a burn cut at the timeout looks
             // nothing like one cut by a hand `temporal workflow cancel`.
             log.LogWarning(
-                "burn CANCELLED at {ElapsedMs}ms of {RequestedMs}ms after {Iterations} samples; if "
-                + "this is near the workflow task heartbeat timeout the task timed out and this "
-                + "entire burn is about to be repeated from zero",
+                "burn CANCELLED at {ElapsedMs}ms of {RequestedMs}ms after {Iterations} samples; if " +
+                "this is near the workflow task heartbeat timeout the task timed out and this " +
+                "entire burn is about to be repeated from zero",
                 elapsedMs, input.DurationMs, iterations);
         }
         else

@@ -64,9 +64,9 @@ internal sealed class LocalActivityDriver(
         var maxMs = (int)localActivity.MaxDuration.TotalMilliseconds;
 
         log.LogInformation(
-            "local-activity: 1 workflow every {Rate} +/-{JitterPercent}%, up to {Concurrency} in "
-            + "flight, burn drawn from {Min}..{Max}, namespace {Namespace}, queue {TaskQueue}, "
-            + "runTimeout {RunTimeout}",
+            "local-activity: 1 workflow every {Rate} +/-{JitterPercent}%, up to {Concurrency} in " +
+            "flight, burn drawn from {Min}..{Max}, namespace {Namespace}, queue {TaskQueue}, " +
+            "runTimeout {RunTimeout}",
             GoDuration.ToGoString(localActivity.Rate), (int)(localActivity.Jitter * 100),
             localActivity.Concurrency, GoDuration.ToGoString(localActivity.MinDuration),
             GoDuration.ToGoString(localActivity.MaxDuration), localActivity.Namespace,
@@ -191,8 +191,8 @@ internal sealed class LocalActivityDriver(
             // designed behaviour reads as breakage is worse than no board.
             Interlocked.Increment(ref timedOut);
             log.LogInformation(
-                "local-activity run hit runTimeout after a {DurationMs}ms burn was asked for; its "
-                + "local activity was re-executed from zero on every workflow task timeout",
+                "local-activity run hit runTimeout after a {DurationMs}ms burn was asked for; its " +
+                "local activity was re-executed from zero on every workflow task timeout",
                 durationMs);
             return;
         }
@@ -203,8 +203,8 @@ internal sealed class LocalActivityDriver(
             // the way back to the client, and it carries the two numbers that answer "how fast
             // is this machine" without opening Grafana.
             log.LogInformation(
-                "local-activity: first run returned pi ~ {Pi} from {Iterations} samples in "
-                + "{ElapsedMs}ms ({PerSecond} iterations/s, attempt {Attempt}, isLocal {IsLocal})",
+                "local-activity: first run returned pi ~ {Pi} from {Iterations} samples in " +
+                "{ElapsedMs}ms ({PerSecond} iterations/s, attempt {Attempt}, isLocal {IsLocal})",
                 estimate.Pi, estimate.Iterations, estimate.ElapsedMs, estimate.IterationsPerSecond,
                 estimate.Attempt, estimate.IsLocal);
         }
@@ -222,8 +222,8 @@ internal sealed class LocalActivityDriver(
     /// </remarks>
     private void LogSummary() =>
         log.LogInformation(
-            "local-activity: {Started} started, {Skipped} skipped at capacity | {Completed} "
-            + "completed, {TimedOut} ended at runTimeout (expected, ~2/3) | {Interrupted} "
-            + "interrupted by shutdown, {Failed} failed",
+            "local-activity: {Started} started, {Skipped} skipped at capacity | {Completed} " +
+            "completed, {TimedOut} ended at runTimeout (expected, ~2/3) | {Interrupted} " +
+            "interrupted by shutdown, {Failed} failed",
             started, skipped, completed, timedOut, interrupted, failed);
 }

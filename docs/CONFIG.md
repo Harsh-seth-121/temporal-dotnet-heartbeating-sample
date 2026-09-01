@@ -124,6 +124,15 @@ mismatch is silent in both directions: a wrong namespace in `config.yaml` fails 
 connect time with an opaque not-found, and a wrong one in the dynamicconfig constraint leaves
 the override applying to nothing at all while looking correct.
 
+Two names are checked against the rest of the file at load. `localActivity.namespace` must
+differ from `namespace`, because sharing one applies the 1m heartbeat override to the other
+three workflows, which have no local activities, so heartbeat behaviour appears in workflows
+that cannot cause it. `localActivity.taskQueue` and `taskQueue` must not be a **prefix** of one
+another in either direction — not merely unequal. Task queues are namespace-scoped, so the
+server accepts a collision and nothing fails at startup; what breaks is every lookup that
+matches on queue name without a namespace, which is most of them: `temporal task-queue
+describe`, a log grep, a dashboard selector.
+
 `ConfigLoader` refuses `localActivity.namespace` equal to the top-level `namespace`, which is
 the one part of that agreement it *can* check.
 

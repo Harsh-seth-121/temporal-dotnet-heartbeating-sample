@@ -487,8 +487,8 @@ public sealed class LocalActivityConfig
     /// Task queues are namespace-scoped, so reusing <c>repro-task-queue</c> would be legal.
     /// It is not reused because this repo has already been bitten by ambiguous names: one
     /// spelling in two namespaces makes every `grep` and every visibility query ambiguous for
-    /// a human, whatever the server thinks. Checked disjoint as a string prefix against
-    /// <c>repro-task-queue</c>.
+    /// a human, whatever the server thinks. <c>ConfigLoader.ValidateLocalActivity</c> rejects
+    /// any pair where either name is a string prefix of the other.
     /// </remarks>
     public string TaskQueue { get; set; } = "repro-la-queue";
 
