@@ -1,0 +1,8 @@
+# gen-samples manifest. Regenerate with: ./gen-samples.sh
+# Corpora are gitignored; this file is the record of what was produced.
+# base seed 1234567890123456789   out ../../sample_files
+# name               target       bytes        rows       sha256
+sample-100mb.txt     100000000    99999968     1724588    f2f3ceac4741dd6e3968a4dfc5c37b03fb4b0faaf2d83e5f382a1d783bcebeac
+sample-200mb.txt     200000000    199999981    3449054    1ff5ee44c7a6f9745891b0e9950ad74dac223ab8fae7088f0b36d63128c5c123
+sample-350mb.txt     350000000    349999987    6035691    e78db55352b381a293e1ed6a7a826a1dfd614d2859e81698ce4c19b48312406c
+sample-500mb.txt     500000000    499999963    8622570    50106e666cbadc0353c3e957ee018bf60e6b60f1cce7738827ab589cb464e1d7

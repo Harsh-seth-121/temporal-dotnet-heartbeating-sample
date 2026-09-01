@@ -84,3 +84,17 @@ observability/**/data/
 # `.demo/worker.pid` would NOT, so the layout is flat and this entry covers both.
 # Verify with:  git check-ignore -v .demo/worker.pid
 /.demo/
+
+# Generated sample corpora: four files, 100-500 MB, ~1.15 GB total. Every byte is
+# reproducible from the seed plus scripts/gen-samples/words-1024.txt, and the sha256
+# of each is recorded in scripts/gen-samples/MANIFEST.txt, so committing them would
+# buy 1.15 GB of permanent git history for zero information. Regenerate instead:
+#   ./scripts/gen-samples/gen-samples.sh
+#
+# The glob form plus the negation, NOT a bare `/sample_files/`: git does not descend
+# into an excluded DIRECTORY, so a directory-form rule makes the !.gitkeep negation
+# unreachable and the directory itself disappears from a fresh clone. The default
+# --out path would then not exist. Same .gitkeep convention as history/.
+# Verify with:  git check-ignore -v sample_files/sample-100mb.txt
+/sample_files/*
+!/sample_files/.gitkeep
