@@ -287,3 +287,106 @@ simpleActivity:
   rate: 15s
   jitter: 0.5
   concurrency: 4
+
+# ---------------------------------------------------------------------------
+# WorkflowLocalActivity: one CPU-bound LOCAL activity, in its OWN namespace.
+#
+# This is the only block with a namespace and task queue of its own, and that is not
+# organisation. `history.workflowTaskHeartbeatTimeout` is declared server-side as
+# NewNamespaceDurationSetting, so it can be filtered by NAMESPACE and by nothing finer.
+# A dedicated namespace is the only way to drop it from 30m to 1m here while the other
+# three workflows keep the stock default. The override itself lives in
+# observability/dynamicconfig/development-sql.yaml.
+#
+# WHAT THIS CASE DEMONSTRATES. A local activity runs inside the WORKFLOW TASK. The SDK
+# keeps that task alive with workflow task heartbeats, but only up to the heartbeat
+# timeout; after that the server times the task out and reschedules it, and because a
+# local activity's result is not written to history until it completes, EVERY LOCAL
+# ACTIVITY IN THAT TASK RUNS AGAIN FROM THE BEGINNING. With durations drawn from
+# 30s..2m against a 1m timeout, exactly two-thirds of runs hit it, and because the
+# duration is fixed in the workflow input they hit it again on every re-execution.
+# ---------------------------------------------------------------------------
+localActivity:
+  enabled: true
+
+  # Its own namespace, created by observability/scripts/create-namespace.sh alongside
+  # `default`. If this namespace does not exist the worker fails at connect time with an
+  # opaque not-found; `temporal operator namespace list` is the check.
+  namespace: repro-local-activity
+
+  # Namespace-scoped, so reusing repro-task-queue would be legal. Kept distinct anyway:
+  # one queue name in two namespaces makes every grep and every visibility query
+  # ambiguous for a human, whatever the server thinks.
+  taskQueue: repro-la-queue
+
+  # The per-run duration draw, uniform on [minDuration, maxDuration], made CLIENT-SIDE by
+  # the loadgen and then FIXED in the workflow input for the life of the run.
+  #
+  # The fixedness is what makes this a repro instead of a flake: a re-executing local
+  # activity reads the same duration and takes just as long, so it times out again. A
+  # duration re-drawn per attempt would eventually draw a short one and heal itself.
+  #
+  # P(re-execution) = (120 - 60) / (120 - 30) = 2/3 at these values against the 1m
+  # heartbeat timeout. docs/WORKFLOWS.md quotes that number; change either bound and it
+  # is wrong.
+  minDuration: 30s
+  maxDuration: 2m
+
+  # DELIBERATELY UNREACHABLE. The SDK requires StartToClose or ScheduleToClose to be set,
+  # so one must exist, but the burn is capped at maxDuration and the workflow task dies at
+  # 1m, so 2m30s can never be reached. Documented as unreachable rather than dressed up as
+  # a guard.
+  startToCloseTimeout: 2m30s
+
+  # ABOVE the 1m heartbeat timeout on purpose, which means IT NEVER FIRES. Its clock
+  # restarts on every workflow-task re-dispatch, because sdk-core re-stamps
+  # original_schedule_time on each fresh schedule and only persists it inside a marker --
+  # and a local activity killed by a workflow task timeout never wrote one.
+  #
+  # SET IT BELOW 1m to switch this case from the failure to the documented FIX: the local
+  # activity then fails with a timeout the workflow catches, and the workflow task is
+  # never re-executed. That is the only regime where this field does anything, so
+  # ConfigLoader deliberately does not forbid it.
+  scheduleToCloseTimeout: 5m
+
+  # THE ONLY RUNG THAT ACTUALLY STOPS THE LOOP. Server-enforced on the timer queue, passed
+  # as WorkflowOptions.RunTimeout by the driver rather than carried in the input.
+  #
+  # It closes the run WITHOUT scheduling a workflow task, so workflow code never runs
+  # again and cannot record an outcome. That is why repro_local_activity_completed has
+  # three outcome values and not four, and why repro_pi_attempt_started -- emitted from
+  # activity code, which does not replay -- is the primary signal for this case.
+  runTimeout: 6m
+
+  retry:
+    initialInterval: 1s
+    backoffCoefficient: 2.0
+    maximumInterval: 10s
+    # MUST be > 0, and the reason is stronger than it is for simpleActivity. An UNSET
+    # RetryPolicy on a local activity means retry FOREVER, and 0 means unlimited in
+    # Temporalio.Common.RetryPolicy, so both routes to "no policy" give an unbounded chain
+    # of two-minute CPU burns. Write 1 for "do not retry", which is what this is.
+    #
+    # It does not bound the re-execution loop either way: a workflow-task-timeout
+    # re-execution arrives as attempt 1 again, outside the retry policy.
+    maximumAttempts: 1
+
+  # Loadgen's fourth loop. Same jittered-interval, skip-at-capacity contract as the others.
+  rate: 30s
+  jitter: 0.5
+
+  # Expected slot occupancy is about (1/3)(45s) + (2/3)(6m) = ~255s per run, so one slot
+  # is busy essentially always. At concurrency 1 that is ~14 runs an hour with ~88% of
+  # ticks skipped, i.e. one or two samples inside a 30-minute dashboard window, and a
+  # sparse panel looks exactly like a broken target. Three makes the board legible without
+  # pegging a laptop.
+  concurrency: 3
+
+  # The SDK default is 100. Leaving it there lets 100 concurrent CPU burns saturate the
+  # thread pool, and workflow activations run on that same pool: the SDK fails any
+  # workflow task that does not yield within 2 seconds, so a starved pool produces evicted
+  # runs and retried workflow tasks that look exactly like this repro and are not it.
+  #
+  # Local activities have their own slot type, so this does not come out of
+  # worker.maxConcurrentActivities. Core reports it as worker_type="LocalActivityWorker".
+  maxConcurrentLocalActivities: 4

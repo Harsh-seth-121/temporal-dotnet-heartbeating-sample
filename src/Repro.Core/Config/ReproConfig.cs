@@ -58,6 +58,16 @@ public sealed class ReproConfig
     /// </remarks>
     public SimpleActivityConfig SimpleActivity { get; set; } = new();
 
+    /// <summary>Everything about WorkflowLocalActivity: one CPU-bound LOCAL activity.</summary>
+    /// <remarks>
+    /// The only block that carries its OWN <see cref="LocalActivityConfig.Namespace"/> and
+    /// <see cref="LocalActivityConfig.TaskQueue"/>, because this workflow runs somewhere else
+    /// entirely. That is not tidiness: <c>history.workflowTaskHeartbeatTimeout</c> is a
+    /// namespace-scoped dynamic config setting, so a dedicated namespace is the ONLY way to
+    /// lower it for this workflow without changing it for the other three.
+    /// </remarks>
+    public LocalActivityConfig LocalActivity { get; set; } = new();
+
     public FaultConfig Fault { get; set; } = new();
 }
 
@@ -429,6 +439,173 @@ public sealed class SimpleActivityConfig
 
     /// <summary>Max runs in flight. At capacity a tick is SKIPPED, never queued.</summary>
     public int Concurrency { get; set; } = 4;
+}
+
+/// <summary>
+/// WorkflowLocalActivity's job shape, its local activity's timeouts, its dedicated
+/// namespace, and every knob of the loadgen's FOURTH driver loop.
+/// </summary>
+/// <remarks>
+/// The local-activity case, and the one the other three blocks cannot express. A local
+/// activity runs INSIDE the workflow task rather than as a separately scheduled activity
+/// task, so it writes a MarkerRecorded event instead of ActivityTaskScheduled, holds a
+/// LocalActivityWorker slot rather than an activity slot, and cannot heartbeat at all.
+/// <para>
+/// Flat and single-hump, names boring on purpose, for the reason <see cref="SimpleConfig"/>
+/// records: CamelCaseNamingConvention lowers only the FIRST character and an unmatched YAML
+/// key is a hard error here.
+/// </para>
+/// </remarks>
+public sealed class LocalActivityConfig
+{
+    /// <summary>Turn the fourth driver loop off without editing the loadgen. <c>--no-local-activity</c> does the same.</summary>
+    /// <remarks>
+    /// NOT <c>--no-simple-activity</c>, which is the WorkflowSimpleActivity loop. Three
+    /// `--no-*` flags now exist and they are matched EXACTLY, never by prefix.
+    /// </remarks>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>The namespace this workflow runs in. Everything else uses <see cref="ReproConfig.Namespace"/>.</summary>
+    /// <remarks>
+    /// LOAD-BEARING, and the reason the second namespace exists at all.
+    /// <c>history.workflowTaskHeartbeatTimeout</c> is declared in the server as
+    /// <c>NewNamespaceDurationSetting</c>, so it can be filtered by NAMESPACE and by nothing
+    /// finer -- not by task queue, not by workflow type. Dropping it from 30m to 1m in a
+    /// dedicated namespace is therefore the only way to make this workflow's re-execution
+    /// loop reachable in a demo while leaving the other three workflows on the stock default.
+    /// <para>
+    /// A namespace is a CLIENT property and a worker binds one client, so this costs a second
+    /// TemporalClient and a second TemporalWorker in both Repro.Worker and Repro.LoadGen. They
+    /// share the one TemporalRuntime; ReproRuntime's guard counts runtime constructions, not
+    /// client bindings.
+    /// </para>
+    /// </remarks>
+    public string Namespace { get; set; } = "repro-local-activity";
+
+    /// <summary>This workflow's task queue, inside <see cref="Namespace"/>.</summary>
+    /// <remarks>
+    /// Task queues are namespace-scoped, so reusing <c>repro-task-queue</c> would be legal.
+    /// It is not reused because this repo has already been bitten by ambiguous names: one
+    /// spelling in two namespaces makes every `grep` and every visibility query ambiguous for
+    /// a human, whatever the server thinks. Checked disjoint as a string prefix against
+    /// <c>repro-task-queue</c>.
+    /// </remarks>
+    public string TaskQueue { get; set; } = "repro-la-queue";
+
+    /// <summary>Lower bound of the per-run duration draw.</summary>
+    public TimeSpan MinDuration { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Upper bound of the per-run duration draw.</summary>
+    /// <remarks>
+    /// The draw is uniform on [<see cref="MinDuration"/>, <see cref="MaxDuration"/>], so with
+    /// the shipped 30s..2m against a 1m heartbeat timeout, exactly (120-60)/(120-30) = 2/3 of
+    /// runs outlive the timeout and re-execute. Change either bound and that fraction moves;
+    /// docs/WORKFLOWS.md quotes it.
+    /// <para>
+    /// THIS IS THE FIRST THING IN THE REPO TO BREAK THE 45s DRAIN DOCTRINE that
+    /// <see cref="SimpleConfig.MaxDuration"/> states. demo-down.sh allows
+    /// worker.gracefulShutdownTimeout + 15 = 45s before SIGKILL, and this runs for up to 2m.
+    /// It survives only because the burn loop polls its worker-shutdown token; see
+    /// PiActivities. Raise DEMO_DRAIN_TIMEOUT if you raise this.
+    /// </para>
+    /// </remarks>
+    public TimeSpan MaxDuration { get; set; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>Per attempt. DELIBERATELY UNREACHABLE at the shipped config.</summary>
+    /// <remarks>
+    /// The SDK requires StartToClose or ScheduleToClose to be set, so one of them has to
+    /// exist. This one can never fire: the burn is wall-clock capped at
+    /// <see cref="MaxDuration"/> and the server kills the workflow task at the heartbeat
+    /// timeout well before 2m30s. Documented as unreachable rather than described as a guard,
+    /// which is the standard WorkflowSimpleActivity's BuildActivityOptions sets for a rung
+    /// that cannot fire.
+    /// </remarks>
+    public TimeSpan StartToCloseTimeout { get; set; } = TimeSpan.FromSeconds(150);
+
+    /// <summary>Total across attempts -- but NOT across workflow-task re-executions.</summary>
+    /// <remarks>
+    /// Shipped ABOVE the 1m heartbeat timeout, which means it never fires, which is the
+    /// repro. Its clock restarts on every re-dispatch: sdk-core re-stamps
+    /// <c>original_schedule_time</c> on each fresh schedule and only persists it inside a
+    /// marker, and a local activity killed by a workflow task timeout never wrote one.
+    /// LocalActivityOptionsInput's remarks carry the full chain.
+    /// <para>
+    /// SET IT BELOW THE HEARTBEAT TIMEOUT to switch this case from the failure to the
+    /// documented FIX: the local activity then fails with a timeout the workflow can catch,
+    /// and the workflow task is never re-executed. That is the one regime in which this field
+    /// does anything, and ConfigLoader deliberately does not forbid it.
+    /// </para>
+    /// </remarks>
+    public TimeSpan ScheduleToCloseTimeout { get; set; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>Server-enforced bound on the whole run. THE ONLY RUNG THAT ACTUALLY STOPS THE LOOP.</summary>
+    /// <remarks>
+    /// Passed as <c>WorkflowOptions.RunTimeout</c> by the driver, not carried in the workflow
+    /// input, because it is enforced by the SERVER's timer queue rather than by anything the
+    /// workflow does.
+    /// <para>
+    /// KNOW WHAT IT COSTS YOU. The server closes a run-timed-out workflow by calling
+    /// TimeoutWorkflow directly, WITHOUT scheduling a workflow task. So workflow code never
+    /// runs again and cannot record an outcome: repro_local_activity_completed does not
+    /// increment at all for these runs, not even as timed_out. That is why this workflow's
+    /// outcome vocabulary has three values rather than four, and why repro_pi_attempt_started
+    /// -- emitted from ACTIVITY code, which does not replay -- is the primary signal for this
+    /// case rather than a supporting one.
+    /// </para>
+    /// </remarks>
+    public TimeSpan RunTimeout { get; set; } = TimeSpan.FromMinutes(6);
+
+    /// <summary>The local activity's retry policy.</summary>
+    /// <remarks>
+    /// MaximumAttempts is validated to be greater than zero, and the reason is STRONGER here
+    /// than it is for simpleActivity. An unset RetryPolicy on a LOCAL activity means retry
+    /// FOREVER -- "Gets or sets the retry policy. If unset, defaults to retrying forever" --
+    /// and 0 means unlimited in Temporalio.Common.RetryPolicy, so both routes to "no policy"
+    /// end in an unbounded chain of two-minute CPU burns. Write 1 for "do not retry".
+    /// <para>
+    /// It does NOT bound the re-execution loop. A workflow-task-timeout re-execution arrives
+    /// as attempt 1 again, outside the retry policy entirely.
+    /// </para>
+    /// </remarks>
+    public RetryConfig Retry { get; set; } = new() { MaximumAttempts = 1 };
+
+    /// <summary>Mean interval between starts, before jitter.</summary>
+    public TimeSpan Rate { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Fractional spread on <see cref="Rate"/>: the interval is
+    /// <c>rate x [1-jitter, 1+jitter]</c>. 0 is a metronome.
+    /// </summary>
+    /// <remarks>Same contract and same helper as the other two jittered loops.</remarks>
+    public double Jitter { get; set; } = 0.5;
+
+    /// <summary>Max runs in flight. At capacity a tick is SKIPPED, never queued.</summary>
+    /// <remarks>
+    /// 3, and the arithmetic is worth keeping because a sparse panel here looks exactly like
+    /// a broken target. Expected slot occupancy is (1/3)(~45s) + (2/3)(runTimeout) which is
+    /// about 255s per run at the shipped values, so one slot is busy essentially always. At
+    /// concurrency 1 that is roughly 14 runs an hour with ~88% of ticks skipped, which is one
+    /// or two samples inside a 30-minute dashboard window. Three slots make the board legible
+    /// without pegging a laptop.
+    /// </remarks>
+    public int Concurrency { get; set; } = 3;
+
+    /// <summary>Worker-side cap on concurrent LOCAL activities. Its own slot type.</summary>
+    /// <remarks>
+    /// The SDK default is 100, and leaving it there is a real hazard for THIS activity rather
+    /// than a theoretical one: 100 concurrent CPU burns saturate the thread pool, and workflow
+    /// activations run on that same pool. The SDK's deadlock detector fails a workflow task
+    /// that does not yield within 2 seconds, so a starved pool produces evicted runs and
+    /// retried workflow tasks that look exactly like the heartbeat-timeout repro and are not
+    /// it. A board that cannot tell you which failure you are looking at is worse than no
+    /// board.
+    /// <para>
+    /// Local activities have their OWN slot type, so this does not come out of
+    /// <see cref="WorkerConfig.MaxConcurrentActivities"/>: Core reports them as
+    /// <c>worker_type="LocalActivityWorker"</c> on temporal_worker_task_slots_available.
+    /// </para>
+    /// </remarks>
+    public int MaxConcurrentLocalActivities { get; set; } = 4;
 }
 
 /// <summary>
