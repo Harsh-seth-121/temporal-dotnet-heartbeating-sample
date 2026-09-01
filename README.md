@@ -31,6 +31,11 @@ logs in `.demo/`, waits until Prometheus has actually scraped both, then runs on
 Then open <http://localhost:3000>, which needs no login, and look at the `sandbox`
 folder.
 
+Two namespaces now, not one. `default` holds the first three workflows; `repro-local-activity`
+holds `WorkflowLocalActivity` alone, because the server setting that case depends on,
+`history.workflowTaskHeartbeatTimeout`, can only be scoped per namespace. Both are created by
+`demo-up.sh` and both are gated on before it declares readiness.
+
 [docs/DEMO.md](docs/DEMO.md) has every flag, the exit codes, and the four-terminal
 manual sequence, which still works and is still the right tool for a debugger or a
 second worker.
@@ -89,11 +94,14 @@ Then edit `HeartbeatWorkflow.workflow.cs` and `HeartbeatActivities.cs`. Adjust
 JSON that demonstrates the bug. It is the artifact worth keeping.
 
 `HeartbeatWorkflow` is the seed case and the one to edit, but it is not always the right
-starting point. Two others ship registered on the same worker and task queue:
-`SimpleNoActivity` if the bug is about signals, queries, updates or cancellation, and
-`WorkflowSimpleActivity` if it is about a plain non-heartbeating activity, its retry
-policy or its start-to-close timeout. [docs/WORKFLOWS.md](docs/WORKFLOWS.md) puts all
-three next to each other.
+starting point. Three others ship: `SimpleNoActivity` if the bug is about signals, queries,
+updates or cancellation, and `WorkflowSimpleActivity` if it is about a plain
+non-heartbeating activity, its retry policy or its start-to-close timeout — both on the same
+worker and task queue. `WorkflowLocalActivity` is the fourth, and it is somewhere else
+entirely: its own namespace, its own task queue, its own worker, because the server setting
+it depends on can only be scoped per namespace. Reach for it if the bug is about local
+activities, markers, or a workflow task that will not stay alive.
+[docs/WORKFLOWS.md](docs/WORKFLOWS.md) puts all four next to each other.
 
 ## Reset
 
@@ -114,10 +122,10 @@ dotnet clean && rm -rf src/*/bin src/*/obj tests/*/bin tests/*/obj
 
 | File | What is in it |
 |---|---|
-| [docs/WORKFLOWS.md](docs/WORKFLOWS.md) | The three workflows side by side, their message handlers and outcome vocabularies, and all 16 `repro_*` metrics with their tags |
+| [docs/WORKFLOWS.md](docs/WORKFLOWS.md) | The four workflows side by side, their message handlers and outcome vocabularies, and all 19 `repro_*` metrics with their tags |
 | [docs/DEMO.md](docs/DEMO.md) | The two scripts: every phase, flag and exit code, and the six things they do differently from the manual path |
 | [docs/HEARTBEATING.md](docs/HEARTBEATING.md) | The throttle, stale checkpoints, the `kill -9` resume test, the three fault knobs, the `temporal activity` verbs |
-| [docs/GOTCHAS.md](docs/GOTCHAS.md) | 29 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
+| [docs/GOTCHAS.md](docs/GOTCHAS.md) | 36 .NET and Core behaviors that look exactly like bugs, worst first. Read before you conclude a panel is broken |
 | [docs/CONFIG.md](docs/CONFIG.md) | Every `config.yaml` field, and why activity options travel through the workflow input rather than being read from the file |
 | [docs/DASHBOARDS.md](docs/DASHBOARDS.md) | Probing every panel, the every-target-renders result, known-empty imported panels |
 | [docs/REPLAY.md](docs/REPLAY.md) | Capture a history, catch a nondeterminism error, and why the replayer emits no metrics |
@@ -138,14 +146,19 @@ src/Repro.Core/     the library everything else references
   Workflows/SimpleNoActivity.workflow.cs    NO activities: signal, query, update, cancel
   Workflows/WorkflowSimpleActivity.workflow.cs  ONE activity, NO heartbeats: plain
                                             start-to-close + retry, result in history
+  Workflows/WorkflowLocalActivity.workflow.cs   ONE LOCAL activity, CPU-bound: a marker
+                                            instead of an activity task, in its OWN namespace
   Activities/HeartbeatActivities.cs         seed activity    <- edit per repro
   Activities/WeatherActivities.cs           Open-Meteo fetch + synthetic offline fallback
+  Activities/PiActivities.cs                Monte Carlo Pi burn; the repo's only SYNC activity
   HeartbeatJob.cs      JobInput, ActivityOptionsInput, Checkpoint
   SimpleJob.cs         SimpleInput, PokeInput, AddInput, SimpleResult, SimpleStatus
   SimpleActivityJob.cs SimpleActivityInput, SimpleActivityOptionsInput, WeatherReading
+  LocalActivityJob.cs  LocalActivityInput, LocalActivityOptionsInput, PiEstimate
 src/Repro.Worker    polls until interrupted, serves :8077
-src/Repro.LoadGen   worker + THREE start loops (heartbeat; simple with jitter and
-                    injected chaos; simple-activity with jitter), serves :8078
+src/Repro.LoadGen   TWO workers (one per namespace) + FOUR start loops (heartbeat;
+                    simple with chaos; simple-activity; local-activity with a per-run
+                    duration draw), serves :8078
 src/Repro.Starter   one run, prints result, pushes metrics on exit
                     (owns Telemetry/PushMetrics.cs, the Pushgateway bridge)
 src/Repro.Replay    replays a history JSON or a directory, exits 1 on mismatch

@@ -98,6 +98,116 @@ The server only communicates cancellation in the **response** to a
 `RecordActivityTaskHeartbeat` RPC. `fault.stopHeartbeating` demonstrates it. Details in
 [HEARTBEATING.md](HEARTBEATING.md).
 
+## A local activity's `scheduleToCloseTimeout` does not bound a re-execution loop
+
+The most expensive wrong assumption in this repo, because it is the one the API name
+actively encourages and the one a plan will reach for as its safety net.
+
+A local activity runs inside the workflow task. If it outlives
+`history.workflowTaskHeartbeatTimeout` the server times the task out and reschedules it, and
+because a local activity's result is not written to history until it completes, the whole
+thing **runs again from the beginning**. Schedule-to-close does not accumulate across those
+re-dispatches. Its clock restarts every time.
+
+The chain, in sdk-core: `original_schedule_time` is re-stamped on every fresh schedule with
+`get_or_insert(SystemTime::now())`, and persisted only inside the **marker**, guarded by
+`if record_marker`. A local activity killed by a workflow task timeout never resolved, so
+there is no marker and nothing was persisted. Eviction then sends `InvalidateRun` and
+`Drop for TimeoutBag` aborts the schedule-to-close handle. The field that carries a previous
+clock forward is used only by `DoBackoff`, i.e. timer-based retry backoff — a different path,
+and the only one sdk-core's own tests cover.
+
+`startToCloseTimeout` does not save you either, and `retry.maximumAttempts` is not even in
+the conversation: a re-execution is a **fresh execution, attempt 1 again**, outside the retry
+policy. Measured: `ActivityInfo.Attempt` reads 1 on every re-execution.
+
+The only thing that ends such a run is **`WorkflowOptions.RunTimeout`**, enforced by the
+server's timer queue with no worker involvement. Set it, or the run is bounded by nothing.
+
+The documented fix is the other direction: put `scheduleToCloseTimeout` **below** the
+heartbeat timeout, and the activity fails with a timeout the workflow can catch before the
+task is ever re-executed.
+
+## A run killed by `RunTimeout` records no outcome, because workflow code never runs again
+
+The server closes a run-timed-out workflow by calling `TimeoutWorkflow` directly, **without
+scheduling a workflow task**. So a `catch` around your activity await does not run, and any
+counter you increment there does not increment.
+
+For `WorkflowLocalActivity` that is two-thirds of runs at the shipped config, and it is why
+`repro_local_activity_completed` is documented as not accounting for every run and why
+`repro_pi_attempt_started` — emitted from *activity* code, which does not replay — is that
+case's primary signal. Combined with the "a counter that has never incremented does not
+exist" entry above, a panel built only on the workflow-side counter reads a confident flat
+line for the exact behaviour you are trying to watch.
+
+## Heartbeating has no effect on a local activity
+
+Not "is discouraged". `LocalActivityOptions` has no `HeartbeatTimeout` at all — the property
+is absent from the type, not left unset — and the SDK README says the rest out loud:
+"Heartbeating has no effect on local activities." Everything in
+[HEARTBEATING.md](HEARTBEATING.md) — the throttle, the checkpoint details, the `kill -9`
+resume test — is inapplicable. A worker killed mid-local-activity loses all of it and the
+next attempt starts from zero.
+
+## But the local activity IS told when its workflow task times out
+
+Which nothing in the documentation predicted, so it is measured here rather than cited.
+
+Across 17 cut-short burns in one demo run, **every one ended between 64.0s and 64.2s**
+against a 1m `history.workflowTaskHeartbeatTimeout` — never at its requested duration and
+never at a drain. `ActivityExecutionContext.Current.CancellationToken` fires roughly four
+seconds after the server's timeout.
+
+It changes no outcome, since the workflow task is already gone and the result is discarded.
+It changes the CPU arithmetic: a doomed run burns ~64s per execution rather than its full
+drawn length.
+
+Do not fold that token together with `WorkerShutdownToken`. They are the same shape and
+completely different events, and their signatures differ in a way worth knowing:
+
+- a **drain** cuts every in-flight burn at the same **wall-clock** instant with unrelated
+  elapsed values (measured: 49848ms, 2887ms, 30422ms, all at `10:25:30`)
+- a **workflow task timeout** cuts each burn at the same **elapsed** value at unrelated
+  wall-clock times (measured: 64076, 64079, 64080, 64097ms)
+
+The first version of `PiActivities` checked them with a single `||` and logged "worker drain
+cut the burn short" seventeen times during a demo in which nothing had drained.
+
+## An unset `RetryPolicy` on a local activity means retry FOREVER
+
+Stronger than the regular activity path, where you would usually have set one anyway.
+`LocalActivityOptions.RetryPolicy` is documented as "If unset, defaults to retrying forever",
+and `Temporalio.Common.RetryPolicy.MaximumAttempts` of `0` also means unlimited. Both routes
+to "no policy" give you an unbounded chain. Write `1` for "do not retry".
+
+## `history.workflowTaskHeartbeatTimeout` is namespace-scoped and nothing finer
+
+It is declared in `temporalio/temporal` as `NewNamespaceDurationSetting`, so it filters by
+namespace — not by task queue, not by workflow type. Server default is **30m**
+(`common/dynamicconfig/constants.go`, v1.31.2).
+
+That is the entire reason `WorkflowLocalActivity` has a namespace of its own. Lowering the
+setting namespace-wide would have been worse than useless here: the other three workflows use
+no local activities, so they would never visibly react, and the override would sit in the
+config file looking scoped when it was not.
+
+Temporal's own integration suite overrides it to 5s, so lowering it is supported rather than
+a hack.
+
+## `.editorconfig` does NOT scope anything to `.workflow.cs`
+
+The `.workflow.cs` suffix is a naming convention and nothing more. `CA1848`, `CA1873` and
+`CA1822` are suppressed **repo-wide** under `[*.cs]`. `CA1822` in particular is what lets a
+`[WorkflowRun]` method and an instance `[Activity]` method stay non-static, and the
+non-static local-activity lambda overload requires it.
+
+`CA2007` (ConfigureAwait) is **not enabled**, so `.ConfigureAwait(false)` in workflow code
+compiles clean and silently drops the continuation off the SDK's deterministic scheduler. The
+convention is hand-enforced: `(true)` in workflow files, `(false)` elsewhere in `Repro.Core`.
+`CA5394` is not enabled either, which is why the seeded `System.Random` in `PiActivities` is
+allowed to stay seeded.
+
 ## A workflow cannot cancel ITSELF into `CANCELED` status
 
 The server records that status only when a cancellation **request** exists. From inside
