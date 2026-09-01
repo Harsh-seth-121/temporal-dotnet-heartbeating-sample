@@ -52,7 +52,8 @@ Generates and verifies ~2 MB in a temp directory, regenerates it, confirms the t
 
 ## Requirements
 
-Either `uv`, or a `python3` of 3.9 or newer. 
+Either `uv`, or a `python3` of 3.11 or newer. Anything older exits 3 with a message;
+macOS's stock `/usr/bin/python3` 3.9.6 is below the floor and is rejected.
 
 
 ```bash
@@ -102,11 +103,13 @@ Measured on Apple silicon, macOS 25.6, 1,000,000 rows. Covers full four-round Fe
 | uv-managed CPython | 3.11 | 2.39 s | 418k rows/s | ~44 s |
 | uv-managed CPython | 3.13 | 2.51 s | 398k rows/s | ~46 s |
 | uv-managed CPython | 3.12 | 2.60 s | 385k rows/s | ~48 s |
-| system `/usr/bin/python3` | 3.9.6 | 3.13 s | 319k rows/s | ~58 s |
 | uv-managed CPython | 3.14 | 3.15 s | 317k rows/s | ~58 s |
 | Homebrew `python3` | 3.14.7 | 3.21 s | 312k rows/s | ~59 s |
 | `/usr/bin/perl` | 5.34.1 | 3.50 s | 286k rows/s | ~65 s |
 | `bash` | 5.3 | ~390 s | 2.6k rows/s | ~2 h 40 m |
+
+macOS's stock `/usr/bin/python3` 3.9.6 measured 3.13 s here before the floor rose to
+3.11. It now exits 3 instead of running.
 
 
 

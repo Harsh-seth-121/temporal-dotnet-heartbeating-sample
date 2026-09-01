@@ -49,9 +49,9 @@ if [ -z "${GEN_NO_UV:-}" ] && command -v uv >/dev/null 2>&1; then
   # CPython on first run and caches it. Nothing is installed into the project.
   exec uv run --script "$SCRIPT_DIR/gen_samples.py" "$@"
 elif command -v python3 >/dev/null 2>&1; then
-  # Whatever python3 happens to be on PATH, including macOS's /usr/bin/python3 3.9.6.
-  # gen_samples.py warns when it lands outside the tuned range and then runs anyway.
+  # Whatever python3 happens to be on PATH. gen_samples.py enforces its own 3.11 floor,
+  # so macOS's /usr/bin/python3 3.9.6 is rejected there with the same exit 3 as here.
   exec python3 "$SCRIPT_DIR/gen_samples.py" "$@"
 fi
 
-die "no usable interpreter on PATH. Either install uv (https://docs.astral.sh/uv/), which is preferred because it fetches its own CPython in the tuned range, or put a python3 >= 3.9 on PATH and re-run."
+die "no usable interpreter on PATH. Either install uv (https://docs.astral.sh/uv/), which is preferred because it fetches its own CPython in the tuned range, or put a python3 >= 3.11 on PATH and re-run."
