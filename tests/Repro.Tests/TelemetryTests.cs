@@ -18,6 +18,19 @@ namespace Repro.Tests;
 /// </remarks>
 public class HistogramBucketsTests
 {
+    /// <summary>
+    /// The workflow task heartbeat timeout this stack ships, in milliseconds.
+    /// </summary>
+    /// <remarks>
+    /// Mirrors <c>history.workflowTaskHeartbeatTimeout</c> in
+    /// observability/dynamicconfig/development-sql.yaml, which overrides the server's own 30m
+    /// default. It is duplicated here rather than parsed out of that YAML because the file is
+    /// read by the SERVER, not by this process, and a test that parsed it would be asserting
+    /// its own parser. The dynamicconfig file names this constant in a comment so the pair
+    /// stays visible from both sides.
+    /// </remarks>
+    private const double HeartbeatTimeoutMs = 60_000;
+
     [Fact]
     public void NoScrapeKeyIsASubstringOfAnother()
     {
@@ -45,6 +58,7 @@ public class HistogramBucketsTests
     [InlineData(MetricNames.SimpleLatency)]
     [InlineData(MetricNames.SimpleActivityLatency)]
     [InlineData(MetricNames.HeartbeatStaleness)]
+    [InlineData(MetricNames.LocalActivityLatency)]
     public void CustomHistogramsHaveTheirOwnRow(string name) =>
         // A missing row does not read "no data", it reads a plausible CONSTANT out of
         // Core's catch-all, which tops out at 10s while all four of these run longer.
@@ -81,6 +95,39 @@ public class HistogramBucketsTests
         Assert.DoesNotContain(
             HistogramBuckets.ScrapeOverrides.Keys,
             k => k.StartsWith("temporal_repro_", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void LocalActivityBucketsResolveBelowTheDurationFloorAndAtTheHeartbeatTimeout()
+    {
+        // TWO separate failures, one at each end of the row, and neither reads "no data".
+        //
+        // BELOW THE FLOOR. localActivity.minDuration floors every run that gets to record a
+        // sample at all, but not every run does so at its full length: CancellationType
+        // defaults to TryCancel, so a hand `temporal workflow cancel` records at ~T+1s, and
+        // maximumAttempts is 1 so a throwing activity ends the run immediately. With no
+        // boundary under the floor those pile into the floor bucket and p95 for them reads a
+        // plausible constant just under it. This is the same trap
+        // SimpleActivityBucketsStraddleTheSleepFloor guards from the other direction.
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var floorMs = config.LocalActivity.MinDuration.TotalMilliseconds;
+
+        var buckets = HistogramBuckets.ForInstrument(MetricNames.LocalActivityLatency);
+
+        Assert.Contains(floorMs, buckets);
+        Assert.True(
+            buckets.Count(b => b < floorMs) >= 3,
+            $"repro_local_activity_latency needs boundaries BELOW the {floorMs}ms duration floor: "
+            + "a cancelled or immediately-failed run records well under it, and without them "
+            + "every such run lands in the floor bucket and p95 pins just below the floor "
+            + "forever");
+
+        // AT THE TIMEOUT. The workflow task heartbeat timeout is what separates the runs that
+        // complete from the runs that are re-executed, so the boundary has to exist for the
+        // split to be resolvable at all. It is asserted against the dynamic-config value this
+        // repo actually ships rather than against a literal, so lowering one and not the other
+        // is a test failure instead of a silently unreadable panel.
+        Assert.Contains(HeartbeatTimeoutMs, buckets);
     }
 
     [Fact]

@@ -130,6 +130,45 @@ public static class HistogramBuckets
         ("repro_simple_activity_latency", true,
             [1000, 2500, 4000, 5000, 5100, 5250, 5500, 6000, 7500, 10_000, 15_000, 30_000, 60_000]),
 
+        // MANDATORY, not tuning, and the boundary set is asymmetric on purpose at BOTH ends.
+        //
+        // BELOW THE FLOOR. localActivity.minDuration is 30s, so 30_000 is a floor in the same
+        // way 5000 is for repro_simple_activity_latency. The four boundaries under it are not
+        // padding, and the reason is the one that row already documents: a run can end well
+        // before its burn finishes. LocalActivityOptions.CancellationType defaults to
+        // TryCancel, so a hand `temporal workflow cancel` makes the workflow's await throw
+        // immediately and records at T+~1s; a throwing activity ends the run on attempt 1
+        // because maximumAttempts is 1. Without 1000/5000/10_000/20_000 every one of those
+        // lands in le=30000 and p95 for those outcomes reads a flat ~29.9s forever, which is
+        // the plausible-constant failure this file's header calls the worst one here.
+        //
+        // ABOVE 60_000 there is almost nothing, and that is deliberate rather than an
+        // oversight. At the shipped config a run whose burn exceeds the 1m workflow task
+        // heartbeat timeout is closed by runTimeout, and the server does that WITHOUT
+        // scheduling a workflow task, so the workflow never records a sample at all. The
+        // observations that exist are the completers, whose durations lie in [30s, ~60s].
+        // 90_000 is kept as the one boundary above the timeout so that a sample appearing
+        // there is visible as the anomaly it would be.
+        //
+        // DO NOT READ THE EDGE AT 60_000 AS A SHOULDER. It is the ceiling of what can be
+        // recorded, not evidence that a timeout is being enforced at 60s. docs/DASHBOARDS.md
+        // says the same thing next to the panel.
+        ("repro_local_activity_latency", true,
+            [1000, 5000, 10_000, 20_000, 30_000, 40_000, 45_000, 50_000, 55_000, 60_000, 90_000]),
+
+        // Core's own local-activity latency, which is a DIFFERENT measurement from the row
+        // above: it times one execution of the burn, where repro_local_activity_latency times
+        // the whole workflow. On a re-executed run the SDK records several of these and the
+        // workflow records none.
+        //
+        // The substring hazard here is the one this file's header uses as its example, so it
+        // is worth restating as a fact rather than a warning:
+        // "temporal_local_activity_execution_latency".Contains("temporal_activity_execution_latency")
+        // is FALSE, because the byte preceding "activity_execution_latency" is the "l" of
+        // "local_" rather than the "_" of "temporal_". The two rows are independent.
+        ("temporal_local_activity_execution_latency", false,
+            [1000, 5000, 10_000, 30_000, 60_000, 90_000, 120_000, 180_000, 300_000]),
+
         // LEFT AT CORE DEFAULTS ON PURPOSE, do not add:
         //   workflow_task_execution_latency, workflow_task_replay_latency
         //     -> [1,10,20,50,100,200,500,1000]: 1ms floor, good spread already
