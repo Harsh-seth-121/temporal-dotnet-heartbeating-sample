@@ -173,6 +173,22 @@ public class FlagsTests
         Assert.False(Flags.Parse(["--no-simple"]).Switch("--no-simple-activity"));
         Assert.False(Flags.Parse(["--no-simple-activity"]).Switch("--no-simple"));
     }
+
+    [Fact]
+    public void NoLocalActivityIsASwitchOnEveryBinary()
+    {
+        Assert.True(Flags.Parse(["--no-local-activity"]).Switch("--no-local-activity"));
+        Assert.False(Flags.Parse([]).Switch("--no-local-activity"));
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--no-local-activity=false"]));
+
+        // The near-homograph, and the reason this assertion is here rather than assumed.
+        // --no-local-activity and --no-simple-activity differ by one word in the middle and
+        // turn off different loops; neither is a prefix of the other, so nothing but exact
+        // matching keeps them apart. Somebody will type the wrong one.
+        Assert.False(Flags.Parse(["--no-simple-activity"]).Switch("--no-local-activity"));
+        Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-simple-activity"));
+        Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-simple"));
+    }
 }
 
 public class ConfigLoaderTests

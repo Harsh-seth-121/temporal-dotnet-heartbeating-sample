@@ -115,6 +115,13 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - DEFAULT_NAMESPACE=default
+      # WorkflowLocalActivity's own namespace. It exists so
+      # history.workflowTaskHeartbeatTimeout can be dropped to 1m for that workflow alone:
+      # the setting is namespace-scoped server-side, so there is no finer knob. Must match
+      # localActivity.namespace in config.yaml and the constraint in
+      # dynamicconfig/development-sql.yaml; nothing cross-checks the three, and a mismatch
+      # is silent (the worker fails to connect, or the override applies to nothing).
+      - LOCAL_ACTIVITY_NAMESPACE=repro-local-activity
       # 7d, not the 1d the Go original used. Retention caps how long a CLOSED
       # workflow's history survives, and this repo's whole replay workflow depends on
       # `temporal workflow show` still finding it. At 1d, a history captured on Friday

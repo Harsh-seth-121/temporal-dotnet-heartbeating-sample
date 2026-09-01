@@ -26,3 +26,36 @@ matching.numTaskqueueWritePartitions:
 # NOT SET ON PURPOSE: frontend.enableUpdateWorkflowExecution and
 # metrics.breakdownByTaskQueue/byPartition all already default to true in 1.31.
 # Older sandbox guides tell you to flip them; that advice is obsolete.
+
+# THE KNOB THE WHOLE LOCAL-ACTIVITY CASE TURNS ON. Server default is 30m
+# (common/dynamicconfig/constants.go, NewNamespaceDurationSetting, time.Minute*30 as of
+# v1.31.2, which is the version observability/.env pins).
+#
+# A local activity runs INSIDE the workflow task, so that task stays open for the whole of it
+# and the SDK keeps it alive by sending workflow task heartbeats. The server allows that only
+# up to this value; past it the task is timed out and rescheduled, and because a local
+# activity's result is not written to history until it completes, every local activity in that
+# task RUNS AGAIN FROM THE BEGINNING. At 30m that is unreachable in a demo. At 1m, with
+# localActivity durations drawn from 30s..2m, two-thirds of runs hit it within a minute.
+#
+# CONSTRAINED TO ONE NAMESPACE, and that constraint is the only reason the second namespace
+# exists. This setting is declared as NewNamespaceDurationSetting: it filters by namespace and
+# nothing finer, so without the split this would lower the timeout for the other three
+# workflows too. They use no local activities and so would never visibly react -- which is
+# worse, not better, because the override would sit here looking scoped when it was not.
+#
+# Temporal's own integration suite overrides this to 5s
+# (tests/testcore/dynamic_config_overrides.go), so lowering it is supported rather than a
+# hack.
+#
+# The value is mirrored as HeartbeatTimeoutMs in tests/Repro.Tests/TelemetryTests.cs, which
+# asserts that repro_local_activity_latency has a bucket boundary here. Change one and that
+# test fails, which is the intended coupling: without a boundary at the timeout, the split
+# between runs that complete and runs that are re-executed is not resolvable on the panel.
+#
+# Re-read on the 60s poll like everything else in this file, so an edit applies without a
+# restart. The namespace must already exist; scripts/create-namespace.sh makes it.
+history.workflowTaskHeartbeatTimeout:
+  - value: 1m
+    constraints:
+      namespace: repro-local-activity
