@@ -39,17 +39,15 @@ internal sealed class SimpleDriver(
     /// </summary>
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
 
-    private int inFlight;
-    private int started;
-    private int skipped;
+    /// <summary>The tick loop, its capacity accounting, and the started/skipped/interrupted/failed counters.</summary>
+    private readonly DriverLoop<int> loop = new(simple.Rate, simple.Jitter, simple.Concurrency);
+
     private int stopped;
     private int canceled;
     private int expired;
     private int updates;
     private int rejected;
     private int raced;
-    private int interrupted;
-    private int failed;
 
     private enum Ending
     {
@@ -70,77 +68,18 @@ internal sealed class SimpleDriver(
             simple.MinMessages, simple.MaxMessages, simple.StopWeight, simple.CancelWeight,
             simple.ExpireWeight, GoDuration.ToGoString(simple.MaxDuration));
 
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                // Task.Delay, not PeriodicTimer: a PeriodicTimer has one fixed period and
-                // the period has to vary here. The token is forwarded
-                // because CA2016 is an error in this repo, and because without it a
-                // shutdown waits out a full interval. See Jitter for why the formula lives
-                // in one place and which validation rule keeps it safe.
-                await Task.Delay(
-                    Jitter.NextInterval(simple.Rate, simple.Jitter),
-                    cancellationToken).ConfigureAwait(false);
+        // Every run is bounded by the same configured maximum, so the draw is a constant. The
+        // per-run ENDING is drawn inside OneRunAsync instead, because PickEnding's roll only
+        // matters once the run exists and the counters it feeds are this driver's own.
+        await loop.RunAsync(
+            () => maxDurationMs,
+            OneRunAsync,
 
-                // SKIP at capacity, never queue. Same contract as the heartbeat loop.
-                // Queueing would build an unbounded backlog and `rate` would stop
-                // describing what the process is doing.
-                if (Interlocked.Increment(ref inFlight) > simple.Concurrency)
-                {
-                    Interlocked.Decrement(ref inFlight);
-                    Interlocked.Increment(ref skipped);
-                    continue;
-                }
-
-                var n = Interlocked.Increment(ref started);
-
-                _ = Task.Run(
-                    async () =>
-                    {
-                        try
-                        {
-                            await OneRunAsync(maxDurationMs, cancellationToken).ConfigureAwait(false);
-                        }
-                        catch (Exception e)
-                        {
-                            // A TOTAL catch, or an unobserved TaskException tears down the
-                            // process on finalization.
-                            //
-                            // Shutdown is counted SEPARATELY from failure. A run whose RPCs
-                            // were cancelled because the process is going down did not fail,
-                            // and folding the two together makes every clean Ctrl-C look
-                            // like it broke something, which is exactly the kind of
-                            // misleading signal this repo exists to avoid.
-                            if (cancellationToken.IsCancellationRequested)
-                            {
-                                Interlocked.Increment(ref interrupted);
-                            }
-                            else
-                            {
-                                Interlocked.Increment(ref failed);
-                                log.LogWarning("simple run failed: {Message}", e.Message);
-                            }
-                        }
-                        finally
-                        {
-                            Interlocked.Decrement(ref inFlight);
-                        }
-                    },
-                    CancellationToken.None);
-
-                if (n % 10 == 0)
-                {
-                    LogSummary();
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected: the shutdown token cancelled Task.Delay.
-        }
-
-        LogSummary();
+            // Reached only by a run that failed for a reason this driver has no per-outcome catch
+            // for; the expected endings are counted in OneRunAsync as stopped/canceled/expired.
+            (_, e) => log.LogWarning("simple run failed: {Message}", e.Message),
+            LogSummary,
+            cancellationToken).ConfigureAwait(false);
     }
 
     private Ending PickEnding()
@@ -326,6 +265,6 @@ internal sealed class SimpleDriver(
             "simple: {Started} started, {Skipped} skipped at capacity | {Stopped} stopped, " +
             "{Canceled} canceled, {Expired} expired | {Updates} updates, {Rejected} rejected, " +
             "{Raced} post-close NotFound, {Interrupted} interrupted by shutdown, {Failed} failed",
-            started, skipped, stopped, canceled, expired, updates, rejected, raced, interrupted,
-            failed);
+            loop.Started, loop.Skipped, stopped, canceled, expired, updates, rejected, raced,
+            loop.Interrupted, loop.Failed);
 }

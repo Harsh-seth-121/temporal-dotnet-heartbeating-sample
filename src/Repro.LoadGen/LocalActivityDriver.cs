@@ -50,13 +50,16 @@ internal sealed class LocalActivityDriver(
     /// <summary>Bounds the StartWorkflowAsync RPC, so a wedged frontend cannot park the loop.</summary>
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
 
-    private int inFlight;
-    private int started;
-    private int skipped;
+    /// <summary>
+    /// The tick loop, its capacity accounting, and the started/skipped/interrupted/failed
+    /// counters. Its <c>TRun</c> is the per-run draw, which is why the type argument is a tuple
+    /// here and a plain input in the other three drivers.
+    /// </summary>
+    private readonly DriverLoop<(int DurationMs, int Seed)> loop =
+        new(localActivity.Rate, localActivity.Jitter, localActivity.Concurrency);
+
     private int completed;
     private int timedOut;
-    private int interrupted;
-    private int failed;
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -72,73 +75,24 @@ internal sealed class LocalActivityDriver(
             GoDuration.ToGoString(localActivity.MaxDuration), localActivity.Namespace,
             localActivity.TaskQueue, GoDuration.ToGoString(localActivity.RunTimeout));
 
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                await Task.Delay(
-                    Jitter.NextInterval(localActivity.Rate, localActivity.Jitter),
-                    cancellationToken).ConfigureAwait(false);
+        // Skip-at-capacity fires far more often here than in the other three loops; see the class
+        // remarks for why that is the designed behaviour and not breakage.
+        await loop.RunAsync(
 
-                // SKIP at capacity, never queue. Same contract as the other three loops, and
-                // it fires far more often here; see the class remarks.
-                if (Interlocked.Increment(ref inFlight) > localActivity.Concurrency)
-                {
-                    Interlocked.Decrement(ref inFlight);
-                    Interlocked.Increment(ref skipped);
-                    continue;
-                }
+            // Next(min, max + 1) for a CLOSED interval. Next's upper bound is exclusive, so
+            // without the +1 the configured maxDuration is the one value that can never be
+            // drawn -- and it is the value the whole case is tuned around.
+            () => (Random.Shared.Next(minMs, maxMs + 1), Random.Shared.Next()),
+            (run, token) => OneRunAsync(run.DurationMs, run.Seed, token),
 
-                var n = Interlocked.Increment(ref started);
-
-                // Next(min, max + 1) for a CLOSED interval. Next's upper bound is exclusive, so
-                // without the +1 the configured maxDuration is the one value that can never be
-                // drawn -- and it is the value the whole case is tuned around.
-                var durationMs = Random.Shared.Next(minMs, maxMs + 1);
-                var seed = Random.Shared.Next();
-
-                _ = Task.Run(
-                    async () =>
-                    {
-                        try
-                        {
-                            await OneRunAsync(durationMs, seed, cancellationToken).ConfigureAwait(false);
-                        }
-                        catch (Exception e)
-                        {
-                            // A TOTAL catch, or an unobserved TaskException tears down the
-                            // process on finalization.
-                            if (cancellationToken.IsCancellationRequested)
-                            {
-                                Interlocked.Increment(ref interrupted);
-                            }
-                            else
-                            {
-                                Interlocked.Increment(ref failed);
-                                log.LogWarning(
-                                    "local-activity run failed after a {DurationMs}ms burn: {Message}",
-                                    durationMs, e.Message);
-                            }
-                        }
-                        finally
-                        {
-                            Interlocked.Decrement(ref inFlight);
-                        }
-                    },
-                    CancellationToken.None);
-
-                if (n % 10 == 0)
-                {
-                    LogSummary();
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected: the shutdown token cancelled Task.Delay.
-        }
-
-        LogSummary();
+            // The failure line names the duration that was ASKED for, which is the number that
+            // explains the run: it is what every re-execution reads and what decides whether the
+            // run was doomed from the draw.
+            (run, e) => log.LogWarning(
+                "local-activity run failed after a {DurationMs}ms burn: {Message}",
+                run.DurationMs, e.Message),
+            LogSummary,
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Start one run with its drawn duration, then wait for it.</summary>
@@ -225,5 +179,5 @@ internal sealed class LocalActivityDriver(
             "local-activity: {Started} started, {Skipped} skipped at capacity | {Completed} " +
             "completed, {TimedOut} ended at runTimeout (expected, ~2/3) | {Interrupted} " +
             "interrupted by shutdown, {Failed} failed",
-            started, skipped, completed, timedOut, interrupted, failed);
+            loop.Started, loop.Skipped, completed, timedOut, loop.Interrupted, loop.Failed);
 }

@@ -46,14 +46,13 @@ internal sealed class SimpleActivityDriver(
     /// </remarks>
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
 
-    private int inFlight;
-    private int started;
-    private int skipped;
+    /// <summary>The tick loop, its capacity accounting, and the started/skipped/interrupted/failed counters.</summary>
+    private readonly DriverLoop<SimpleActivityInput> loop =
+        new(simpleActivity.Rate, simpleActivity.Jitter, simpleActivity.Concurrency);
+
     private int completed;
     private int live;
     private int synthetic;
-    private int interrupted;
-    private int failed;
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -74,78 +73,18 @@ internal sealed class SimpleActivityDriver(
             simpleActivity.Retry.MaximumAttempts,
             simpleActivity.RequireLiveWeather ? "OFF (requireLiveWeather)" : "synthetic");
 
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                // Task.Delay, not PeriodicTimer: the period varies, which is the point. The
-                // token is forwarded because CA2016 is an error in this repo, and because
-                // without it a shutdown waits out a full interval.
-                await Task.Delay(
-                    Jitter.NextInterval(simpleActivity.Rate, simpleActivity.Jitter),
-                    cancellationToken).ConfigureAwait(false);
+        // Every run takes the same prebuilt input, so the draw is a constant. Skip-at-capacity
+        // here has the same contract as the other three loops and fires about as rarely.
+        await loop.RunAsync(
+            () => input,
+            OneRunAsync,
 
-                // SKIP at capacity, never queue. Same contract as the other two loops.
-                if (Interlocked.Increment(ref inFlight) > simpleActivity.Concurrency)
-                {
-                    Interlocked.Decrement(ref inFlight);
-                    Interlocked.Increment(ref skipped);
-                    continue;
-                }
-
-                var n = Interlocked.Increment(ref started);
-
-                _ = Task.Run(
-                    async () =>
-                    {
-                        try
-                        {
-                            await OneRunAsync(input, cancellationToken).ConfigureAwait(false);
-                        }
-                        catch (Exception e)
-                        {
-                            // A TOTAL catch, or an unobserved TaskException tears down the
-                            // process on finalization.
-                            //
-                            // Shutdown is counted SEPARATELY from failure, for the reason
-                            // SimpleDriver records: a run whose RPCs were cancelled because
-                            // the process is going down did not fail, and folding the two
-                            // together makes every clean Ctrl-C look like breakage.
-                            //
-                            // Unlike SimpleDriver there is no per-outcome catch above this:
-                            // a failed run here is a GENUINE failure, either exhausted
-                            // retries or a non-retryable Open-Meteo response, and belongs in
-                            // this bucket rather than being reclassified as an expected
-                            // ending.
-                            if (cancellationToken.IsCancellationRequested)
-                            {
-                                Interlocked.Increment(ref interrupted);
-                            }
-                            else
-                            {
-                                Interlocked.Increment(ref failed);
-                                log.LogWarning("simple-activity run failed: {Message}", e.Message);
-                            }
-                        }
-                        finally
-                        {
-                            Interlocked.Decrement(ref inFlight);
-                        }
-                    },
-                    CancellationToken.None);
-
-                if (n % 10 == 0)
-                {
-                    LogSummary();
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected: the shutdown token cancelled Task.Delay.
-        }
-
-        LogSummary();
+            // Unlike SimpleDriver there is no per-outcome catch above this: a failed run here is
+            // a GENUINE failure, either exhausted retries or a non-retryable Open-Meteo response,
+            // and belongs in this bucket rather than being reclassified as an expected ending.
+            (_, e) => log.LogWarning("simple-activity run failed: {Message}", e.Message),
+            LogSummary,
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Start one run, wait for it, and record which source produced the reading.</summary>
@@ -208,5 +147,5 @@ internal sealed class SimpleActivityDriver(
             "simple-activity: {Started} started, {Skipped} skipped at capacity | {Completed} " +
             "completed ({Live} live weather, {Synthetic} synthetic fallback) | {Interrupted} " +
             "interrupted by shutdown, {Failed} failed",
-            started, skipped, completed, live, synthetic, interrupted, failed);
+            loop.Started, loop.Skipped, completed, live, synthetic, loop.Interrupted, loop.Failed);
 }
