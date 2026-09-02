@@ -1,0 +1,788 @@
+{
+  "uid": "sandbox-filescan",
+  "title": "Repro / File Scan",
+  "description": "The long-running-activity case. One activity streams a generated corpus out of sample_files/, checkpointing a byte offset AND a rewound accumulator into its heartbeat details, on its own queue (repro-scan-queue) and -- unlike the local-activity case -- in the DEFAULT namespace, so this board opens on 'default'. The first six panels answer 'is the scan working, and what did a resume redo'; the rest answer 'what is this costing the worker'. Start at 'Row cursor vs resume floor vs corpus ceiling': every drop is redone work, drawn to scale. WHOLE BOARD EMPTY means the corpus is missing -- sample_files/ is gitignored and generated, so run scripts/gen-samples/gen-samples.sh.",
+  "tags": [
+    "sandbox",
+    "filescan"
+  ],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "graphTooltip": 1,
+  "time": {
+    "from": "now-30m",
+    "to": "now"
+  },
+  "refresh": "10s",
+  "timezone": "browser",
+  "templating": {
+    "list": [
+      {
+        "name": "namespace",
+        "label": "SDK namespace",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "sandbox-prometheus"
+        },
+        "query": "label_values(temporal_request{service_name=\"temporal-core-sdk\"}, namespace)",
+        "refresh": 1,
+        "includeAll": false,
+        "multi": false,
+        "current": {
+          "text": "default",
+          "value": "default",
+          "selected": true
+        },
+        "description": "Values are NOT sanitized by the .NET SDK; dashes survive."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Row cursor vs resume floor vs corpus ceiling",
+      "description": "START HERE. Three untagged gauges, and every drop from the cursor to the floor is work the next attempt has to redo, drawn to scale against the whole corpus.\n\nmax(), NEVER sum(). All three are process-wide, last-writer-wins gauges, so summing two workers' cursors would report a scan twice as far along as any scan actually is.\n\nrow_cursor deliberately carries NO attempt tag. A dead attempt's tagged series keeps its last sample for Prometheus's 5-minute staleness window, so max() across attempts would flatline at the dead attempt's peak and the drop -- the entire point of this panel -- would never render. Untagged it is one series with last-writer-wins semantics and the drop is immediate.\n\nTHE CEILING IS A METRIC, NOT A LITERAL. repro_file_scan_rows_expected is the corpus's own first line (1,724,588 for sample-100mb.txt), so nothing on this board hard-codes a corpus size and swapping corpora moves the line instead of lying about it.\n\nAt the shipped config a kill -9 drops the cursor about 144,000 rows, 8.35% of the corpus: fileScan.heartbeatTimeout 30s throttles heartbeats to min(0.8 x 30s, 60s) = 24s, and 24s x 6000 rows/s is how far behind the checkpoint the server holds can be.\n\nWHOLE BOARD EMPTY means the corpus is missing. sample_files/ is gitignored and generated: run scripts/gen-samples/gen-samples.sh.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(repro_file_scan_row_cursor{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "row cursor (last COMPLETED row)"
+        },
+        {
+          "refId": "B",
+          "expr": "max(repro_file_scan_resumed_from_row{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "resume floor (where this attempt started)"
+        },
+        {
+          "refId": "C",
+          "expr": "max(repro_file_scan_rows_expected{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "corpus ceiling (rows in the file)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Rows redone this range",
+      "description": "Rows physically read, minus rows in the corpus. Everything above zero was read twice.\n\nmax_over_time PER ATTEMPT-SERIES, NOT increase(), and the difference is not cosmetic. rows_read is tagged with the attempt, so each (attempt, instance) series is monotone and never resets within itself -- its last sample IS its total, which is exactly what max_over_time returns. increase() would extrapolate to both range edges AND have to cross the gap where a killed worker's target is down, i.e. it approximates in precisely the region this panel measures. attempt is the one extra tag on that counter and it earns it: retry.maximumAttempts bounds it at 10 whatever concurrency does.\n\nACCURACY, STATED HONESTLY. Exact for an attempt that drains, cancels or fails, because it survives to the next scrape and its final count is therefore scraped. Low only for kill -9, and then only by the rows read since the last scrape: one 1s scrape at 6000 rows/s is 6,000 rows against a 144,000-row signal, so at most ~4.2% low. That contrast is the punchline -- kill -9 loses the work AND the record of having done it.\n\nA NEGATIVE READING MEANS THE SCAN IS STILL IN FLIGHT: the ceiling is the whole corpus and the attempts have not reached it yet. Read this once 'Idempotency verdict' says match. Keep the dashboard range around ONE run too -- two completed scans in range sum two corpora of reads against one corpus of ceiling.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(max_over_time(repro_file_scan_rows_read{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__range])) or vector(0)) - (max(max_over_time(repro_file_scan_rows_expected{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__range])) or vector(0))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "rows redone"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Idempotency verdict",
+      "description": "The activity's own closed-form check at completion: indexSum == rows x (rows + 1) / 2, and on a full scan endOffset == fileBytes.\n\nmatch means a RESUMED scan produced the aggregate a clean one would. That is the whole case: the accumulator is restored from the same checkpoint as the read cursor, so rows re-read between the checkpoint and the crash are physically read twice and arithmetically counted once.\n\nmismatch is the one failure here that must never be tolerated. The activity logs at Error and throws NON-RETRYABLE rather than returning a wrong aggregate as a success.\n\nEMPTY IS NOT A FAILURE. Core creates a series on first increment, so neither value exists until a scan finishes inside the range. The standalone sum by (result) carries no `or vector(0)` on purpose: the fallback returns a series with NO result label, a blank legend that joins nothing, and it would print a confident 0 in the place where the verdict goes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (result) (increase(repro_file_scan_verified{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__range]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {}
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Checkpoint staleness on resume",
+      "description": "How stale the checkpoint a resuming attempt inherited was: now - checkpoint.RecordedAtUtc, measured in the activity at the moment of resume. Multiply by the target rate and you have the estimate the RESUMING console line prints -- and it labels itself an estimate for that reason.\n\nTHE FLAT LINE IS A LITERAL, NOT A SERIES: 0.8 x fileScan.heartbeatTimeout = 24000 ms at the shipped 30s. Core coalesces heartbeats, so the details the server holds can be a full throttle interval old and staleness cannot beat that bound. This case deliberately does NOT reuse repro_heartbeat_throttle_ms: that gauge's panels are unfiltered max() across activity types, so a second writer with a different value would silently change what they mean. The cost of that choice is this line -- change fileScan.heartbeatTimeout and you must edit the literal here.\n\nSAMPLES ABOVE THE BOUND ARE EXPECTED and are the interesting ones. A kill -9 adds the time the server needs to NOTICE the missing heartbeat (heartbeatTimeout) and the retry's backoff (retry.maximumInterval) on top of the throttle, which lands around 64s.\n\nBuckets come from the repro_file_scan_staleness row in src/Repro.Core/Telemetry/HistogramBuckets.cs, whose 24_000 boundary is that bound, so the throttle reads as a visible shoulder instead of interpolation inside one wide bucket. Custom histograms otherwise land in Core's catch-all set, which tops out at 10s.\n\nNODATA until something resumes: a clean scan records staleness never.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(repro_file_scan_staleness_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p50 staleness"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(repro_file_scan_staleness_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95 staleness"
+        },
+        {
+          "refId": "C",
+          "expr": "vector(24000)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "throttle bound = 0.8 x fileScan.heartbeatTimeout (literal)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Rows/s achieved vs target",
+      "description": "rate() over rows_read, summed across attempts. The pacer holds this at fileScan.targetRowsPerSecond by sleeping to an ABSOLUTE per-batch deadline (rowsThisAttempt / target), so a GC pause or a disk hiccup is absorbed rather than accumulated.\n\nTHE TARGET IS NOT A SERIES. It is config -- fileScan.targetRowsPerSecond, 6000 shipped -- and nothing echoes it as a gauge. The heartbeat board echoes its three configured intervals because comparing them IS that panel's subject; here a hard-coded vector(6000) would go stale the first time you turned the knob. Read the line against the number in config.yaml.\n\nA SUSTAINED SHORTFALL IS WHY THE PRESSURE BLOCK BELOW EXISTS. When the machine cannot keep up the pacer skips its sleep and degrades to full speed, so a deficit here is the honest signal that something below -- GC pause, allocation, a fault knob -- is eating the budget. fault.retainScannedRows is the knob that produces it on purpose.\n\nRows/s and bytes/s are the same line to within the corpus's mean row length (~58 bytes for sample-100mb.txt: 99,999,968 bytes over 1,724,588 rows), which is why bytes_read gets no panel of its own -- 6000 rows/s IS the 348 KB/s the console prints.\n\nNo counter-reset artifact to reason about: each attempt gets its own series, so a resume starts a new one instead of resetting one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(repro_file_scan_rows_read{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "rows/s achieved (all attempts)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Scan outcomes /s",
+      "description": "WORKFLOW-meter counter (Workflow.MetricMeter, replay-suppressed), so one increment per RUN and not per attempt: a scan that resumed nine times lands here once.\n\nIts own metric name rather than a fifth workflow_type on repro_workflow_completed, because the Bug Signals panel \"Custom: repro workflow outcomes /s\" queries that metric with NO workflow_type selector and STACKS the result -- sharing the name would fold this case into the heartbeat lines.\n\noutcome is completed / failed / canceled / timed_out. failed here is usually STRUCTURAL rather than transient and lands in MILLISECONDS: a corpus-identity mismatch, a checkpoint that fails arithmetic validation, or a completion aggregate mismatch all throw non-retryably and none of them retries. timed_out means the ladder is wrong for the corpus you pointed it at (startToCloseTimeout 30m and scheduleToCloseTimeout 1h are sized for a 23m57s worst-case scan).\n\nSPARSE BY CONSTRUCTION: at fileScan.rate 6m a completion arrives every few minutes, so on the default 30m window this is a flat zero with one spike per run. Widen the window, or read the range total off 'Idempotency verdict'.\n\nNo `or vector(0)` on a standalone sum by (outcome): the fallback returns a series with no outcome label, which renders as a blank legend and stacks against nothing.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(repro_file_scan_completed{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 40,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "normal",
+              "group": "A"
+            }
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Memory: managed heap, LOH, working set",
+      "description": "Three PROCESS-WIDE gauges, and every reading a newcomer gets wrong about them is in this description.\n\nmax(), NEVER sum(). These are properties of a PROCESS, not of a scan: GC.GetTotalMemory(false) for the managed heap (never true -- that forces a blocking collection and makes the sampler measure itself), GCMemoryInfo.GenerationInfo[3] for the LOH, and the OS's own working set. Two workers scrape into this board, so sum() would add two unrelated processes' heaps and report a number no process has. Last-writer-wins inside one process is NOT a defect here, and is why these carry no tags at all: eight concurrent scans in one process read one heap and write the same number, so the only artifact is a higher update rate.\n\nTHEY NEST, THEY DO NOT PARTITION: the LOH is inside the managed heap, which is inside the working set. That is exactly why these are four separate metric NAMES -- these three plus bytes_allocated, one panel down -- instead of one metric with a `region` label. sum by (region) is this repo's reflex idiom (every outcome, gen and status_code panel here is one) and over nested quantities it would count the managed heap twice and the LOH three times, producing a total larger than the process.\n\nTHE WORKING SET STAYS FLAT THROUGH A 500 MB SCAN, AND THAT IS THE PROOF, NOT A BROKEN GAUGE. The read path streams one 64 KiB buffer; the file's bytes live in the KERNEL PAGE CACHE and never enter this process's address space. A reader who expects RSS to climb with bytes read will conclude the gauge is wrong -- the flat line is the cleanest evidence available that the scan is really streaming.\n\nloh_bytes flat at ~0 is by design too: the raw-byte reader allocates one buffer below the 85,000-byte LOH threshold. It MOVES with fault.slurpWholeFile -- File.ReadAllBytes steps it to the file size, 476.8 MiB for the 500 MB corpus, in ONE sample, and the LOH is not compacted, so it does not come back -- or with bufferBytes >= 84_976.\n\nRead the shapes: a sawtooth on a flat floor is CHURN (fault.decodeRowsToStrings); a staircase with no falling edge is RETENTION (fault.retainScannedRows) and it takes the working set up with it. This is workstation GC, ServerGarbageCollection unset -- DOTNET_gcServer=1 invalidates every magnitude quoted here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 22
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(repro_file_scan_managed_heap_bytes{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "managed heap"
+        },
+        {
+          "refId": "B",
+          "expr": "max(repro_file_scan_loh_bytes{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "large object heap"
+        },
+        {
+          "refId": "C",
+          "expr": "max(repro_file_scan_working_set_bytes{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "working set (RSS)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "GC collections /s by generation",
+      "description": "A watermark-backed counter: the activity samples GC.CollectionCount(g) once per fileScan.logInterval and adds only the difference it won on a compare-exchange that refuses to move backwards. The watermark is seeded lazily at the first sample, so the worker's startup collections are excluded by construction rather than attributed to the first scan.\n\n`gen` EARNS ITS LABEL, and it is the counter-example to the memory panel above: gen values PARTITION the quantity -- a gen0 collection is not a gen2 collection -- while those byte gauges NEST. That is the whole rule on this board: a label when the values partition, separate names when they nest.\n\ngen=\"2\" is ABSENT, NOT ZERO, in a shipped-config scan. Core creates a series on first increment and a streaming scan promotes nothing. Turn on fault.retainScannedRows (promotes the retained rows) or fault.slurpWholeFile (one LOH object, and the LOH is collected with gen2) to make it appear.\n\nNO `or vector(0)`, unlike most targets on these boards: sum by (gen) (...) or vector(0) returns a series with NO gen label when the metric is absent, a blank legend entry that joins nothing and reads as a real generation. An absent generation should be absent.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (gen) (rate(repro_file_scan_gc_collected{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval]))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "gen {{gen}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "GC pause time",
+      "description": "GCMemoryInfo.PauseTimePercentage, read once per sample. max() for the same reason the memory panel uses it: process-wide, so summing two workers invents a number.\n\nREAD IT AS A LEVEL, NOT A RATE. The runtime computes this percentage over its OWN window -- the collections it tracks -- not over $__rate_interval, so it does not respond to the dashboard's window the way every rate() panel here does.\n\n~0 in the shipped path, because a streaming scan allocates almost nothing and there is almost nothing to collect. It climbs with fault.retainScannedRows, where promoted live gen2 makes each collection do real work, and that climb is the mechanism behind a shortfall on 'Rows/s achieved vs target' above: single digits here are already visible there.\n\nThe sampler is not the story. GC.GetGCMemoryInfo() allocates ~400 B per call and runs once per logInterval, roughly 0.002% of the allocation counter it publishes.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(repro_file_scan_gc_pause_percent{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}) or vector(0)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "pause time %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Allocation amplification",
+      "description": "Bytes ALLOCATED per byte READ: a ratio of two rates, so it is dimensionless and comparable across corpora and rates.\n\nNumerator guarded, denominator clamped -- the 'Attempts resuming from a checkpoint' idiom off the heartbeat board -- and both halves are load-bearing. bytes_allocated may not EXIST: Core creates a metric on first increment and the shipped read path allocates nothing per row (raw byte[] and IndexOf((byte)'\\n'), no string per row), so an unguarded numerator empties the whole ratio and the panel reads No data in exactly the healthy state whose ~0 you wanted to see. clamp_min covers the idle window between runs.\n\n~0 SHIPPED, BY DESIGN AND FOR A REASON: with no per-row allocation the floor is zero, so every movement here is attributable to a knob you turned rather than read against a non-zero baseline.\n\n~2.4 with fault.decodeRowsToStrings: Encoding.ASCII.GetString per row is about 140 B of gen0 garbage against a ~58-byte row. ALLOCATION IS NOT GROWTH -- that 2.4 arrives with a FLAT live-heap floor on the memory panel above. Growth is fault.retainScannedRows, which turns the same garbage into promoted live gen2 and shows up there as a staircase, not here.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "(sum(rate(repro_file_scan_bytes_allocated{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(repro_file_scan_bytes_read{namespace=\"$namespace\",service_name=\"temporal-core-sdk\"}[$__rate_interval])), 1e-9)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "allocated bytes per byte read"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Activity execution latency, ScanFile",
+      "description": "Per-ATTEMPT wall time from the SDK's point of view, which for this case means 'how long did one scan attempt run', not 'how long did the scan take'. A run that resumed nine times contributes nine observations here and one to 'Scan outcomes /s'.\n\nITS TOP BUCKET IS THIS CASE'S DOING. The boundaries come from the `activity_execution_latency` row in src/Repro.Core/Telemetry/HistogramBuckets.cs, extended to 1,800,000 ms for the file-scan case. Core's own default for this metric tops out at 60 s, and that row previously topped out at 600,000 ms -- so the 350 and 500 MB corpora (16m46s and 23m57s at 6000 rows/s) put every attempt in +Inf and pinned p95 at a plausible CONSTANT forever, which reads as a number rather than as no-data and is the worst kind of broken panel. The change is purely additive: boundaries above the old top change no existing case's resolution.\n\nA kill -9'd attempt IS NOT HERE AT ALL. Core records this when the activity task completes, and the process died first. That absence is why 'Rows redone this range' has to reconstruct redone work from a monotone counter instead of reading it off a latency histogram.\n\nPinned to activity_type=\"ScanFile\" -- the wire name, because [Activity] trims the Async off ScanFileAsync.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 38
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(temporal_activity_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",activity_type=\"ScanFile\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p50"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(temporal_activity_execution_latency_bucket{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",activity_type=\"ScanFile\"}[$__rate_interval])))",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "p95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Activity slot saturation on repro-scan-queue",
+      "description": "used / (used + available) for ActivityWorker slots on repro-scan-queue.\n\nTHE QUEUE PIN IS WHY THIS CASE HAS A QUEUE OF ITS OWN. temporal_worker_task_slots_used carries worker_type but NO activity_type, so 'how many slots is THIS case holding' can only be asked of the task queue. repro-scan-queue answers it exactly, and the same pin on the heartbeat board's two slot expressions now excludes this case from those by construction rather than by hoping nothing else heartbeats.\n\nNo `or vector(0)` on any operand, and none needed: the slot gauges are registered when a worker STARTS, not on first use, so both read 0 from the first scrape. A fallback would also be actively wrong in a division -- it contributes a series with no labels.\n\nAt fileScan.concurrency 1 against the SDK's default 100 activity slots this sits near 1%, so the useful reading is binary: NON-ZERO proves a worker is polling repro-scan-queue and running the scan. Sustained 100% means the scan worker's activity slots are the bottleneck, which at concurrency 1 cannot happen unless another activity type moved onto this queue.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "sandbox-prometheus"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 46
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\",task_queue=\"repro-scan-queue\"}) / clamp_min(sum(temporal_worker_task_slots_used{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\",task_queue=\"repro-scan-queue\"}) + sum(temporal_worker_task_slots_available{namespace=\"$namespace\",service_name=\"temporal-core-sdk\",worker_type=\"ActivityWorker\",task_queue=\"repro-scan-queue\"}), 1)",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "sandbox-prometheus"
+          },
+          "legendFormat": "repro-scan-queue activity slots"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ],
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    }
+  ]
+}
