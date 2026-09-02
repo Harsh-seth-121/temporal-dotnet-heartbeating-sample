@@ -113,16 +113,7 @@ public class WorkflowLocalActivity
             StartToCloseTimeout = TimeSpan.FromMilliseconds(a.StartToCloseTimeoutMs),
             ScheduleToCloseTimeout = TimeSpan.FromMilliseconds(a.ScheduleToCloseTimeoutMs),
 
-            RetryPolicy = new RetryPolicy
-            {
-                InitialInterval = TimeSpan.FromMilliseconds(a.RetryInitialIntervalMs),
-
-                // float, not double. Temporalio.Common.RetryPolicy takes a float and
-                // config.yaml's 2.0 is parsed as a double.
-                BackoffCoefficient = (float)a.RetryBackoffCoefficient,
-                MaximumInterval = TimeSpan.FromMilliseconds(a.RetryMaximumIntervalMs),
-                MaximumAttempts = a.RetryMaximumAttempts,
-            },
+            RetryPolicy = a.ToRetryPolicy(),
         };
     }
 

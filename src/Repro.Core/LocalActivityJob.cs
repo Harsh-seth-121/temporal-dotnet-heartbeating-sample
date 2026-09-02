@@ -106,7 +106,7 @@ public record LocalActivityOptionsInput(
     int RetryInitialIntervalMs = 1_000,
     double RetryBackoffCoefficient = 2.0,
     int RetryMaximumIntervalMs = 10_000,
-    int RetryMaximumAttempts = 1)
+    int RetryMaximumAttempts = 1) : IRetryInput
 {
     /// <summary>Projects the config block's timeouts and retry policy onto this record.</summary>
     /// <remarks>

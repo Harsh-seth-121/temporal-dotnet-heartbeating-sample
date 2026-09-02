@@ -62,12 +62,11 @@ internal sealed class FileScanDriver(
     /// <summary>Checked ONCE, at construction. See the class remarks.</summary>
     private readonly bool corpusPresent = File.Exists(fileScan.Path);
 
-    private int inFlight;
-    private int started;
-    private int skipped;
+    /// <summary>The tick loop, its capacity accounting, and the started/skipped/interrupted/failed counters.</summary>
+    private readonly DriverLoop<FileScanInput> loop =
+        new(fileScan.Rate, fileScan.Jitter, fileScan.Concurrency);
+
     private int completed;
-    private int interrupted;
-    private int failed;
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -104,82 +103,22 @@ internal sealed class FileScanDriver(
             GoDuration.ToGoString(fileScan.HeartbeatTimeout),
             GoDuration.ToGoString(fileScan.StartToCloseTimeout), fileScan.Retry.MaximumAttempts);
 
-        try
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                // Task.Delay, not PeriodicTimer: the period varies, which is the point. The
-                // token is forwarded because CA2016 is an error in this repo, and because
-                // without it a shutdown waits out a full interval -- six minutes here.
-                await Task.Delay(
-                    Jitter.NextInterval(fileScan.Rate, fileScan.Jitter),
-                    cancellationToken).ConfigureAwait(false);
+        // Every scan takes the same prebuilt input, so the draw is a constant. Skip-at-capacity
+        // fires regularly at the shipped values; see the class remarks for why. The loop's
+        // interrupted/failed split is worth more here than anywhere else, because a teardown
+        // lands INSIDE a scan most of the time -- one scan covers 4m47s of every 6m.
+        await loop.RunAsync(
+            () => input,
+            OneRunAsync,
 
-                // SKIP at capacity, never queue. Same contract as the other four loops, and see
-                // the class remarks for why it fires regularly at the shipped values.
-                if (Interlocked.Increment(ref inFlight) > fileScan.Concurrency)
-                {
-                    Interlocked.Decrement(ref inFlight);
-                    Interlocked.Increment(ref skipped);
-                    continue;
-                }
-
-                var n = Interlocked.Increment(ref started);
-
-                _ = Task.Run(
-                    async () =>
-                    {
-                        try
-                        {
-                            await OneRunAsync(input, cancellationToken).ConfigureAwait(false);
-                        }
-                        catch (Exception e)
-                        {
-                            // A TOTAL catch, or an unobserved TaskException tears down the
-                            // process on finalization.
-                            //
-                            // Shutdown is counted SEPARATELY from failure, for the reason
-                            // SimpleDriver records: a run whose RPCs were cancelled because the
-                            // process is going down did not fail, and folding the two together
-                            // makes every clean Ctrl-C look like breakage. That split is worth
-                            // more here than anywhere else, because a teardown lands INSIDE a
-                            // scan most of the time -- one scan covers 4m47s of every 6m.
-                            //
-                            // Everything that reaches `failed` is genuine: exhausted retries, or
-                            // one of the activity's non-retryable throws -- a checkpoint that
-                            // disagrees with itself, a corpus that changed under a resume, or an
-                            // aggregate that does not match its closed form. The last of those
-                            // is the one failure this whole case exists to rule out, so it must
-                            // never be quietly reclassified as an expected ending.
-                            if (cancellationToken.IsCancellationRequested)
-                            {
-                                Interlocked.Increment(ref interrupted);
-                            }
-                            else
-                            {
-                                Interlocked.Increment(ref failed);
-                                log.LogWarning("file-scan run failed: {Message}", e.Message);
-                            }
-                        }
-                        finally
-                        {
-                            Interlocked.Decrement(ref inFlight);
-                        }
-                    },
-                    CancellationToken.None);
-
-                if (n % 10 == 0)
-                {
-                    LogSummary();
-                }
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            // Expected: the shutdown token cancelled Task.Delay.
-        }
-
-        LogSummary();
+            // Everything that reaches `failed` is genuine: exhausted retries, or one of the
+            // activity's non-retryable throws -- a checkpoint that disagrees with itself, a
+            // corpus that changed under a resume, or an aggregate that does not match its closed
+            // form. The last of those is the one failure this whole case exists to rule out, so it
+            // must never be quietly reclassified as an expected ending.
+            (_, e) => log.LogWarning("file-scan run failed: {Message}", e.Message),
+            LogSummary,
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Start one scan, wait for it, and report the first verdict that comes back.</summary>
@@ -243,5 +182,5 @@ internal sealed class FileScanDriver(
         log.LogInformation(
             "file-scan: {Started} started, {Skipped} skipped at capacity | {Completed} " +
             "completed and verified | {Interrupted} interrupted by shutdown, {Failed} failed",
-            started, skipped, completed, interrupted, failed);
+            loop.Started, loop.Skipped, completed, loop.Interrupted, loop.Failed);
 }

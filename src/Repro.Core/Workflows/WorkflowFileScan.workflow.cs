@@ -91,20 +91,11 @@ public class WorkflowFileScan
             ScheduleToCloseTimeout = TimeSpan.FromMilliseconds(a.ScheduleToCloseTimeoutMs),
             HeartbeatTimeout = TimeSpan.FromMilliseconds(a.HeartbeatTimeoutMs),
 
-            RetryPolicy = new RetryPolicy
-            {
-                InitialInterval = TimeSpan.FromMilliseconds(a.RetryInitialIntervalMs),
-
-                // float, not double. Temporalio.Common.RetryPolicy takes a float and
-                // config.yaml's 2.0 is parsed as a double.
-                BackoffCoefficient = (float)a.RetryBackoffCoefficient,
-                MaximumInterval = TimeSpan.FromMilliseconds(a.RetryMaximumIntervalMs),
-
-                // 10 rather than the repo's usual 5, and never 0 -- zero means UNLIMITED in
-                // Temporalio.Common.RetryPolicy. Each kill -9 spends one attempt and
-                // docs/HEARTBEATING.md's recipe does three cycles.
-                MaximumAttempts = a.RetryMaximumAttempts,
-            },
+            // RetryMaximumAttempts is 10 here rather than the repo's usual 5, and never 0 --
+            // zero means UNLIMITED in Temporalio.Common.RetryPolicy. Each kill -9 spends one
+            // attempt and docs/HEARTBEATING.md's recipe does three cycles. The default lives on
+            // FileScanOptionsInput; the policy is built by IRetryInput.ToRetryPolicy.
+            RetryPolicy = a.ToRetryPolicy(),
 
             CancellationType = ActivityCancellationType.WaitCancellationCompleted,
         };
