@@ -168,19 +168,9 @@ public static class ConfigLoader
                 "is a busy spin against the frontend.");
         }
 
-        if (config.Simple.Jitter is < 0 or >= 1)
-        {
-            throw new ArgumentException(
-                $"simple.jitter must be in [0, 1) (got {config.Simple.Jitter}). The interval is " +
-                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
-        }
+        ValidateJitter(config.Simple.Jitter, "simple");
 
-        if (config.Simple.Concurrency <= 0)
-        {
-            throw new ArgumentException(
-                $"simple.concurrency must be > 0 (got {config.Simple.Concurrency}), otherwise " +
-                "every tick is skipped at capacity and the driver starts nothing at all.");
-        }
+        ValidateConcurrency(config.Simple.Concurrency, "simple");
 
         if (config.Simple.MinMessages < 0 || config.Simple.MaxMessages < config.Simple.MinMessages)
         {
@@ -349,19 +339,9 @@ public static class ConfigLoader
                 "every run on it.");
         }
 
-        if (sa.Jitter is < 0 or >= 1)
-        {
-            throw new ArgumentException(
-                $"simpleActivity.jitter must be in [0, 1) (got {sa.Jitter}). The interval is " +
-                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
-        }
+        ValidateJitter(sa.Jitter, "simpleActivity");
 
-        if (sa.Concurrency <= 0)
-        {
-            throw new ArgumentException(
-                $"simpleActivity.concurrency must be > 0 (got {sa.Concurrency}), otherwise " +
-                "every tick is skipped at capacity and the driver starts nothing at all.");
-        }
+        ValidateConcurrency(sa.Concurrency, "simpleActivity");
     }
 
     /// <summary>The <c>localActivity:</c> block. Split out to keep Validate readable.</summary>
@@ -492,19 +472,9 @@ public static class ConfigLoader
                 "spin that starts a CPU-bound workflow every iteration.");
         }
 
-        if (la.Jitter is < 0 or >= 1)
-        {
-            throw new ArgumentException(
-                $"localActivity.jitter must be in [0, 1) (got {la.Jitter}). The interval is " +
-                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
-        }
+        ValidateJitter(la.Jitter, "localActivity");
 
-        if (la.Concurrency <= 0)
-        {
-            throw new ArgumentException(
-                $"localActivity.concurrency must be > 0 (got {la.Concurrency}), otherwise every tick " +
-                "is skipped at capacity and the driver starts nothing at all.");
-        }
+        ValidateConcurrency(la.Concurrency, "localActivity");
 
         if (la.MaxConcurrentLocalActivities <= 0)
         {
@@ -850,19 +820,9 @@ public static class ConfigLoader
                 "an activity slot, so capacity is reached immediately and stays reached.");
         }
 
-        if (fs.Jitter is < 0 or >= 1)
-        {
-            throw new ArgumentException(
-                $"fileScan.jitter must be in [0, 1) (got {fs.Jitter}). The interval is " +
-                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
-        }
+        ValidateJitter(fs.Jitter, "fileScan");
 
-        if (fs.Concurrency <= 0)
-        {
-            throw new ArgumentException(
-                $"fileScan.concurrency must be > 0 (got {fs.Concurrency}), otherwise every tick is " +
-                "skipped at capacity and the driver starts nothing at all.");
-        }
+        ValidateConcurrency(fs.Concurrency, "fileScan");
 
         // 8. The one cross-block refusal: retention x concurrency is an OOM, not a panel.
         if (config.Fault.RetainScannedRows && fs.Concurrency > 1)
@@ -878,6 +838,44 @@ public static class ConfigLoader
                 "The failure is an OOM-killed worker, which takes the whole demo's signal down " +
                 "with it, not the empty panel you were expecting. Turn the knob on at " +
                 "concurrency 1: one retained scan already moves every panel it is meant to move.");
+        }
+    }
+
+    /// <summary>The jitter bound, identical for all four driver loops.</summary>
+    /// <remarks>
+    /// FOUR IDENTICAL COPIES of this check existed, one per loop, differing only in the block
+    /// name in the message. Unlike the four `rate` checks next to them -- whose reasons genuinely
+    /// differ, because a spinning simpleActivity loop spins against api.open-meteo.com and earns
+    /// a retryable 429 -- the jitter reason is a property of Jitter.NextInterval itself and is the
+    /// same sentence every time.
+    /// </remarks>
+    /// <param name="jitter">The configured fraction.</param>
+    /// <param name="block">The config block name, used as the message prefix.</param>
+    private static void ValidateJitter(double jitter, string block)
+    {
+        if (jitter is < 0 or >= 1)
+        {
+            throw new ArgumentException(
+                $"{block}.jitter must be in [0, 1) (got {jitter}). The interval is " +
+                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
+        }
+    }
+
+    /// <summary>The concurrency floor, identical for all four driver loops.</summary>
+    /// <remarks>
+    /// Also four identical copies. The consequence is the same for every loop because it is a
+    /// property of the shared skeleton in <c>Repro.LoadGen.DriverLoop</c>: at zero, the
+    /// skip-at-capacity branch takes every tick and the loop starts nothing at all.
+    /// </remarks>
+    /// <param name="concurrency">The configured in-flight ceiling.</param>
+    /// <param name="block">The config block name, used as the message prefix.</param>
+    private static void ValidateConcurrency(int concurrency, string block)
+    {
+        if (concurrency <= 0)
+        {
+            throw new ArgumentException(
+                $"{block}.concurrency must be > 0 (got {concurrency}), otherwise every tick is " +
+                "skipped at capacity and the driver starts nothing at all.");
         }
     }
 }
