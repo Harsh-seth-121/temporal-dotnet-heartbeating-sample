@@ -65,7 +65,7 @@ public static class ConfigLoader
 
         var config = Deserializer.Deserialize<ReproConfig>(File.ReadAllText(path)) ?? new ReproConfig();
         ApplyEnvironmentOverrides(config);
-        Validate(config);
+        Validate(config, path);
         return config;
     }
 
@@ -99,7 +99,12 @@ public static class ConfigLoader
     }
 
     /// <summary>Fail at startup rather than in native code or on a blank dashboard.</summary>
-    private static void Validate(ReproConfig config)
+    /// <param name="config">Deserialized config, MUTATED here: see the normalizing calls below.</param>
+    /// <param name="configPath">
+    /// The path <see cref="Load"/> actually read, which is the only directory a relative path
+    /// inside the file may be resolved against. See <see cref="ValidateFileScan"/>.
+    /// </param>
+    private static void Validate(ReproConfig config, string configPath)
     {
         config.Metrics.ListenAddress =
             BindAddress.Normalize(config.Metrics.ListenAddress, "metrics.listenAddress");
@@ -218,6 +223,7 @@ public static class ConfigLoader
 
         ValidateSimpleActivity(config);
         ValidateLocalActivity(config);
+        ValidateFileScan(config, configPath);
     }
 
     /// <summary>The <c>simpleActivity:</c> block. Split out only to keep Validate readable.</summary>
@@ -508,6 +514,370 @@ public static class ConfigLoader
                 "TemporalWorkerOptions, which rejects a non-positive value, and 0 is not a " +
                 "\"leave the SDK default\" sentinel here the way worker.maxConcurrentActivities " +
                 "treats it.");
+        }
+    }
+
+    /// <summary>Rows in <c>sample-500mb.txt</c>, the largest corpus scripts/gen-samples produces.</summary>
+    /// <remarks>
+    /// A CONSTANT, and never <c>new FileInfo(fileScan.path).Length</c>, for the reason
+    /// <see cref="ValidateFileScan"/> states: this method may not touch the filesystem. Kept in
+    /// step with scripts/gen-samples/MANIFEST.txt BY HAND. Generate something larger and the
+    /// timeout ladder is checked against the wrong worst case, and the symptom is an attempt
+    /// that dies of start-to-close on a perfectly healthy worker part-way through the corpus.
+    /// </remarks>
+    private const long LargestShippedCorpusRows = 8_622_570;
+
+    /// <summary>Bytes of LIVE heap one retained row costs, for <c>fault.retainScannedRows</c>' arithmetic.</summary>
+    /// <remarks>
+    /// A ~58-byte average row decoded to a UTF-16 string is 22 bytes of object header and length
+    /// plus 2 bytes per char, rounded up, plus the 8-byte List slot holding the reference.
+    /// Order-of-magnitude by intent: the message it feeds says "about".
+    /// </remarks>
+    private const int RetainedBytesPerRow = 150;
+
+    /// <summary>
+    /// Bounds on <c>fileScan.bufferBytes</c>. The range deliberately SPANS the 85,000-byte
+    /// LOH threshold (a <c>byte[]</c> reaches it at 84,976), because crossing it on purpose is
+    /// the cheapest one-line demonstration this repo has of that threshold.
+    /// </summary>
+    private const int MinBufferBytes = 4096;
+
+    /// <inheritdoc cref="MinBufferBytes"/>
+    private const int MaxBufferBytes = 16 * 1024 * 1024;
+
+    /// <summary>Resumes the schedule-to-close ladder covers: <c>maximumAttempts - 1</c> at the shipped 10.</summary>
+    /// <remarks>
+    /// FIXED rather than derived from the configured <c>retry.maximumAttempts</c>. The ladder is
+    /// provisioned for the documented worst case -- docs/HEARTBEATING.md's recipe does three
+    /// kill cycles and a careless extra kill must not fail the workflow terminally -- and
+    /// maximumAttempts is the field most likely to be edited on a whim. Deriving it would let
+    /// lowering maximumAttempts quietly lower the floor as well, so the two numbers would never
+    /// disagree and the check would stop being a check.
+    /// </remarks>
+    private const int LadderResumes = 9;
+
+    /// <summary>Floor on the batch period: below one platform tick the configured rate is a lie.</summary>
+    private static readonly TimeSpan MinBatchPeriod = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>Cap on the batch period: the loop's reaction time to a cancel, a drain or a heartbeat.</summary>
+    private static readonly TimeSpan MaxBatchPeriod = TimeSpan.FromSeconds(2);
+
+    /// <summary>Absolute floor on <c>fileScan.heartbeatTimeout</c>, independent of the batch period.</summary>
+    private static readonly TimeSpan MinHeartbeatTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>Slack both timeout rungs carry over their derived worst case.</summary>
+    /// <remarks>
+    /// Covers activity-task scheduling, payload conversion, opening the file and the header
+    /// read, plus the ordinary variance of a multi-minute paced scan on a laptop.
+    /// </remarks>
+    private static readonly TimeSpan LadderHeadroom = TimeSpan.FromMinutes(2);
+
+    /// <summary>The <c>fileScan:</c> block and its whole timeout ladder. Split out to keep Validate readable.</summary>
+    /// <remarks>
+    /// TWO things here are unlike every other block in this file, and both are the point.
+    /// <para>
+    /// IT NEVER STATS THE CORPUS. <c>sample_files/</c> is gitignored and generated, and
+    /// ConfigTests calls <see cref="Load"/> against the COMMITTED config.yaml, so a
+    /// <c>File.Exists</c> or a <c>FileInfo.Length</c> anywhere in this method would break
+    /// <c>dotnet test</c> on every fresh clone. That is why rule 6's derived floor comes from
+    /// <c>maxRows</c> when it is set and from <see cref="LargestShippedCorpusRows"/> otherwise,
+    /// never from the file on disk. DO NOT "fix" this by reading the file: existence is checked
+    /// where it can be handled instead, once in FileScanDriver's constructor, which skips its
+    /// loop with a named banner, and again in the activity, which throws NON-retryably because
+    /// a missing corpus is a config bug and burning ten retries proves nothing.
+    /// </para>
+    /// <para>
+    /// IT MUTATES THE CONFIG, resolving <c>path</c> to an absolute path against the directory
+    /// holding the resolved config file -- NOT the working directory. Same
+    /// mutate-during-validate precedent <c>BindAddress.Normalize</c> sets at the top of
+    /// <see cref="Validate"/>. docs/HEARTBEATING.md's kill-the-worker recipe runs the built
+    /// binary from the repo root while demo-up.sh runs from elsewhere, so a cwd-relative path
+    /// would silently mean two DIFFERENT files across a resume, and the checkpoint's
+    /// corpus-identity check is the only thing that would ever notice.
+    /// </para>
+    /// <para>
+    /// Every message names the key, quotes the value it got, and says what breaks.
+    /// </para>
+    /// </remarks>
+    private static void ValidateFileScan(ReproConfig config, string configPath)
+    {
+        var fs = config.FileScan;
+
+        // 1. path: non-empty, then resolved to absolute against the CONFIG FILE's directory.
+        if (string.IsNullOrWhiteSpace(fs.Path))
+        {
+            throw new ArgumentException(
+                $"fileScan.path must not be empty (got \"{fs.Path}\"). It names the corpus to scan " +
+                "and there is no default that could be right, since the file is generated into a " +
+                "gitignored directory by scripts/gen-samples/gen-samples.sh. An empty path is not " +
+                "caught here as a missing FILE -- nothing in this method stats anything -- it " +
+                "reaches the activity, which throws non-retryably, so every scan dies on attempt 1 " +
+                "with the cause buried under an ActivityFailure chain.");
+        }
+
+        // Path.Combine returns its second argument unchanged when that is already absolute, so an
+        // absolute path in the file survives verbatim. GetFullPath then normalizes ".." and ".",
+        // which is what makes the RESUMING console line's absolute path worth printing.
+        var configDir = Path.GetDirectoryName(Path.GetFullPath(configPath));
+        fs.Path = Path.GetFullPath(Path.Combine(
+            string.IsNullOrEmpty(configDir) ? Directory.GetCurrentDirectory() : configDir,
+            fs.Path));
+
+        // 2. The plain scalar bounds.
+        if (fs.TargetRowsPerSecond < 0)
+        {
+            throw new ArgumentException(
+                $"fileScan.targetRowsPerSecond must be >= 0 (got {fs.TargetRowsPerSecond}). 0 is " +
+                "the documented sentinel for UNTHROTTLED. A negative rate makes the pacer's " +
+                "absolute due time run backwards, so every batch is already overdue, the scan runs " +
+                "flat out, and every rows/s panel and the console line keep reporting the " +
+                "configured rate.");
+        }
+
+        if (fs.BatchRows <= 0)
+        {
+            throw new ArgumentException(
+                $"fileScan.batchRows must be > 0 (got {fs.BatchRows}). It is the number of rows " +
+                "between one pace, cancel, drain, heartbeat and log check and the next, so at zero " +
+                "the loop completes no rows between checks: the cursor never advances while the " +
+                "activity keeps heartbeating an unchanged checkpoint, which on the board is " +
+                "indistinguishable from a stalled disk.");
+        }
+
+        if (fs.MaxRows < 0)
+        {
+            throw new ArgumentException(
+                $"fileScan.maxRows must be >= 0 (got {fs.MaxRows}). 0 is the documented sentinel " +
+                "for the whole file; a negative bound is not \"unlimited\". It would also make the " +
+                "completion aggregate rowsToScan x (rowsToScan + 1) / 2 negative, so a correct " +
+                "scan reports repro_file_scan_verified{result=\"mismatch\"} and throws " +
+                "non-retryably -- the one failure this case must never produce spuriously.");
+        }
+
+        if (fs.LogInterval <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"fileScan.logInterval must be > 0 (got {fs.LogInterval}). One wall-clock interval " +
+                "gates both the console line and the pressure sampler, and at zero every batch " +
+                "takes a GC.GetGCMemoryInfo() sample (~400 B a call) and prints a line, so the " +
+                "sampler comes to dominate the allocation counter it publishes and the memory " +
+                "panels measure the measurement.");
+        }
+
+        if (fs.BufferBytes is < MinBufferBytes or > MaxBufferBytes)
+        {
+            throw new ArgumentException(
+                $"fileScan.bufferBytes must be in [{MinBufferBytes}, {MaxBufferBytes}] (got " +
+                $"{fs.BufferBytes}). The scan finds line breaks itself and treats a FULL buffer " +
+                "with no LF as terminal, so a buffer below the longest row -- 76 bytes in the " +
+                "shipped corpora -- fails a perfectly legal file, and below one page the read " +
+                "syscall rate is the scan. Above the ceiling the buffer is a slurp with extra " +
+                "steps: one Large Object Heap allocation held for the whole attempt, stepping " +
+                "loh_bytes and working_set_bytes exactly the way fault.slurpWholeFile is supposed " +
+                "to, so neither knob can attribute the step to itself any more. Crossing the " +
+                "85,000-byte LOH threshold (a byte[] reaches it at 84,976) is INSIDE the range on " +
+                "purpose: that is a demonstration, not a mistake.");
+        }
+
+        // 3 and 4 bound the BATCH PERIOD, which is the loop's reaction time. Both are vacuous
+        // when unthrottled: with no target rate a batch is however long the raw read takes,
+        // microseconds, and there is no configured period to bound.
+        var batchPeriod = fs.TargetRowsPerSecond > 0
+            ? TimeSpan.FromSeconds((double)fs.BatchRows / fs.TargetRowsPerSecond)
+            : TimeSpan.Zero;
+
+        // 3. The batch must reach a token check at least every 2s.
+        if (batchPeriod > MaxBatchPeriod)
+        {
+            throw new ArgumentException(
+                $"fileScan.batchRows ({fs.BatchRows}) over targetRowsPerSecond " +
+                $"({fs.TargetRowsPerSecond}) is a batch period of {batchPeriod}, above the " +
+                $"{MaxBatchPeriod} cap. The batch boundary is the ONLY place the loop observes " +
+                "ctx.CancellationToken, polls ctx.WorkerShutdownToken or calls Heartbeat(), so a " +
+                "long batch is not slow, it is deaf: batchRows 1000000 at 6000 rows/s is a " +
+                "167-second batch, inside which the activity can observe neither a drain nor a " +
+                "cancel nor emit one heartbeat.");
+        }
+
+        // 4. And not so short that Task.Delay cannot express the sleep.
+        if (fs.TargetRowsPerSecond > 0 && batchPeriod < MinBatchPeriod)
+        {
+            throw new ArgumentException(
+                $"fileScan.batchRows ({fs.BatchRows}) over targetRowsPerSecond " +
+                $"({fs.TargetRowsPerSecond}) is a batch period of {batchPeriod}, below the " +
+                $"{MinBatchPeriod} floor. Task.Delay cannot express a sub-tick sleep and rounds UP " +
+                "to the platform timer, so the process runs SLOWER than the configured rate while " +
+                "repro_file_scan_rows_expected, the console line and every rows/s panel report the " +
+                "configured one. That is the same lie a per-row sleep would tell, which is why the " +
+                "loop batches at all.");
+        }
+
+        // 5. The heartbeat rung, against the batch period rather than against liveness.
+        var heartbeatFloor = TimeSpan.FromTicks(
+            Math.Max(MinHeartbeatTimeout.Ticks, batchPeriod.Ticks * 10));
+        if (fs.HeartbeatTimeout < heartbeatFloor)
+        {
+            throw new ArgumentException(
+                $"fileScan.heartbeatTimeout must be >= max({MinHeartbeatTimeout}, 10 x batchPeriod " +
+                $"{batchPeriod}) = {heartbeatFloor} (got {fs.HeartbeatTimeout}). Ten batch periods " +
+                "is the margin that keeps one GC pause or one page-cache miss from timing the " +
+                "ATTEMPT out on a healthy worker, which reads as \"resume is broken\" and is the " +
+                "worst way for this case to fail. The 5s floor is separate: the throttle is " +
+                "min(0.8 x this, worker.maxHeartbeatThrottleInterval), and below 5s a kill -9 " +
+                "redoes under 4s of rows, which is visible on a panel and invisible in a demo.");
+        }
+
+        if (fs.StartToCloseTimeout <= fs.HeartbeatTimeout)
+        {
+            throw new ArgumentException(
+                $"fileScan.startToCloseTimeout ({fs.StartToCloseTimeout}) must exceed " +
+                $"fileScan.heartbeatTimeout ({fs.HeartbeatTimeout}). Otherwise every attempt dies " +
+                "of start-to-close before a heartbeat timeout can be observed, so the server never " +
+                "reschedules from the checkpoint and the resume path this case exists to " +
+                "demonstrate is never taken.");
+        }
+
+        // 6. The DERIVED floor for both long rungs. rowsToScan comes from maxRows when set and
+        // from LargestShippedCorpusRows otherwise -- NEVER from new FileInfo(fs.Path).Length,
+        // which would break dotnet test on a fresh clone where the corpus does not exist. See
+        // the remarks on this method before changing that.
+        //
+        // Vacuous when unthrottled: with no target rate there is no derivable duration, only
+        // whatever the machine's read ceiling turns out to be.
+        if (fs.TargetRowsPerSecond > 0)
+        {
+            var rowsToScan = fs.MaxRows > 0 ? fs.MaxRows : LargestShippedCorpusRows;
+            var derivedFrom = fs.MaxRows > 0
+                ? "fileScan.maxRows"
+                : $"the largest shipped corpus, sample-500mb.txt at {LargestShippedCorpusRows} rows";
+            var worstScan = TimeSpan.FromSeconds((double)rowsToScan / fs.TargetRowsPerSecond);
+
+            var startFloor = worstScan + LadderHeadroom;
+            if (fs.StartToCloseTimeout < startFloor)
+            {
+                throw new ArgumentException(
+                    $"fileScan.startToCloseTimeout must be >= worstScan + {LadderHeadroom} = " +
+                    $"{startFloor} (got {fs.StartToCloseTimeout}). worstScan is {rowsToScan} rows " +
+                    $"at {fs.TargetRowsPerSecond} rows/s = {worstScan}, taken from {derivedFrom} " +
+                    "and never from the file on disk, which is gitignored and may be absent. Below " +
+                    "this floor attempt 1 dies of start-to-close part-way through the corpus on a " +
+                    "healthy worker, and every retry then resumes from the last checkpoint and " +
+                    "dies at the same place until maximumAttempts is gone.");
+            }
+
+            // The real SDK formula, so the number in the message is the number the throttle
+            // actually takes: min(0.8 x heartbeatTimeout, worker.maxHeartbeatThrottleInterval).
+            var throttle = TimeSpan.FromTicks(Math.Min(
+                (long)(fs.HeartbeatTimeout.Ticks * 0.8),
+                config.Worker.MaxHeartbeatThrottleInterval.Ticks));
+            var perResume = fs.HeartbeatTimeout + fs.Retry.MaximumInterval + throttle;
+            var scheduleFloor = worstScan + (perResume * LadderResumes) + LadderHeadroom;
+            if (fs.ScheduleToCloseTimeout < scheduleFloor)
+            {
+                throw new ArgumentException(
+                    $"fileScan.scheduleToCloseTimeout must be >= worstScan + {LadderResumes} x " +
+                    $"(heartbeatTimeout + retry.maximumInterval + throttle) + {LadderHeadroom} = " +
+                    $"{scheduleFloor} (got {fs.ScheduleToCloseTimeout}). \"maximumAttempts x " +
+                    "startToClose\" is the WRONG model and gives an absurd number: useful work is " +
+                    $"ONE worst-case scan ({worstScan}, from {derivedFrom}) however many attempts " +
+                    $"it takes, and each RESUME adds heartbeatTimeout ({fs.HeartbeatTimeout}, the " +
+                    $"server noticing) + retry.maximumInterval ({fs.Retry.MaximumInterval}, " +
+                    $"backoff) + throttle ({throttle}, the reading that is redone) = {perResume}. " +
+                    "Below this floor the WORKFLOW fails schedule-to-close mid-scan with attempts " +
+                    "still on the clock, which also reads as \"resume is broken\".");
+            }
+        }
+
+        // 7. The retry policy, and the queue name against both queues that already exist.
+        if (fs.Retry.MaximumAttempts <= 0)
+        {
+            throw new ArgumentException(
+                $"fileScan.retry.maximumAttempts must be > 0 (got {fs.Retry.MaximumAttempts}). 0 " +
+                "means UNLIMITED in Temporalio.Common.RetryPolicy, not \"do not retry\", and an " +
+                "unbounded chain of half-hour scans holds an activity slot on the scan queue " +
+                "forever. Write 1 for no retry -- though 1 also removes the resume this case " +
+                "exists to show, because each kill -9 spends one attempt and " +
+                "docs/HEARTBEATING.md's recipe does three cycles. That is why the shipped value " +
+                "is 10 rather than the usual 5.");
+        }
+
+        if (string.IsNullOrWhiteSpace(fs.TaskQueue))
+        {
+            throw new ArgumentException(
+                $"fileScan.taskQueue must not be empty (got \"{fs.TaskQueue}\"). It is not a " +
+                "fallback to taskQueue: an empty queue name is rejected by the server when the " +
+                "worker polls, so the worker starts, logs nothing useful and takes no scan task.");
+        }
+
+        // PREFIX-disjoint against BOTH existing queues, not merely unequal, in the shape of
+        // ValidateLocalActivity above -- but one step stronger there, because THIS queue lives in
+        // the SAME namespace as config.TaskQueue. A shared name is not only ambiguous to a human,
+        // it puts a second heartbeating activity type on the queue whose slot panel sums
+        // temporal_worker_task_slots_used unfiltered while claiming this repo has exactly one.
+        // That metric carries no activity_type label, so there is no way to filter it back out.
+        if (fs.TaskQueue.StartsWith(config.TaskQueue, StringComparison.Ordinal) ||
+            config.TaskQueue.StartsWith(fs.TaskQueue, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"fileScan.taskQueue (\"{fs.TaskQueue}\") and taskQueue (\"{config.TaskQueue}\") " +
+                "must not be a prefix of one another, in either direction. They are in the SAME " +
+                "namespace, so an outright collision silently merges a multi-minute heartbeating " +
+                "scan into the seed case's queue, and temporal_worker_task_slots_used carries no " +
+                "activity_type label to separate them again. A shared PREFIX costs almost as much, " +
+                "because every dashboard selector and every `temporal task-queue describe` in this " +
+                "repo is read by matching on queue name.");
+        }
+
+        if (fs.TaskQueue.StartsWith(config.LocalActivity.TaskQueue, StringComparison.Ordinal) ||
+            config.LocalActivity.TaskQueue.StartsWith(fs.TaskQueue, StringComparison.Ordinal))
+        {
+            throw new ArgumentException(
+                $"fileScan.taskQueue (\"{fs.TaskQueue}\") and localActivity.taskQueue " +
+                $"(\"{config.LocalActivity.TaskQueue}\") must not be a prefix of one another, in " +
+                "either direction. These two ARE in different namespaces, so the server permits it " +
+                "and nothing fails at startup; what breaks is every human-facing lookup that " +
+                "matches on queue name without a namespace, which is all of them.");
+        }
+
+        // The loadgen's FOURTH jittered loop, and the fourth copy of the contract Jitter.cs
+        // names: that file's formula is safe only because rate > 0 and jitter in [0, 1) are
+        // enforced here.
+        if (fs.Rate <= TimeSpan.Zero)
+        {
+            throw new ArgumentException(
+                $"fileScan.rate must be > 0 (got {fs.Rate}). At zero the driver loop is a busy " +
+                "spin, and each iteration it does not skip starts a multi-minute scan that holds " +
+                "an activity slot, so capacity is reached immediately and stays reached.");
+        }
+
+        if (fs.Jitter is < 0 or >= 1)
+        {
+            throw new ArgumentException(
+                $"fileScan.jitter must be in [0, 1) (got {fs.Jitter}). The interval is " +
+                "rate x [1-jitter, 1+jitter], so at 1 the low end is zero and the loop spins.");
+        }
+
+        if (fs.Concurrency <= 0)
+        {
+            throw new ArgumentException(
+                $"fileScan.concurrency must be > 0 (got {fs.Concurrency}), otherwise every tick is " +
+                "skipped at capacity and the driver starts nothing at all.");
+        }
+
+        // 8. The one cross-block refusal: retention x concurrency is an OOM, not a panel.
+        if (config.Fault.RetainScannedRows && fs.Concurrency > 1)
+        {
+            var retainedGb = LargestShippedCorpusRows * RetainedBytesPerRow * fs.Concurrency
+                / 1_000_000_000;
+            throw new ArgumentException(
+                $"fault.retainScannedRows is on together with fileScan.concurrency " +
+                $"{fs.Concurrency}: refused. One retained scan of the largest shipped corpus is " +
+                $"{LargestShippedCorpusRows} rows x about {RetainedBytesPerRow} bytes per retained " +
+                $"string, so about 1.3 GB of LIVE promoted heap, and {fs.Concurrency} concurrent " +
+                $"scans is about {retainedGb} GB in one process sharing one workstation-GC heap. " +
+                "The failure is an OOM-killed worker, which takes the whole demo's signal down " +
+                "with it, not the empty panel you were expecting. Turn the knob on at " +
+                "concurrency 1: one retained scan already moves every panel it is meant to move.");
         }
     }
 }

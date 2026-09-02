@@ -95,6 +95,96 @@ The printed staleness is much larger than the 4 s throttle bound for a different
 reason: the server does not know the worker is gone until the 5 s `heartbeatTimeout`
 expires, and then waits out the retry backoff before attempt N+1 starts.
 
+## Kill the worker mid-SCAN, which is the better version of that test
+
+Same mechanism, same two traps, a far better subject. The seed activity's checkpoint is
+over synthetic steps, so nothing is genuinely reprocessed and there is no way for a resume
+to be *wrong*. `WorkflowFileScan`'s activity reads a real file, restores an accumulator
+from the same heartbeat as its byte cursor, and closes with a closed-form check that says
+out loud whether the resume was idempotent. Run this one instead when you want to see
+resume work rather than see heartbeats arrive.
+
+Start **one** scan, from the starter rather than the loadgen, so exactly one execution is
+writing the untagged cursor gauge:
+
+```bash
+./scripts/demo-up.sh --no-loadgen      # frees :8078, and starts no scan loop
+dotnet run --project src/Repro.Starter -- --file-scan
+```
+
+It needs the corpus. `sample_files/` is gitignored, so generate it first with
+`scripts/gen-samples/gen-samples.sh` or the whole board reads NODATA and the driver logs
+`file-scan: OFF (corpus not found at <path>)`.
+
+The activity prints a progress line every `fileScan.logInterval`, about 29 of them over the
+4m47s scan. Read the row off the last one and call it M. Then, mid-scan:
+
+```bash
+kill -9 $(lsof -ti tcp:8077)
+./src/Repro.Worker/bin/Debug/net10.0/worker
+```
+
+Both traps from the recipe above apply unchanged, and the second one matters MORE here:
+
+- Run the **built binary**, not `dotnet run`, which launches the app as a child process, so
+  killing the parent leaves the child holding :8077 and still reading the corpus.
+- Use **`-9`, not SIGTERM**. A SIGTERM drains gracefully, and this activity checkpoints on
+  the `WorkerShutdownToken` **edge** and then keeps reading until `ctx.CancellationToken`
+  fires `worker.gracefulShutdownTimeout` later. So a drain loses almost nothing, which is
+  the opposite of what you are trying to see. It is worth watching once on its own: total
+  drain reaction is **30.1s** (the grace window plus one 100 ms batch period) against
+  `demo-down.sh`'s 45s budget, so a 4m47s activity is not meant to finish inside the drain
+  window and does not need to.
+
+What to expect, and where each number comes from:
+
+| Reading | Expect | Why |
+|---|---|---|
+| `RESUMING at row N` in the console | N roughly **144,000** below M | `min(0.8 x 30s, 60s)` = 24s of throttle x 6000 rows/s |
+| the drop on **Row cursor vs resume floor vs corpus ceiling** | **8.35%** of the corpus, drawn to scale | 144,000 of 1,724,588 rows |
+| **Rows redone this range** | about **144,000**, up to ~4.2% low | `kill -9` also loses the record of up to one 1s scrape, 6,000 rows |
+| printed staleness | above 24s, up to roughly **64s** | throttle, plus the server noticing (`heartbeatTimeout`), plus `retry.maximumInterval` |
+| `scan COMPLETE` | `indexSum 1487102747166 == expected`, `wordByteSum 65508200 == expected`, end offset **99999968** | closed forms over `sample-100mb.txt`, independent of how many times it resumed |
+| `repro_file_scan_verified` | `{result="match"}` | **A `mismatch` here is the one failure that must never pass.** It means rows were double-counted or skipped across the resume |
+
+Those three totals came out **identical from a full scan and from three separate resume
+points**, which is the measurement this case exists to produce.
+
+That table is the row-cursor equivalent of the seed recipe's measured-run table above, but
+read the difference: its Expect column is **derived** from the throttle arithmetic rather
+than transcribed off a run. The one number this case pins by measurement is the aggregate,
+which is the useful one, because it does not depend on where any kill landed. Run the three
+cycles and read your own M, resume row and staleness off the console if you want those
+recorded here too.
+
+Do not expect a drop every time. The shortfall is throttle lag and it is sometimes **zero**,
+because the kill landed just after Core flushed a heartbeat. That is the same caveat the
+seed recipe carries, and it is why the resume row lands at or below `M + 1` rather than at a
+fixed distance below it.
+
+### Prove idempotence a second way, with no kill at all
+
+This is the cleanest proof available, and `temporal activity reset` is the verb for it.
+Take one in-flight scan and run the two forms back to back:
+
+```bash
+# KEEPS the heartbeat details: the retried attempt resumes from the same checkpoint,
+# re-reads the rows the throttle lost, and counts them once.
+temporal activity reset -w repro-file-scan --activity-id <id>
+
+# DISCARDS them: the next attempt starts over at row 1 and offset 8.
+temporal activity reset -w repro-file-scan --activity-id <id> --reset-heartbeats
+```
+
+**The aggregate comes out right either way.** That is the point: one path exercises the
+resume arithmetic and the other bypasses it entirely, and `indexSum` lands on
+1,487,102,747,166 in both. This section of the doc has claimed that flag's behaviour for a
+while without a case worth demonstrating it on; this is the case.
+
+Get the activity id from `temporal workflow describe -w repro-file-scan`. A reset also
+unpauses a paused activity unless you add `--keep-paused`, and a mid-flight activity only
+observes the reset on its next heartbeat, so on this case that is within one 100 ms batch.
+
 ## Fault knobs
 
 `config.yaml` ships the first two faults on, so the failure and latency panels move
@@ -106,15 +196,25 @@ fault:
   latency: 150ms        # added to every step
 ```
 
-Zero both for a clean baseline. The three heartbeat faults ship **off**, and each one
-proves a specific claim. Turn on exactly one at a time, then restart the worker or
-loadgen.
+Zero both for a clean baseline. **Six** faults ship **off**, three for the seed heartbeating
+activity and three for the file scan, and each one proves a specific claim. Turn on exactly
+one at a time, then restart the worker or loadgen. A knob that moves two panels at once
+cannot attribute a symptom to a cause, which is also why `fault.readAllLinesFirst` is
+deliberately not offered: it would be the union of two of the rows below.
 
 | Knob | What it proves | Watch |
 |---|---|---|
 | `stallPastHeartbeatTimeout` | The server can only tell an activity to stop via the **response to a heartbeat RPC**. Stop heartbeating and the attempt is timed out server-side while your code keeps running, oblivious. | Heartbeating board, "Heartbeat timeouts", and **nothing else**. It is gated to attempt 1, so attempt 2 runs normally and the workflow still ends `completed`. |
 | `stopHeartbeating` | An activity that stops heartbeating can **never be cancelled**. This one is not gated to attempt 1, so it starves all five attempts. It is the knob that produces `outcome=timed_out`. | Heartbeat RPC rate falls to zero while `repro_activity_progress` climbs, then Bug Signals shifts to `timed_out`. Watch the gauge against ONE execution: the starter, or loadgen `--concurrency 1`. It is a single series per worker process and the last writer wins. |
 | `ignoreCancellation` | `TemporalWorker.ExecuteAsync` does not return until every executing activity returns, and `gracefulShutdownTimeout` does **not** bound that. It only controls *when* `ctx.CancellationToken` fires. | Ctrl-C the worker and watch it refuse to exit. |
+| `decodeRowsToStrings` | **Allocation is not growth.** A `string` per scanned row is about 140 B of gen0 garbage, so allocated lands at **2.41x** bytes read (measured, against a **0.01x** baseline) while the LIVE heap floor does not move at all. | File Scan board: "Allocation amplification" goes to ~2.4, `gen="0"` climbs, and "Memory" sawtooths on a **flat floor**. The flat floor is the claim. |
+| `retainScannedRows` | **Retention grows the heap.** The identical garbage, kept in a list, becomes promoted live gen2. Allocation barely moves (**2.54x**), which is why the two knobs have to be read together: the *rate* is nearly the same and the *shape* is what differs. | "Memory" becomes a staircase with **no falling edge**, `gen="1"` and `gen="2"` appear, "GC pause time" reaches single digits, and "Rows/s achieved vs target" dips below 6000. **Refused** with `fileScan.concurrency > 1`: that is an OOM, not a panel. |
+| `slurpWholeFile` | **A big read is one LOH object, and the LOH is not compacted**, so committed bytes step up and do not come back. Allocation reads **8.63x**. | `loh_bytes` and `working_set_bytes` both step and stay. **They step at the NEXT GC, not in the sample that allocated the array**: `GCMemoryInfo` describes the last collection, not now. It does **not** produce a heartbeat timeout, since 500 MB off page cache is well under a second. |
+
+The scan knobs are also how you get the File Scan board's deliberately-empty series to
+appear. `gen="2"` is ABSENT rather than zero on a shipped-config scan, and
+`bytes_allocated` reads near zero because the default path really does allocate nothing per
+row. [DASHBOARDS.md](DASHBOARDS.md) names each one.
 
 ## What a measured run looks like
 

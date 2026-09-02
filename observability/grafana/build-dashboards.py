@@ -105,22 +105,39 @@ OUT = pathlib.Path(__file__).resolve().parent / "dashboards/sandbox"
 CUSTOM = "repro_"              # prefix on this repo's own metrics. NOT applied by
                                # MetricPrefix. Core does not prefix custom names,
                                # so this is a literal part of the metric name.
-TASK_QUEUES = ("repro-task-queue",     # for docs/legends only; panels group by label.
-               "repro-la-queue")       # The dashes are deliberate: see the sanitization
+TASK_QUEUES = ("repro-task-queue",     # the seed heartbeating case AND FetchWeather
+               "repro-la-queue",       # WorkflowLocalActivity, in its own namespace
+               "repro-scan-queue")     # WorkflowFileScan, in the DEFAULT namespace.
+                                       # The dashes are deliberate: see the sanitization
                                        # note in the docstring.
-# Documentation only: grep shows ZERO expressions reference these, because every panel
-# groups by the label rather than selecting one value. They are here so a reader can check
-# the spellings against src/ -- which is also why they had to become plural once there
-# were several workflow types and several activity classes.
+# Documentation only, in the sense that no expression references these TUPLES: a panel that
+# wants a breakdown groups by the label instead of selecting one value. But three spellings
+# out of them are now PINNED as literals further down -- task_queue on the heartbeat board's
+# two slot expressions and on the file-scan board's saturation panel, and
+# activity_type="ScanFile" on the ScanFile latency panel -- because
+# temporal_worker_task_slots_used carries worker_type but NO activity_type, so a per-case
+# slot reading can only be had from the queue. The queue pins go through MAIN_Q / SCAN_Q
+# below so the two spellings live in one place each. They still have to match src/ exactly:
+# a typo in any of them is a silently empty panel, never an error, which is also why these
+# had to become plural once there were several workflow types and several activity classes.
 WORKFLOW_TYPES = ("HeartbeatWorkflow", "SimpleNoActivity", "WorkflowSimpleActivity",
-                  "WorkflowLocalActivity")
-# [Activity] TRIMS the "Async" suffix, which is why ProcessBatchAsync and FetchWeatherAsync
-# are on the wire without it. EstimatePi is declared sync and never had one.
-ACTIVITY_TYPES = ("ProcessBatch", "FetchWeather", "EstimatePi")
+                  "WorkflowLocalActivity", "WorkflowFileScan")
+# [Activity] TRIMS the "Async" suffix, which is why ProcessBatchAsync, FetchWeatherAsync and
+# ScanFileAsync are on the wire as ProcessBatch, FetchWeather and ScanFile. EstimatePi is
+# declared sync and never had one.
+ACTIVITY_TYPES = ("ProcessBatch", "FetchWeather", "EstimatePi", "ScanFile")
 
 # Units: s=seconds, ms=milliseconds, percent=0-100, percentunit=0-1,
 # short=plain number, reqps=rate.
 SEC, MS, PCT, RATIO, NUM, RPS = "s", "ms", "percent", "percentunit", "short", "reqps"
+# The file-scan board's three. BYTES is Grafana's IEC scale (KiB/MiB/GiB), which is the
+# vocabulary every magnitude for that case is quoted in: the 500 MB corpus read whole lands
+# on the LOH as 476.8 MiB, not as 500 MB. CPS (counts/sec) carries rows/s and GC
+# collections/s -- those are counts, not requests, so RPS above would mislabel them.
+# BPS (bytes/sec) is deliberately on NO panel: see "Rows/s achieved vs target", where
+# bytes/s is rows/s times a constant mean row length and a second axis of it would say
+# nothing new. It is here as the unit to reach for if you ever plot bytes_read directly.
+BYTES, BPS, CPS = "bytes", "Bps", "cps"
 
 
 def target(expr, legend=None, ref="A"):
@@ -324,6 +341,19 @@ HI = '{service_name="history"}'
 HI_WFT = '{service_name="history",task_type="Workflow"}'
 HI_ACT = '{service_name="history",task_type="Activity"}'
 HB = '{operation="RecordActivityTaskHeartbeat"}'   # documentation only; see sdk(...)
+
+# Task-queue PINS, unlike the TASK_QUEUES tuple above, which nothing references.
+# temporal_worker_task_slots_used carries worker_type but NO activity_type, so "how many
+# slots is THIS case holding" is a question only the task queue can answer. Giving the
+# file-scan case a queue of its own is what makes both pins below possible, and it is why
+# the heartbeat board's two slot expressions can exclude the scan by construction rather
+# than by hoping nothing else heartbeats.
+MAIN_Q = 'task_queue="repro-task-queue"'   # config.yaml taskQueue: ProcessBatch, FetchWeather
+SCAN_Q = 'task_queue="repro-scan-queue"'   # fileScan.taskQueue: ScanFile, and nothing else
+
+# WorkflowFileScan's metric family, composed from CUSTOM rather than spelled out, for the
+# reason CUSTOM exists at all: the prefix stays in exactly one place.
+SCAN = CUSTOM + "file_scan_"
 
 
 # ---------------------------------------------------------------- worker board
@@ -746,10 +776,27 @@ heartbeat = grid([
               "registers.",
          exprs=[('sum(increase(activity_task_timeout%s[$__range])) or vector(0)' % srv('operation="TimerActiveTaskActivityTimeout",timeout_type="Heartbeat"'), "heartbeat timeouts")]),
     dict(title="Running heartbeating activities", unit=NUM, h=6, w=8, kind="stat",
-         desc="Used activity slots. This repo has exactly one activity type and "
-              "it always heartbeats, so this is the divisor that turns a "
-              "heartbeat RATE into a per-activity INTERVAL on the panel below.",
-         exprs=[('sum(temporal_worker_task_slots_used%s) or vector(0)' % sdk('worker_type="ActivityWorker"'), "running activities")]),
+         desc="Used ACTIVITY slots on repro-task-queue -- the divisor that turns a "
+              "heartbeat RATE into a per-activity INTERVAL on the panel below.\n\n"
+              "THE QUEUE PIN IS A FIX, NOT DECORATION. This expression used to sum the "
+              "metric unfiltered and this description used to claim the repo has exactly "
+              "one activity type and that it always heartbeats. Both halves are false. "
+              "FetchWeather shares repro-task-queue and never heartbeats -- it already "
+              "falsified the claim before the file-scan case existed -- and ScanFile "
+              "heartbeats from repro-scan-queue in this SAME namespace, which would have "
+              "made it worse. temporal_worker_task_slots_used carries worker_type but NO "
+              "activity_type, so the type cannot be pinned at all; the QUEUE can, which is "
+              "exactly why the scan was given one of its own. EstimatePi never appears "
+              "here at all: local activities take LocalActivityWorker slots, and in another "
+              "namespace.\n\n"
+              "WHAT THE NUMBER MEANS NOW: an UPPER BOUND on heartbeating activities, not a "
+              "count of them. The seed case holds about four slots at the shipped loadgen "
+              "(a run every 5s, ~20s per attempt), and FetchWeather adds about 0.4 of a "
+              "slot on average -- simpleActivity.rate 15s against a ~5.8s attempt -- and "
+              "up to its concurrency of 4 in a burst. So read it as a few percent high "
+              "rather than as exact, and read D below as a lower bound partly for this "
+              "reason.",
+         exprs=[('sum(temporal_worker_task_slots_used%s) or vector(0)' % sdk('worker_type="ActivityWorker"', MAIN_Q), "running activities")]),
 
     dict(title="Heartbeat interval: asked for vs throttled vs observed", unit=MS, minval=0, w=24,
          desc="The most educational panel in this repo. It makes an invisible "
@@ -785,6 +832,20 @@ heartbeat = grid([
               "gauge and its denominator a rate over the whole rate interval, so "
               "a few percent of sampling jitter is normal and D can cross B for a "
               "scrape or two.\n\n"
+              "D'S NUMERATOR IS PINNED TO repro-task-queue AND ITS DENOMINATOR IS NOT, "
+              "which is a real asymmetry rather than an oversight. The slot gauge carries "
+              "no activity_type, so the queue is the only way to drop activities that do "
+              "not heartbeat (FetchWeather, on this queue) or that heartbeat from somewhere "
+              "else (ScanFile, on repro-scan-queue in this SAME namespace). The heartbeat "
+              "RPC counter opposite it is keyed by operation, not by queue, so the "
+              "denominator still counts every heartbeat this namespace sent. The two errors "
+              "pull opposite ways: FetchWeather sits in the numerator and sends nothing, "
+              "pushing D UP, while a running file scan adds RPCs to the denominator without "
+              "adding slots to the numerator, pushing D DOWN. Read D in a scan-free window, "
+              "or read the scan on its own board. Before pinning the denominator too, "
+              "check whether your scrape even carries a task_queue label on that counter: "
+              "`curl -s localhost:8077/metrics | grep RecordActivityTaskHeartbeat`. No "
+              "board here has ever pinned one on it.\n\n"
               "Read it: D up near B and far above A is the throttle doing its job "
               "-- the activity asks every A ms and the server hears one every "
               "~B ms. D climbing toward C means heartbeats are arriving too "
@@ -807,7 +868,7 @@ heartbeat = grid([
                 # autoscale flattens A, B and C. `and rate > 0` yields NO SERIES
                 # instead. That is the honest answer to "what is the mean gap between
                 # events that did not happen".
-                ('(1000 * sum(temporal_worker_task_slots_used%s) / sum(rate(temporal_request%s[$__rate_interval]))) and (sum(rate(temporal_request%s[$__rate_interval])) > 0)' % (sdk('worker_type="ActivityWorker"'), sdk('operation="RecordActivityTaskHeartbeat"'), sdk('operation="RecordActivityTaskHeartbeat"')), "D: observed gap per activity (lower bound on B)")]),
+                ('(1000 * sum(temporal_worker_task_slots_used%s) / sum(rate(temporal_request%s[$__rate_interval]))) and (sum(rate(temporal_request%s[$__rate_interval])) > 0)' % (sdk('worker_type="ActivityWorker"', MAIN_Q), sdk('operation="RecordActivityTaskHeartbeat"'), sdk('operation="RecordActivityTaskHeartbeat"')), "D: observed gap per activity on repro-task-queue (lower bound on B)")]),
 
     dict(title="Heartbeat calls vs heartbeat RPCs /s", unit=RPS,
          desc="The throttle, seen from the other side. repro_heartbeat_sent is "
@@ -1036,6 +1097,315 @@ localactivity = grid([
 ])
 
 
+# -------------------------------------------------------------- file-scan board
+# WorkflowFileScan: one activity streams a generated corpus out of sample_files/,
+# checkpointing a byte offset and a REWOUND accumulator into its heartbeat details, on its
+# own queue and in the DEFAULT namespace. Two questions, in this order, because that is the
+# order you ask them in: does the scan work and what did a resume redo (the lifecycle
+# block), then what is it costing the worker (the pressure block).
+#
+# grid() numbers ids and grid positions sequentially, so panels are APPENDED here, never
+# inserted -- inserting mid-list renumbers and repositions every later panel and turns a
+# one-panel change into several hundred lines of churn in filescan.json.
+filescan = grid([
+    dict(title="Row cursor vs resume floor vs corpus ceiling", unit=NUM, minval=0, w=24,
+         desc="START HERE. Three untagged gauges, and every drop from the cursor to the "
+              "floor is work the next attempt has to redo, drawn to scale against the "
+              "whole corpus.\n\n"
+              "max(), NEVER sum(). All three are process-wide, last-writer-wins gauges, so "
+              "summing two workers' cursors would report a scan twice as far along as any "
+              "scan actually is.\n\n"
+              "row_cursor deliberately carries NO attempt tag. A dead attempt's tagged "
+              "series keeps its last sample for Prometheus's 5-minute staleness window, so "
+              "max() across attempts would flatline at the dead attempt's peak and the drop "
+              "-- the entire point of this panel -- would never render. Untagged it is one "
+              "series with last-writer-wins semantics and the drop is immediate.\n\n"
+              "THE CEILING IS A METRIC, NOT A LITERAL. repro_file_scan_rows_expected is the "
+              "corpus's own first line (1,724,588 for sample-100mb.txt), so nothing on this "
+              "board hard-codes a corpus size and swapping corpora moves the line instead "
+              "of lying about it.\n\n"
+              "At the shipped config a kill -9 drops the cursor about 144,000 rows, 8.35% "
+              "of the corpus: fileScan.heartbeatTimeout 30s throttles heartbeats to "
+              "min(0.8 x 30s, 60s) = 24s, and 24s x 6000 rows/s is how far behind the "
+              "checkpoint the server holds can be.\n\n"
+              "WHOLE BOARD EMPTY means the corpus is missing. sample_files/ is gitignored "
+              "and generated: run scripts/gen-samples/gen-samples.sh.",
+         exprs=[('max(%srow_cursor%s) or vector(0)' % (SCAN, SDK), "row cursor (last COMPLETED row)"),
+                ('max(%sresumed_from_row%s) or vector(0)' % (SCAN, SDK), "resume floor (where this attempt started)"),
+                ('max(%srows_expected%s) or vector(0)' % (SCAN, SDK), "corpus ceiling (rows in the file)")]),
+
+    dict(title="Rows redone this range", unit=NUM, h=6, kind="stat",
+         desc="Rows physically read, minus rows in the corpus. Everything above zero was "
+              "read twice.\n\n"
+              "max_over_time PER ATTEMPT-SERIES, NOT increase(), and the difference is not "
+              "cosmetic. rows_read is tagged with the attempt, so each (attempt, instance) "
+              "series is monotone and never resets within itself -- its last sample IS its "
+              "total, which is exactly what max_over_time returns. increase() would "
+              "extrapolate to both range edges AND have to cross the gap where a killed "
+              "worker's target is down, i.e. it approximates in precisely the region this "
+              "panel measures. attempt is the one extra tag on that counter and it earns "
+              "it: retry.maximumAttempts bounds it at 10 whatever concurrency does.\n\n"
+              "ACCURACY, STATED HONESTLY. Exact for an attempt that drains, cancels or "
+              "fails, because it survives to the next scrape and its final count is "
+              "therefore scraped. Low only for kill -9, and then only by the rows read "
+              "since the last scrape: one 1s scrape at 6000 rows/s is 6,000 rows against a "
+              "144,000-row signal, so at most ~4.2% low. That contrast is the punchline -- "
+              "kill -9 loses the work AND the record of having done it.\n\n"
+              "A NEGATIVE READING MEANS THE SCAN IS STILL IN FLIGHT: the ceiling is the "
+              "whole corpus and the attempts have not reached it yet. Read this once "
+              "'Idempotency verdict' says match. Keep the dashboard range around ONE run "
+              "too -- two completed scans in range sum two corpora of reads against one "
+              "corpus of ceiling.",
+         exprs=[('(sum(max_over_time(%srows_read%s[$__range])) or vector(0)) - (max(max_over_time(%srows_expected%s[$__range])) or vector(0))' % (SCAN, SDK, SCAN, SDK), "rows redone")]),
+    dict(title="Idempotency verdict", unit=NUM, h=6, kind="stat",
+         desc="The activity's own closed-form check at completion: indexSum == "
+              "rows x (rows + 1) / 2, and on a full scan endOffset == fileBytes.\n\n"
+              "match means a RESUMED scan produced the aggregate a clean one would. That is "
+              "the whole case: the accumulator is restored from the same checkpoint as the "
+              "read cursor, so rows re-read between the checkpoint and the crash are "
+              "physically read twice and arithmetically counted once.\n\n"
+              "mismatch is the one failure here that must never be tolerated. The activity "
+              "logs at Error and throws NON-RETRYABLE rather than returning a wrong "
+              "aggregate as a success.\n\n"
+              "EMPTY IS NOT A FAILURE. Core creates a series on first increment, so neither "
+              "value exists until a scan finishes inside the range. The standalone "
+              "sum by (result) carries no `or vector(0)` on purpose: the fallback returns a "
+              "series with NO result label, a blank legend that joins nothing, and it would "
+              "print a confident 0 in the place where the verdict goes.",
+         exprs=[('sum by (result) (increase(%sverified%s[$__range]))' % (SCAN, SDK), "{{result}}")]),
+
+    dict(title="Checkpoint staleness on resume", unit=MS, minval=0,
+         desc="How stale the checkpoint a resuming attempt inherited was: "
+              "now - checkpoint.RecordedAtUtc, measured in the activity at the moment of "
+              "resume. Multiply by the target rate and you have the estimate the RESUMING "
+              "console line prints -- and it labels itself an estimate for that reason.\n\n"
+              "THE FLAT LINE IS A LITERAL, NOT A SERIES: 0.8 x fileScan.heartbeatTimeout = "
+              "24000 ms at the shipped 30s. Core coalesces heartbeats, so the details the "
+              "server holds can be a full throttle interval old and staleness cannot beat "
+              "that bound. This case deliberately does NOT reuse "
+              "repro_heartbeat_throttle_ms: that gauge's panels are unfiltered max() across "
+              "activity types, so a second writer with a different value would silently "
+              "change what they mean. The cost of that choice is this line -- change "
+              "fileScan.heartbeatTimeout and you must edit the literal here.\n\n"
+              "SAMPLES ABOVE THE BOUND ARE EXPECTED and are the interesting ones. A kill -9 "
+              "adds the time the server needs to NOTICE the missing heartbeat "
+              "(heartbeatTimeout) and the retry's backoff (retry.maximumInterval) on top of "
+              "the throttle, which lands around 64s.\n\n"
+              "Buckets come from the repro_file_scan_staleness row in "
+              "src/Repro.Core/Telemetry/HistogramBuckets.cs, whose 24_000 boundary is that "
+              "bound, so the throttle reads as a visible shoulder instead of interpolation "
+              "inside one wide bucket. Custom histograms otherwise land in Core's catch-all "
+              "set, which tops out at 10s.\n\n"
+              "NODATA until something resumes: a clean scan records staleness never.",
+         exprs=[('histogram_quantile(0.50, sum by (le) (rate(%sstaleness_bucket%s[$__rate_interval])))' % (SCAN, SDK), "p50 staleness"),
+                ('histogram_quantile(0.95, sum by (le) (rate(%sstaleness_bucket%s[$__rate_interval])))' % (SCAN, SDK), "p95 staleness"),
+                # A LITERAL, and the only one on any of these boards. Nothing echoes this
+                # case's throttle as a gauge, and reusing the heartbeat case's gauge would
+                # corrupt that case's panels (see the description).
+                ('vector(24000)', "throttle bound = 0.8 x fileScan.heartbeatTimeout (literal)")]),
+    dict(title="Rows/s achieved vs target", unit=CPS, minval=0,
+         desc="rate() over rows_read, summed across attempts. The pacer holds this at "
+              "fileScan.targetRowsPerSecond by sleeping to an ABSOLUTE per-batch deadline "
+              "(rowsThisAttempt / target), so a GC pause or a disk hiccup is absorbed rather "
+              "than accumulated.\n\n"
+              "THE TARGET IS NOT A SERIES. It is config -- fileScan.targetRowsPerSecond, "
+              "6000 shipped -- and nothing echoes it as a gauge. The heartbeat board echoes "
+              "its three configured intervals because comparing them IS that panel's "
+              "subject; here a hard-coded vector(6000) would go stale the first time you "
+              "turned the knob. Read the line against the number in config.yaml.\n\n"
+              "A SUSTAINED SHORTFALL IS WHY THE PRESSURE BLOCK BELOW EXISTS. When the "
+              "machine cannot keep up the pacer skips its sleep and degrades to full speed, "
+              "so a deficit here is the honest signal that something below -- GC pause, "
+              "allocation, a fault knob -- is eating the budget. fault.retainScannedRows is "
+              "the knob that produces it on purpose.\n\n"
+              "Rows/s and bytes/s are the same line to within the corpus's mean row length "
+              "(~58 bytes for sample-100mb.txt: 99,999,968 bytes over 1,724,588 rows), which "
+              "is why bytes_read gets no panel of its own -- 6000 rows/s IS the 348 KB/s the "
+              "console prints.\n\n"
+              "No counter-reset artifact to reason about: each attempt gets its own series, "
+              "so a resume starts a new one instead of resetting one.",
+         exprs=[('sum(rate(%srows_read%s[$__rate_interval])) or vector(0)' % (SCAN, SDK), "rows/s achieved (all attempts)")]),
+
+    dict(title="Scan outcomes /s", unit=RPS, stack=True,
+         desc="WORKFLOW-meter counter (Workflow.MetricMeter, replay-suppressed), so one "
+              "increment per RUN and not per attempt: a scan that resumed nine times lands "
+              "here once.\n\n"
+              "Its own metric name rather than a fifth workflow_type on "
+              "repro_workflow_completed, because the Bug Signals panel \"Custom: repro "
+              "workflow outcomes /s\" queries that metric with NO workflow_type selector "
+              "and STACKS the result -- sharing the name would fold this case into the "
+              "heartbeat lines.\n\n"
+              "outcome is completed / failed / canceled / timed_out. failed here is usually "
+              "STRUCTURAL rather than transient and lands in MILLISECONDS: a corpus-identity "
+              "mismatch, a checkpoint that fails arithmetic validation, or a completion "
+              "aggregate mismatch all throw non-retryably and none of them retries. "
+              "timed_out means the ladder is wrong for the corpus you pointed it at "
+              "(startToCloseTimeout 30m and scheduleToCloseTimeout 1h are sized for a "
+              "23m57s worst-case scan).\n\n"
+              "SPARSE BY CONSTRUCTION: at fileScan.rate 6m a completion arrives every few "
+              "minutes, so on the default 30m window this is a flat zero with one spike per "
+              "run. Widen the window, or read the range total off 'Idempotency verdict'.\n\n"
+              "No `or vector(0)` on a standalone sum by (outcome): the fallback returns a "
+              "series with no outcome label, which renders as a blank legend and stacks "
+              "against nothing.",
+         exprs=[('sum by (outcome) (rate(%scompleted%s[$__rate_interval]))' % (SCAN, SDK), "{{outcome}}")]),
+    dict(title="Memory: managed heap, LOH, working set", unit=BYTES, minval=0,
+         desc="Three PROCESS-WIDE gauges, and every reading a newcomer gets wrong about "
+              "them is in this description.\n\n"
+              "max(), NEVER sum(). These are properties of a PROCESS, not of a scan: "
+              "GC.GetTotalMemory(false) for the managed heap (never true -- that forces a "
+              "blocking collection and makes the sampler measure itself), "
+              "GCMemoryInfo.GenerationInfo[3] for the LOH, and the OS's own working set. "
+              "Two workers scrape into this board, so sum() would add two unrelated "
+              "processes' heaps and report a number no process has. Last-writer-wins inside "
+              "one process is NOT a defect here, and is why these carry no tags at all: "
+              "eight concurrent scans in one process read one heap and write the same "
+              "number, so the only artifact is a higher update rate.\n\n"
+              "THEY NEST, THEY DO NOT PARTITION: the LOH is inside the managed heap, which "
+              "is inside the working set. That is exactly why these are four separate metric "
+              "NAMES -- these three plus bytes_allocated, one panel down -- instead of one "
+              "metric with a `region` label. sum by (region) is this repo's reflex idiom "
+              "(every outcome, gen and status_code panel here is one) and over nested "
+              "quantities it would count the managed heap twice and the LOH three times, "
+              "producing a total larger than the process.\n\n"
+              "THE WORKING SET STAYS FLAT THROUGH A 500 MB SCAN, AND THAT IS THE PROOF, NOT "
+              "A BROKEN GAUGE. The read path streams one 64 KiB buffer; the file's bytes "
+              "live in the KERNEL PAGE CACHE and never enter this process's address space. "
+              "A reader who expects RSS to climb with bytes read will conclude the gauge is "
+              "wrong -- the flat line is the cleanest evidence available that the scan is "
+              "really streaming.\n\n"
+              "loh_bytes flat at ~0 is by design too: the raw-byte reader allocates one "
+              "buffer below the 85,000-byte LOH threshold. It MOVES with "
+              "fault.slurpWholeFile -- File.ReadAllBytes steps it to the file size, 476.8 "
+              "MiB for the 500 MB corpus, AT THE NEXT GC -- these gauges come from "
+              "GCMemoryInfo, which describes the LAST collection, not the live heap -- and the "
+              "LOH is not compacted, so it "
+              "does not come back -- or with bufferBytes >= 84_976.\n\n"
+              "Read the shapes: a sawtooth on a flat floor is CHURN "
+              "(fault.decodeRowsToStrings); a staircase with no falling edge is RETENTION "
+              "(fault.retainScannedRows) and it takes the working set up with it. This is "
+              "workstation GC, ServerGarbageCollection unset -- DOTNET_gcServer=1 "
+              "invalidates every magnitude quoted here.",
+         exprs=[('max(%smanaged_heap_bytes%s) or vector(0)' % (SCAN, SDK), "managed heap"),
+                ('max(%sloh_bytes%s) or vector(0)' % (SCAN, SDK), "large object heap"),
+                ('max(%sworking_set_bytes%s) or vector(0)' % (SCAN, SDK), "working set (RSS)")]),
+
+    dict(title="GC collections /s by generation", unit=CPS, minval=0,
+         desc="A watermark-backed counter: the activity samples GC.CollectionCount(g) once "
+              "per fileScan.logInterval and adds only the difference it won on a "
+              "compare-exchange that refuses to move backwards. The watermark is seeded "
+              "lazily at the first sample, so the worker's startup collections are excluded "
+              "by construction rather than attributed to the first scan.\n\n"
+              "THE THREE LINES NEST, THEY DO NOT PARTITION, and this is the reading to get "
+              "right before doing arithmetic on them. MEASURED: GC.CollectionCount(g) counts "
+              "collections of generation g OR HIGHER, so from 0/0/0 two forced gen0 collects "
+              "then one gen1 then one gen2 read 4/2/1, not 2/1/1 -- one gen2 collection "
+              "increments all three. So gen=\"0\" is always at least gen=\"1\", which is "
+              "always at least gen=\"2\", and each line reads 'collections of this generation "
+              "or higher'. sum by (gen) GROUPS rather than adds, so the three lines here are "
+              "each correct; what is wrong is adding them together to get 'total collections', "
+              "which triple-counts every gen2. Published raw on purpose: raw is what "
+              "GC.CollectionCount means, what dotnet-counters prints and what every other .NET "
+              "exporter publishes, and differencing them into an exclusive partition here "
+              "would give a gen0 line agreeing with no other tool on the machine.\n\n"
+              "`gen` still earns its label, for a reason that is NOT 'the values partition': "
+              "these are the runtime's own generation numbers, there are exactly three of them "
+              "forever, and no collection is missing from any line. Contrast the byte gauges "
+              "on the memory panel above, which nest in the CONTAINMENT sense -- the LOH is "
+              "INSIDE the managed heap -- and therefore get separate metric names. The rule "
+              "on this board is bounded-and-complete label values, separate names when one "
+              "quantity contains another.\n\n"
+              "gen=\"2\" is ABSENT, NOT ZERO, in a shipped-config scan. Core creates a "
+              "series on first increment and a streaming scan promotes nothing. Turn on "
+              "fault.retainScannedRows (promotes the retained rows) or fault.slurpWholeFile "
+              "(one LOH object, and the LOH is collected with gen2) to make it appear.\n\n"
+              "NO `or vector(0)`, unlike most targets on these boards: "
+              "sum by (gen) (...) or vector(0) returns a series with NO gen label when the "
+              "metric is absent, a blank legend entry that joins nothing and reads as a real "
+              "generation. An absent generation should be absent.",
+         exprs=[('sum by (gen) (rate(%sgc_collected%s[$__rate_interval]))' % (SCAN, SDK), "gen {{gen}}")]),
+    dict(title="GC pause time", unit=PCT, minval=0,
+         desc="GCMemoryInfo.PauseTimePercentage, read once per sample. max() for the same "
+              "reason the memory panel uses it: process-wide, so summing two workers invents "
+              "a number.\n\n"
+              "READ IT AS A LEVEL, NOT A RATE. The runtime computes this percentage over its "
+              "OWN window -- the collections it tracks -- not over $__rate_interval, so it "
+              "does not respond to the dashboard's window the way every rate() panel here "
+              "does.\n\n"
+              "~0 in the shipped path, because a streaming scan allocates almost nothing and "
+              "there is almost nothing to collect. It climbs with fault.retainScannedRows, "
+              "where promoted live gen2 makes each collection do real work, and that climb "
+              "is the mechanism behind a shortfall on 'Rows/s achieved vs target' above: "
+              "single digits here are already visible there.\n\n"
+              "The sampler is not the story. GC.GetGCMemoryInfo() allocates ~400 B per call "
+              "and runs once per logInterval, roughly 0.002% of the allocation counter it "
+              "publishes.",
+         exprs=[('max(%sgc_pause_percent%s) or vector(0)' % (SCAN, SDK), "pause time %")]),
+
+    dict(title="Allocation amplification", unit=NUM, minval=0,
+         desc="Bytes ALLOCATED per byte READ: a ratio of two rates, so it is dimensionless "
+              "and comparable across corpora and rates.\n\n"
+              "Numerator guarded, denominator clamped -- the 'Attempts resuming from a "
+              "checkpoint' idiom off the heartbeat board -- and both halves are "
+              "load-bearing. bytes_allocated may not EXIST: Core creates a metric on first "
+              "increment and the shipped read path allocates nothing per row (raw byte[] and "
+              "IndexOf((byte)'\\n'), no string per row), so an unguarded numerator empties "
+              "the whole ratio and the panel reads No data in exactly the healthy state "
+              "whose ~0 you wanted to see. clamp_min covers the idle window between "
+              "runs.\n\n"
+              "~0 SHIPPED, BY DESIGN AND FOR A REASON: with no per-row allocation the floor "
+              "is zero, so every movement here is attributable to a knob you turned rather "
+              "than read against a non-zero baseline.\n\n"
+              "~2.4 with fault.decodeRowsToStrings: Encoding.ASCII.GetString per row is "
+              "about 140 B of gen0 garbage against a ~58-byte row. ALLOCATION IS NOT GROWTH "
+              "-- that 2.4 arrives with a FLAT live-heap floor on the memory panel above. "
+              "Growth is fault.retainScannedRows, which turns the same garbage into promoted "
+              "live gen2 and shows up there as a staircase, not here.",
+         exprs=[('(sum(rate(%sbytes_allocated%s[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(%sbytes_read%s[$__rate_interval])), 1e-9)' % (SCAN, SDK, SCAN, SDK), "allocated bytes per byte read")]),
+    dict(title="Activity execution latency, ScanFile", unit=MS, minval=0,
+         desc="Per-ATTEMPT wall time from the SDK's point of view, which for this case means "
+              "'how long did one scan attempt run', not 'how long did the scan take'. A run "
+              "that resumed nine times contributes nine observations here and one to 'Scan "
+              "outcomes /s'.\n\n"
+              "ITS TOP BUCKET IS THIS CASE'S DOING. The boundaries come from the "
+              "`activity_execution_latency` row in "
+              "src/Repro.Core/Telemetry/HistogramBuckets.cs, extended to 1,800,000 ms for "
+              "the file-scan case. Core's own default for this metric tops out at 60 s, and "
+              "that row previously topped out at 600,000 ms -- so the 350 and 500 MB corpora "
+              "(16m46s and 23m57s at 6000 rows/s) put every attempt in +Inf and pinned p95 "
+              "at a plausible CONSTANT forever, which reads as a number rather than as "
+              "no-data and is the worst kind of broken panel. The change is purely additive: "
+              "boundaries above the old top change no existing case's resolution.\n\n"
+              "A kill -9'd attempt IS NOT HERE AT ALL. Core records this when the activity "
+              "task completes, and the process died first. That absence is why 'Rows redone "
+              "this range' has to reconstruct redone work from a monotone counter instead of "
+              "reading it off a latency histogram.\n\n"
+              "Pinned to activity_type=\"ScanFile\" -- the wire name, because [Activity] "
+              "trims the Async off ScanFileAsync.",
+         exprs=[('histogram_quantile(0.50, sum by (le) (rate(temporal_activity_execution_latency_bucket%s[$__rate_interval])))' % sdk('activity_type="ScanFile"'), "p50"),
+                ('histogram_quantile(0.95, sum by (le) (rate(temporal_activity_execution_latency_bucket%s[$__rate_interval])))' % sdk('activity_type="ScanFile"'), "p95")]),
+
+    dict(title="Activity slot saturation on repro-scan-queue", unit=PCT, minval=0, w=24,
+         desc="used / (used + available) for ActivityWorker slots on repro-scan-queue.\n\n"
+              "THE QUEUE PIN IS WHY THIS CASE HAS A QUEUE OF ITS OWN. "
+              "temporal_worker_task_slots_used carries worker_type but NO activity_type, so "
+              "'how many slots is THIS case holding' can only be asked of the task queue. "
+              "repro-scan-queue answers it exactly, and the same pin on the heartbeat "
+              "board's two slot expressions now excludes this case from those by "
+              "construction rather than by hoping nothing else heartbeats.\n\n"
+              "No `or vector(0)` on any operand, and none needed: the slot gauges are "
+              "registered when a worker STARTS, not on first use, so both read 0 from the "
+              "first scrape. A fallback would also be actively wrong in a division -- it "
+              "contributes a series with no labels.\n\n"
+              "At fileScan.concurrency 1 against the SDK's default 100 activity slots this "
+              "sits near 1%, so the useful reading is binary: NON-ZERO proves a worker is "
+              "polling repro-scan-queue and running the scan. Sustained 100% means the scan "
+              "worker's activity slots are the bottleneck, which at concurrency 1 cannot "
+              "happen unless another activity type moved onto this queue.",
+         exprs=[('100 * sum(temporal_worker_task_slots_used%s) / clamp_min(sum(temporal_worker_task_slots_used%s) + sum(temporal_worker_task_slots_available%s), 1)' % (sdk('worker_type="ActivityWorker"', SCAN_Q), sdk('worker_type="ActivityWorker"', SCAN_Q), sdk('worker_type="ActivityWorker"', SCAN_Q)), "repro-scan-queue activity slots")]),
+])
+
+
 BOARDS = [
     ("sandbox-worker", "Repro / Worker Health", worker,
      "SDK-sourced worker health: slots, pollers, schedule-to-start, execution "
@@ -1067,6 +1437,17 @@ BOARDS = [
      "so two-thirds of runs outlive it and re-execute their burn from zero. Start at "
      "'Executions /s vs completions /s': the gap is wasted CPU.",
      ["sandbox", "localactivity"]),
+    ("sandbox-filescan", "Repro / File Scan", filescan,
+     "The long-running-activity case. One activity streams a generated corpus out of "
+     "sample_files/, checkpointing a byte offset AND a rewound accumulator into its "
+     "heartbeat details, on its own queue (repro-scan-queue) and -- unlike the "
+     "local-activity case -- in the DEFAULT namespace, so this board opens on 'default'. "
+     "The first six panels answer 'is the scan working, and what did a resume redo'; the "
+     "rest answer 'what is this costing the worker'. Start at 'Row cursor vs resume floor "
+     "vs corpus ceiling': every drop is redone work, drawn to scale. WHOLE BOARD EMPTY "
+     "means the corpus is missing -- sample_files/ is gitignored and generated, so run "
+     "scripts/gen-samples/gen-samples.sh.",
+     ["sandbox", "filescan"]),
 ]
 
 OUT.mkdir(parents=True, exist_ok=True)

@@ -360,10 +360,10 @@ demo_gate "grafana" "$GATE_TIMEOUT" dotnet-sandbox-grafana \
 BOARDS=$(curl -fs --max-time 5 'http://127.0.0.1:3000/api/search?type=dash-db' 2>/dev/null \
     | grep -o '"uid"' | wc -l | tr -d ' ')
 BOARDS="${BOARDS:-0}"
-if [ "$BOARDS" -ge 8 ]; then
+if [ "$BOARDS" -ge 10 ]; then
     printf '  %-30s ok (%s)\n' "dashboards provisioned" "$BOARDS"
 else
-    printf '  %-30s %s of 8\n' "dashboards provisioned" "$BOARDS"
+    printf '  %-30s %s of 10\n' "dashboards provisioned" "$BOARDS"
     demo_warn "only $BOARDS dashboards are provisioned. The provisioner rewrites them from files on every boot, so the files in observability/grafana/dashboards/ are the source of truth, not the volume."
 fi
 

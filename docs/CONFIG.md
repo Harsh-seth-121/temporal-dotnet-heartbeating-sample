@@ -57,6 +57,22 @@ an afternoon spent staring at a flat panel.
 | `fault.stallPastHeartbeatTimeout` | `false` | overrun the heartbeat timeout on attempt 1 |
 | `fault.stopHeartbeating` | `false` | keep working, stop heartbeating |
 | `fault.ignoreCancellation` | `false` | swallow cancellation and wedge shutdown |
+| `fault.decodeRowsToStrings` | `false` | FILE SCAN: decode every scanned row and throw it away. Proves ALLOCATION IS NOT GROWTH, measured **2.41x** bytes read against a **0.01x** baseline, arriving with a flat live-heap floor. Read against the `retainScannedRows` row: 2.41 and 2.54 are nearly the same rate, and the shape of the heap is what differs |
+| `fault.retainScannedRows` | `false` | FILE SCAN: the same decode, every string retained for the life of the attempt. Proves RETENTION grows the heap, measured **2.54x**. **Refused together with `fileScan.concurrency > 1`**, with the arithmetic in the message: one retained scan of the largest corpus is about 1.3 GB of live promoted heap, so eight is about 10 GB in one workstation-GC heap and the failure is an OOM-killed worker, not the empty panel you were expecting |
+| `fault.slurpWholeFile` | `false` | FILE SCAN: `File.ReadAllBytes` the whole corpus before the loop. Proves a big read is ONE LOH object and the LOH is not compacted, measured **8.63x**. It does **not** produce a heartbeat timeout, since 500 MB off page cache is well under a second; for that you want `stallPastHeartbeatTimeout`. It is also SYNCHRONOUS, so it holds an activity-task thread for its whole duration |
+| `fileScan.enabled` | `true` | run the loadgen's FIFTH loop at all; `--no-file-scan` does the same. Off leaves that process with no scan client, no scan worker and no dependency on the corpus existing at all |
+| `fileScan.path` | `sample_files/sample-100mb.txt` | the corpus. Resolved to an absolute path against **this file's directory**, never the working directory: [HEARTBEATING.md](HEARTBEATING.md)'s kill recipe runs the built binary from the repo root while `demo-up.sh` runs from elsewhere, so a cwd-relative value silently means two DIFFERENT files across a resume and only the checkpoint's corpus-identity check would ever notice. Validated for shape and **never stat'd**; see below |
+| `fileScan.taskQueue` | `repro-scan-queue` | its own queue, in the same namespace. Must be prefix-DISJOINT from `taskQueue` and `localActivity.taskQueue`, not merely different from them. Share a name with `taskQueue` and a second heartbeating activity type lands on the queue whose slot panel sums `temporal_worker_task_slots_used` unfiltered, and that metric carries no `activity_type` label to separate them again |
+| `fileScan.targetRowsPerSecond` | `6000` | rows per second; `0` is the UNTHROTTLED sentinel. THE KNOB THAT MAKES THIS A LONG-RUNNING ACTIVITY: unthrottled, a raw-byte scan of the 500 MB corpus finishes in single-digit seconds, which is shorter than one heartbeat throttle interval, so the case emits one heartbeat and demonstrates neither resume nor pressure. Negative is rejected: the pacer's absolute due time would run backwards, every batch would be overdue, and every rows/s panel would keep reporting the configured rate |
+| `fileScan.batchRows` | `600` | rows between one pace, cancel, drain, heartbeat and log check and the next, so it IS the loop's reaction time. `batchRows / targetRowsPerSecond` is validated into `[10ms, 2s]`. Above the cap a long batch is not slow, it is **deaf**: `batchRows: 1000000` is a 167-second batch inside which the activity can observe neither a drain nor a cancel nor emit one heartbeat. Below the floor `Task.Delay` rounds a sub-tick sleep UP, so the process runs slower than the rate every panel reports |
+| `fileScan.bufferBytes` | `65536` | the single read buffer; range `[4096, 16777216]`. Below the longest row (76 bytes in the shipped corpora) a perfectly legal file fails as "no LF in a full buffer", which names the wrong cause entirely. The range deliberately SPANS the 85,000-byte LOH threshold (a `byte[]` reaches it at 84,976), because crossing it is the cheapest one-line demonstration of that threshold in the repo; above the ceiling the buffer is a slurp with extra steps and neither it nor `fault.slurpWholeFile` can attribute the LOH step to itself |
+| `fileScan.maxRows` | `0` | stop after this many rows; `0` is the whole file. A checkpoint written under a LARGER value is a DIFFERENT JOB and the activity refuses to resume from it rather than reporting a total for a question nobody asked. Negative is rejected and is not "unlimited": it would make the completion aggregate negative, so a correct scan would report `repro_file_scan_verified{result="mismatch"}` and throw |
+| `fileScan.logInterval` | `10s` | wall clock between progress lines and pressure samples, ONE interval feeding both sinks so Grafana and the console cannot disagree by a tick. At `0` every batch takes a `GC.GetGCMemoryInfo()` sample and prints a line, so the sampler comes to dominate the allocation counter it publishes and the memory panels measure the measurement |
+| `fileScan.heartbeatTimeout` | `30s` | chosen for the STALENESS it produces, not for liveness. Floor is `max(5s, 10 x batchPeriod)`: any lower and one GC pause or page-cache miss times the ATTEMPT out on a healthy worker, which reads as "resume is broken" and is the worst way for this case to fail. Ceiling is `worker.maxHeartbeatThrottleInterval`, so raising it past 75s stops increasing the throttle and redone work plateaus at `60s x rate` |
+| `fileScan.startToCloseTimeout` | `30m` | bounds ONE attempt, which for attempt 1 is the whole file. Must exceed `heartbeatTimeout`, or every attempt dies of start-to-close before a heartbeat timeout can be observed and the resume path is never taken. Floor is `worstScan + 2m`: below it attempt 1 dies part-way through the corpus on a healthy worker, and every retry resumes and dies at the same place until `maximumAttempts` is gone |
+| `fileScan.scheduleToCloseTimeout` | `1h` | total across every attempt, including the cost of every resume. Floor is `worstScan + 9 x (heartbeatTimeout + retry.maximumInterval + throttle) + 2m`; below it the WORKFLOW fails schedule-to-close mid-scan with attempts still on the clock, which also reads as "resume is broken". The derivation is below, because "attempts x startToClose" is the wrong model |
+| `fileScan.retry.*` | `1s` / `2.0` / `10s` / `10` | initial interval, coefficient, max interval, max attempts. **10, not the repo's usual 5**: each `kill -9` spends one attempt and [HEARTBEATING.md](HEARTBEATING.md)'s recipe does three cycles, so at 5 one careless extra kill fails the workflow terminally. `0` is **rejected**: `Temporalio.Common.RetryPolicy` reads it as UNLIMITED, and an unbounded chain of half-hour scans holds an activity slot on the scan queue forever. Write `1` for no retry, which also removes the resume this case exists to show |
+| `fileScan.rate` / `jitter` / `concurrency` | `6m` / `0.2` / `1` | fifth-loop traffic shape, same jittered-interval and skip-at-capacity contract as `simple.jitter`. `6m` is just over one 4m47s scan, so a scan is in flight essentially always without a second one ever starting. `concurrency` is a pure multiplier on every byte, allocation and buffer in the case, all sharing ONE heap and ONE thread pool, which is why it is 1 and why `fault.retainScannedRows` refuses it above 1 |
 
 ## The `activity.*` rows reach the workflow through its input, not through the file
 
@@ -114,7 +130,7 @@ organisation. `history.workflowTaskHeartbeatTimeout` is declared server-side as
 `NewNamespaceDurationSetting`: it filters by **namespace and nothing finer** — not task
 queue, not workflow type. Dropping it from its 30m default to 1m in a namespace of its own is
 the only way to make `WorkflowLocalActivity`'s re-execution loop reachable in a demo while the
-other three workflows keep stock behaviour.
+other four workflows keep stock behaviour.
 
 The override itself is not in this file. It lives in
 `observability/dynamicconfig/development-sql.yaml`, constrained to that namespace, and the
@@ -126,7 +142,7 @@ the override applying to nothing at all while looking correct.
 
 Two names are checked against the rest of the file at load. `localActivity.namespace` must
 differ from `namespace`, because sharing one applies the 1m heartbeat override to the other
-three workflows, which have no local activities, so heartbeat behaviour appears in workflows
+four workflows, which have no local activities, so heartbeat behaviour appears in workflows
 that cannot cause it. `localActivity.taskQueue` and `taskQueue` must not be a **prefix** of one
 another in either direction — not merely unequal. Task queues are namespace-scoped, so the
 server accepts a collision and nothing fails at startup; what breaks is every lookup that
@@ -169,6 +185,106 @@ unconfigurable while looking like ordinary hygiene.
 `--no-local-activity` turns the loop off, and with it every dependency this process has on the
 second namespace existing — useful against a stack created before this feature, where
 `create-namespace.sh` has not run in its two-namespace form.
+
+## `fileScan`, and the corpus it does not check for
+
+`WorkflowFileScan` gets a task queue of its own and stays in `default`, so unlike
+`localActivity` there is no second client and no second namespace to keep in agreement.
+What it does have is a real file on disk, and this block is where the two things that
+follow from that are settled: what the file has to look like, and what happens when it is
+not there.
+
+### The corpus contract
+
+Line 1 is the row count `N`, authoritative and cross-checked by
+`scripts/gen-samples/gen-samples.sh --verify <path>`. Each of the next `N` lines is
+`%010d [w w w w w w w]\n`: ASCII, LF, a 10-digit zero-padded index, one space, seven
+3-to-8-letter words in brackets. Rows are **41 to 76 bytes including the LF, not fixed
+width**, of which exactly 20 bytes are fixed overhead.
+
+For the shipped `sample-100mb.txt`: `N` = **1,724,588**, **99,999,968** bytes, header
+length **8** (`digits(N) + 1`). The activity checks `headerLen == digits(N) + 1` on open,
+because every byte identity in the case derives the header length from the row count alone.
+
+**A CRLF corpus fails on row 1, loudly, and that is the design.** The read loop splits on
+LF, so on CRLF input the last byte of every row is `\r` rather than `]` and the row parser
+reports a malformed corpus immediately. Tolerating it would mean one byte of cursor drift
+per row, no exception, and a resume that lands mid-row several hundred thousand rows later.
+
+Generate the four corpora with `scripts/gen-samples/gen-samples.sh`. They total about
+1.15 GB, which is why nothing generates them for you: that is not a demo script's decision,
+and `demo-up.sh` never makes it.
+
+### Absent corpus, and why `dotnet test` still passes without one
+
+`sample_files/` is gitignored, so a fresh clone has no corpus and `fileScan.enabled` still
+ships `true`. Four rules make that safe, and they are worth knowing before "fixing" any one
+of them:
+
+1. **Validation checks shape and never stats the file.** `ConfigTests` calls
+   `ConfigLoader.Load` against the committed `config.yaml`, so a `File.Exists` or a
+   `FileInfo.Length` anywhere in `ValidateFileScan` would break `dotnet test` on every
+   fresh clone. This is also why the timeout ladder's derived floor comes from
+   `fileScan.maxRows` when it is set and from a hand-maintained largest-corpus constant
+   (8,622,570 rows) otherwise, never from the file on disk.
+2. **`path` resolves against the resolved `config.yaml`'s directory**, not the cwd, and is
+   rewritten in place during validation. That is what makes the absolute path on the
+   `RESUMING` console line worth printing.
+3. **The loadgen driver checks once, at construction, and skips its whole loop** with a
+   named banner: `file-scan: OFF (corpus not found at <path>; run
+   scripts/gen-samples/gen-samples.sh)`. It is logged *after* the readiness banner
+   `scripts/demo-lib.sh` greps with a 45s budget, so a missing corpus cannot turn a working
+   start into a `demo-up.sh` timeout.
+4. **The scan worker registers the activity anyway.** `enabled` and `--no-file-scan` turn
+   off the loadgen's driver loop, not this process's ability to run a scan you start by
+   hand, so a corpus generated later needs no worker restart. Invoke a scan with the corpus
+   still missing and the activity throws **non-retryable** on attempt 1: a missing file is a
+   config bug, not a transient fault, and burning ten attempts on it buries the cause under
+   an `ActivityFailure` chain.
+
+### The timeout ladder, derived
+
+Three rungs, and every one is derived rather than picked. `worstScan` below is
+`rowsToScan / targetRowsPerSecond`, which at the shipped 6000 rows/s is 4m47s for the
+100 MB corpus and **23m57s** for the 500 MB one.
+
+| Rung | Shipped | Floor `ConfigLoader` enforces |
+|---|---|---|
+| `heartbeatTimeout` | 30s | `max(5s, 10 x batchPeriod)`, and it must be under `startToCloseTimeout` |
+| `startToCloseTimeout` | 30m | `worstScan + 2m` |
+| `scheduleToCloseTimeout` | 1h | `worstScan + 9 x (heartbeatTimeout + retry.maximumInterval + throttle) + 2m` |
+
+`heartbeatTimeout` is the rung to understand first, and it is **not** set for liveness. The
+maximum gap between two `Heartbeat()` calls is one batch period, 100 ms, so 30s is 300x
+margin. What it sets is Core's throttle,
+`min(0.8 x heartbeatTimeout, worker.maxHeartbeatThrottleInterval)` = **24s**, and therefore
+how much work a `kill -9` destroys the RECORD of: `24 x 6000` = **144,000 rows, 8.35% of
+the 100 MB corpus**. It saturates, because the second term binds past 75s.
+
+`startToCloseTimeout: 30m` **covers** the shipped corpora rather than guarding anything;
+its honest role is catching an attempt that keeps heartbeating and never finishes. It
+becomes a live guard the moment you drop the rate or point at something bigger, and then
+validation fails at startup naming the value it needs.
+
+`scheduleToCloseTimeout` is the one where the obvious model is wrong. "attempts x
+startToClose" gives an absurd number, because useful work is **one** worst-case scan
+however many attempts it takes. Each *resume* adds `heartbeatTimeout` (the server noticing
+the missing heartbeat) plus `retry.maximumInterval` (backoff) plus the throttle (the reading
+that is redone) = **64s** at the shipped values. Nine resumes on the 500 MB corpus is
+`23m57s + 9 x 64s + 2m` = **35m33s**, so 1h leaves about 1.7x headroom.
+
+Nine, not `maximumAttempts - 1`: the number is fixed rather than derived, so that lowering
+`maximumAttempts` on a whim cannot quietly lower the floor with it and leave a check that
+can never disagree.
+
+### `--rows-per-second` can only make the approved worst case shorter
+
+The starter's `--file`, `--rows-per-second` and `--max-rows` land **after** validation, so
+they have to repeat the rules the ladder was derived under rather than trust them.
+`--rows-per-second` must therefore be `0` or **at least** `fileScan.targetRowsPerSecond`,
+and `--max-rows` must be inside `[1, fileScan.maxRows]` when that is bounded. A faster rate
+or a smaller row bound both shorten the scan and are allowed; slowing a scan down is a
+`config.yaml` edit, because that lengthens the worst case the ladder was checked against.
 
 ## Metrics addresses
 

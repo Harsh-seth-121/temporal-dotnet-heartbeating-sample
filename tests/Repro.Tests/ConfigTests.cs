@@ -189,6 +189,64 @@ public class FlagsTests
         Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-simple-activity"));
         Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-simple"));
     }
+
+    [Fact]
+    public void NoFileScanIsASwitchOnEveryBinary()
+    {
+        Assert.True(Flags.Parse(["--no-file-scan"]).Switch("--no-file-scan"));
+        Assert.False(Flags.Parse([]).Switch("--no-file-scan"));
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--no-file-scan=false"]));
+
+        // The three other --no-* switches, none of which may answer for this one. The scan is
+        // the only loop whose runs last minutes and hold an activity slot the whole time, so
+        // "I turned the scan off" being silently false is the expensive version of the mistake
+        // NoSimpleActivityIsASwitchOnEveryBinary describes.
+        Assert.False(Flags.Parse(["--no-simple"]).Switch("--no-file-scan"));
+        Assert.False(Flags.Parse(["--no-simple-activity"]).Switch("--no-file-scan"));
+        Assert.False(Flags.Parse(["--no-local-activity"]).Switch("--no-file-scan"));
+        Assert.False(Flags.Parse(["--no-file-scan"]).Switch("--no-simple"));
+        Assert.False(Flags.Parse(["--no-file-scan"]).Switch("--no-local-activity"));
+
+        // And the starter's OPT-IN switch, which is the near-homograph in this family:
+        // --file-scan runs one scan and --no-file-scan suppresses the loadgen's loop, so they
+        // are not merely different, they are opposites.
+        Assert.False(Flags.Parse(["--file-scan"]).Switch("--no-file-scan"));
+        Assert.False(Flags.Parse(["--no-file-scan"]).Switch("--file-scan"));
+    }
+
+    [Fact]
+    public void FileScanValueFlagsConsumeTheirValue()
+    {
+        // All three are registered in ValueFlags, and registration is the whole test: the sets
+        // are static, so a flag the starter wants but nobody registered is an unknown-flag hard
+        // error in every binary.
+        var flags = Flags.Parse(
+            ["--file", "/corpus/sample-200mb.txt", "--rows-per-second", "3000", "--max-rows=500000"]);
+
+        Assert.Equal("/corpus/sample-200mb.txt", flags.Str("--file"));
+        Assert.Equal(3000, flags.Number("--rows-per-second"));
+        Assert.Equal(500_000, flags.Number("--max-rows"));
+    }
+
+    [Fact]
+    public void FileIsAValueFlagAndFileScanIsASwitch()
+    {
+        // THE DANGEROUS PAIR IN THIS FAMILY. "--file" is a string PREFIX of "--file-scan", and
+        // they are on opposite sides of the value/switch split: if Known or Switches ever
+        // matched by prefix, "--file-scan" would be classified as a value flag and would EAT
+        // THE NEXT ARGV ENTRY. The symptom is not an error -- it is a starter that runs one
+        // scan and silently ignores the flag it swallowed.
+        var flags = Flags.Parse(["--file-scan", "--restart"]);
+
+        Assert.True(flags.Switch("--file-scan"));
+        Assert.True(flags.Switch("--restart"));
+        Assert.Null(flags.Str("--file"));
+
+        // And the reverse: "--file" must still demand a value rather than being treated as the
+        // switch its prefix-mate is.
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--file"]));
+        Assert.Throws<ArgumentException>(() => Flags.Parse(["--file-scan=true"]));
+    }
 }
 
 public class ConfigLoaderTests
@@ -499,5 +557,318 @@ public class ConfigLoaderTests
             path => Assert.Equal(
                 TimeSpan.FromSeconds(45),
                 ConfigLoader.Load(path).LocalActivity.ScheduleToCloseTimeout));
+    }
+
+    /// <summary>Rows in <c>sample-500mb.txt</c>, the largest corpus scripts/gen-samples produces.</summary>
+    /// <remarks>
+    /// THE SAME CONSTANT <c>ConfigLoader.ValidateFileScan</c> derives rule 6's timeout floors
+    /// from, where it is <c>LargestShippedCorpusRows</c> and private. Duplicated here rather
+    /// than read off disk for the reason that method's remarks give: sample_files/ is gitignored
+    /// and generated, so it is absent on a fresh clone and NOTHING in the validation path or in
+    /// this file may stat it. scripts/gen-samples/MANIFEST.txt is the record on the generator's
+    /// side and all three copies are kept in step by hand.
+    /// </remarks>
+    private const long LargestShippedCorpusRows = 8_622_570;
+
+    [Fact]
+    public void LoadsTheCommittedFileScanBlock()
+    {
+        var path = ConfigLoader.Resolve(null);
+        var config = ConfigLoader.Load(path);
+        var fs = config.FileScan;
+
+        Assert.True(fs.Enabled);
+
+        // The queue name, which the second TemporalWorker, the loadgen's fifth driver, the
+        // filescan board's slot panel and the heartbeat board's newly-pinned slot expressions
+        // all have to agree on. Nothing in the .NET build catches a drift between them and the
+        // YAML, so it is pinned here the way localActivity.taskQueue is.
+        Assert.Equal("repro-scan-queue", fs.TaskQueue);
+
+        // The pace, and the two numbers every magnitude in the docs is derived from: 6000
+        // rows/s over the 100 MB corpus's 1,724,588 rows is 4m47s, and 600 rows per batch is a
+        // 100ms batch period, which IS the loop's reaction time to a drain.
+        Assert.Equal(6000L, fs.TargetRowsPerSecond);
+        Assert.Equal(600, fs.BatchRows);
+        Assert.Equal(0L, fs.MaxRows);
+        Assert.Equal(TimeSpan.FromSeconds(10), fs.LogInterval);
+
+        // 65536 is SOH: a byte[] reaches the 85,000-byte LOH threshold at 84,976, so
+        // repro_file_scan_loh_bytes sits at a TRUE zero and fault.slurpWholeFile is the only
+        // thing that can move it. Raise this past ~83 KiB and that panel's NODATA reason in
+        // docs/DASHBOARDS.md becomes wrong.
+        Assert.Equal(65_536, fs.BufferBytes);
+
+        // The ladder. heartbeatTimeout is chosen for the STALENESS it produces, not for
+        // liveness: it sets Core's throttle to min(0.8 x 30s, worker.maxHeartbeatThrottleInterval)
+        // = 24s, and therefore how much work a kill -9 destroys the record of -- 24 x 6000 =
+        // 144,000 rows, the figure docs/HEARTBEATING.md's recipe and the cursor panel both
+        // quote. It is also the value repro_file_scan_staleness' 24_000 boundary is derived
+        // from, which TelemetryTests checks from the other side.
+        Assert.Equal(TimeSpan.FromSeconds(30), fs.HeartbeatTimeout);
+        Assert.Equal(TimeSpan.FromMinutes(30), fs.StartToCloseTimeout);
+        Assert.Equal(TimeSpan.FromHours(1), fs.ScheduleToCloseTimeout);
+
+        // 10, not the usual 5, because each kill -9 spends one and HEARTBEATING.md's recipe
+        // does three cycles. NOT 0, which Temporalio.Common.RetryPolicy reads as UNLIMITED.
+        Assert.Equal(10, fs.Retry.MaximumAttempts);
+        Assert.Equal(TimeSpan.FromSeconds(1), fs.Retry.InitialInterval);
+        Assert.Equal(2.0, fs.Retry.BackoffCoefficient);
+        Assert.Equal(TimeSpan.FromSeconds(10), fs.Retry.MaximumInterval);
+
+        // The loadgen's fifth loop. 6m is just over one 4m47s scan, so a scan is in flight
+        // essentially always without a second one ever being started.
+        Assert.Equal(TimeSpan.FromMinutes(6), fs.Rate);
+        Assert.Equal(0.2, fs.Jitter);
+        Assert.Equal(1, fs.Concurrency);
+
+        // All three pressure knobs ship OFF. They are turned on ONE AT A TIME, and the whole
+        // pressure ladder in docs/WORKFLOWS.md reads a baseline that only exists while every
+        // one of them is false: with any of them on by default, "allocation is not growth" is
+        // measured against a moving floor and attributes nothing.
+        Assert.False(config.Fault.DecodeRowsToStrings);
+        Assert.False(config.Fault.RetainScannedRows);
+        Assert.False(config.Fault.SlurpWholeFile);
+    }
+
+    [Fact]
+    public void ResolvesTheCorpusPathAgainstTheConfigFileNotTheWorkingDirectory()
+    {
+        // ASSERTED AS A BEHAVIOUR, not against the literal in the YAML, because ValidateFileScan
+        // REWRITES fileScan.path in place during Validate -- the BindAddress.Normalize
+        // mutate-during-validate precedent. Asserting the literal "sample_files/sample-100mb.txt"
+        // would pass while the rewrite was deleted.
+        var path = ConfigLoader.Resolve(null);
+        var fs = ConfigLoader.Load(path).FileScan;
+        var configDir = Path.GetDirectoryName(Path.GetFullPath(path))!;
+
+        Assert.True(Path.IsPathRooted(fs.Path), $"fileScan.path must be absolute; got \"{fs.Path}\"");
+        Assert.Equal(Path.Combine(configDir, "sample_files", "sample-100mb.txt"), fs.Path);
+
+        // AND NOT THE CWD-RELATIVE RESOLUTION, which is the difference the rewrite exists to
+        // prevent and the only assertion here that can fail while the one above passes. Under
+        // `dotnet test` the working directory is the test assembly's output directory, five
+        // levels below the repo root, so the two resolutions genuinely differ -- the same way
+        // they differ between docs/HEARTBEATING.md's recipe, which runs the built binary from
+        // the repo root, and demo-up.sh, which runs from elsewhere. A cwd-relative path there
+        // silently means two DIFFERENT files across a resume, and the checkpoint's
+        // corpus-identity check is the only thing that would ever notice.
+        //
+        // MEASURED: replacing the config-dir resolution with the cwd-relative
+        // Path.GetFullPath(fs.Path) fails ONLY this test out of 227. LoadsTheCommittedFileScanBlock
+        // stays green, and so does everything that loads config.yaml, which is exactly why the
+        // path is pinned here as a BEHAVIOUR rather than there as a value.
+        Assert.NotEqual(
+            Path.GetFullPath(Path.Combine("sample_files", "sample-100mb.txt")),
+            fs.Path);
+    }
+
+    // ValidateFileScan, one row per rule. Every row is a config a careless edit produces, and
+    // every one of them would otherwise be accepted by the server.
+    [Theory]
+    // 1. An empty path is not caught here as a missing FILE -- nothing in ValidateFileScan
+    // stats anything -- it reaches the activity, which throws non-retryably, so every scan
+    // dies on attempt 1 with the cause buried under an ActivityFailure chain.
+    [InlineData("fileScan:\n  path: \"\"\n")]
+    // 2. A negative rate makes the pacer's absolute due time run backwards, so every batch is
+    // already overdue and the scan runs flat out while every panel reports the configured rate.
+    [InlineData("fileScan:\n  targetRowsPerSecond: -1\n")]
+    // At zero batchRows the loop completes no rows between checks: the cursor never advances
+    // while the activity keeps heartbeating an unchanged checkpoint, which on the board is
+    // indistinguishable from a stalled disk.
+    [InlineData("fileScan:\n  batchRows: 0\n")]
+    // 0 is the documented sentinel for "the whole file"; a negative bound is not "unlimited".
+    // It also makes the completion aggregate negative, so a CORRECT scan reports
+    // result="mismatch" -- the one failure this case must never produce spuriously.
+    [InlineData("fileScan:\n  maxRows: -1\n")]
+    // At a zero log interval every batch takes a GC.GetGCMemoryInfo() sample (~400 B a call)
+    // and prints a line, so the sampler dominates the allocation counter it publishes and the
+    // memory panels measure the measurement.
+    [InlineData("fileScan:\n  logInterval: 0s\n")]
+    // Below the longest row (76 bytes in the shipped corpora) a full buffer with no LF is
+    // terminal, so a legal file fails; below one page the read syscall rate IS the scan.
+    [InlineData("fileScan:\n  bufferBytes: 1024\n")]
+    // Above the ceiling the buffer is a slurp with extra steps: one LOH allocation held for the
+    // whole attempt, stepping loh_bytes and working_set_bytes exactly the way
+    // fault.slurpWholeFile is supposed to, so neither knob can attribute the step to itself.
+    [InlineData("fileScan:\n  bufferBytes: 33554432\n")]
+    // 3. THE REAL HAZARD. 1,000,000 rows at 6000 rows/s is a 167-second batch, and the batch
+    // boundary is the ONLY place the loop observes ctx.CancellationToken, polls
+    // ctx.WorkerShutdownToken or calls Heartbeat(). Such a batch is not slow, it is DEAF.
+    [InlineData("fileScan:\n  batchRows: 1000000\n")]
+    // 4. And the other end: 1 row at 6000 rows/s is a 167us sleep, which Task.Delay cannot
+    // express and rounds UP to the platform tick, so the process runs SLOWER than the
+    // configured rate while every rows/s panel and the console line report the configured one.
+    [InlineData("fileScan:\n  batchRows: 1\n")]
+    // 5. Below the absolute 5s floor a kill -9 redoes under 4s of rows: visible on a panel,
+    // invisible in a demo, which is the entire point of the case.
+    [InlineData("fileScan:\n  heartbeatTimeout: 1s\n")]
+    // And the 10 x batchPeriod clause, which the row above cannot reach: a 1s batch period
+    // needs a 10s heartbeat timeout, and ten batch periods is the margin that keeps ONE GC
+    // pause from timing the attempt out on a healthy worker -- which reads as "resume is
+    // broken", the worst way for this case to fail.
+    [InlineData("fileScan:\n  batchRows: 6000\n  heartbeatTimeout: 5s\n")]
+    // startToClose must EXCEED heartbeatTimeout, or every attempt dies of start-to-close before
+    // a heartbeat timeout can be observed, the server never reschedules from the checkpoint,
+    // and the resume path this case exists to demonstrate is never taken.
+    [InlineData("fileScan:\n  startToCloseTimeout: 30s\n")]
+    // 6. The derived floor, from the largest SHIPPED corpus when maxRows is 0. 8,622,570 rows
+    // at 6000 rows/s is 23m57s, so 25m does not clear worstScan + 2m: attempt 1 dies of
+    // start-to-close part-way through the corpus on a healthy worker, and every retry then
+    // resumes and dies at the same place until maximumAttempts is gone.
+    [InlineData("fileScan:\n  startToCloseTimeout: 25m\n")]
+    // The schedule rung, whose floor is 23m57s + 9 x 64s + 2m = 35m33s. Below it the WORKFLOW
+    // fails schedule-to-close mid-scan with attempts still on the clock, which also reads as
+    // "resume is broken".
+    [InlineData("fileScan:\n  scheduleToCloseTimeout: 30m\n")]
+    // And the same rule derived from maxRows instead: 20,000,000 rows at 6000 rows/s is 55m33s,
+    // which the shipped 30m start-to-close cannot cover. This row is what proves rule 6 reads
+    // maxRows at all, since every other row here exercises the corpus-constant branch.
+    [InlineData("fileScan:\n  maxRows: 20000000\n")]
+    // 7. 0 means UNLIMITED in Temporalio.Common.RetryPolicy, not "do not retry", and an
+    // unbounded chain of half-hour scans holds an activity slot on the scan queue forever.
+    [InlineData("fileScan:\n  retry:\n    maximumAttempts: 0\n")]
+    // An empty queue name is not a fallback to taskQueue: the server rejects it when the worker
+    // polls, so the worker starts, logs nothing useful and takes no scan task.
+    [InlineData("fileScan:\n  taskQueue: \"\"\n")]
+    // Prefix-disjointness against config.taskQueue, tested in BOTH directions because the check
+    // is symmetric and a one-directional implementation passes one row and fails the other.
+    // These two queues are in the SAME namespace, so a collision puts a second heartbeating
+    // activity type on the seed case's queue, and temporal_worker_task_slots_used carries no
+    // activity_type label to separate them again.
+    [InlineData("fileScan:\n  taskQueue: repro-task-queue-scan\n")]
+    [InlineData("taskQueue: repro-scan\n")]
+    // And against localActivity.taskQueue, also both directions. These two ARE in different
+    // namespaces, so the server permits it and nothing fails at startup; what breaks is every
+    // human-facing lookup that matches on queue name without a namespace, which is all of them.
+    [InlineData("fileScan:\n  taskQueue: repro-la-queue-scan\n")]
+    [InlineData("localActivity:\n  taskQueue: repro-scan\n")]
+    // The loadgen's fourth jittered loop, and the fourth copy of Jitter.cs's contract: its
+    // formula is safe only because rate > 0 and jitter in [0, 1) are enforced here. At zero
+    // rate the driver loop is a busy spin whose every non-skipped iteration starts a
+    // multi-minute scan.
+    [InlineData("fileScan:\n  rate: 0s\n")]
+    [InlineData("fileScan:\n  jitter: 1.0\n")]
+    [InlineData("fileScan:\n  jitter: -0.1\n")]
+    [InlineData("fileScan:\n  concurrency: 0\n")]
+    // 8. The one CROSS-BLOCK refusal, and the only rule here whose failure is not an empty
+    // panel: one retained scan of the largest shipped corpus is about 1.3 GB of live promoted
+    // heap, so two concurrent ones share a workstation-GC heap and the outcome is an
+    // OOM-killed worker, which takes the whole demo's signal down with it.
+    [InlineData("fault:\n  retainScannedRows: true\nfileScan:\n  concurrency: 2\n")]
+    public void RejectsUnusableFileScanConfig(string yaml) =>
+        WithTempConfig(
+            yaml,
+            // The EXACT type, not ThrowsAny: every row above is valid YAML carrying a valid Go
+            // duration, so the only thing that can reject it is Validate. A row that needed
+            // ThrowsAny would be a row that never reached ValidateFileScan at all, which is the
+            // distinction RejectsUnusableSimpleActivityConfig and RejectsGarbage split on.
+            path => Assert.Throws<ArgumentException>(() => ConfigLoader.Load(path)));
+
+    [Fact]
+    public void FileScanBatchPeriodFitsTheDrainReactionBudget()
+    {
+        // NOT a copy of SimpleActivityWorstCaseRunFitsTheDrainBudget, and the difference is the
+        // whole point. That test demands the worst-case RUN finish inside
+        // gracefulShutdownTimeout + 15s; demanding the same of a 4m47s scan would cap the
+        // corpus at about 270,000 rows and destroy the case.
+        //
+        // A long-running activity is not meant to finish inside the drain budget. It
+        // checkpoints on the WorkerShutdownToken EDGE, keeps reading, and unwinds when
+        // ctx.CancellationToken fires gracefulShutdownTimeout later -- so total drain is about
+        // 30s against the 45s budget, the same shape HeartbeatActivities already has, and the
+        // corpus size does not enter into it at all.
+        //
+        // What the budget actually constrains is the loop's REACTION TIME: the batch boundary is
+        // the only place ctx.CancellationToken is observed, ctx.WorkerShutdownToken is polled
+        // and Heartbeat() is called, so a drain arriving just after a batch starts is not seen
+        // for one batch period. The hazard this catches is a batchRows large enough to straddle
+        // the whole grace window -- at which point the activity can observe neither the drain
+        // nor the cancel nor emit a heartbeat inside ANY window, and demo-down.sh SIGKILLs a
+        // worker that never got the chance to checkpoint.
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var fs = config.FileScan;
+
+        var batchPeriod = fs.TargetRowsPerSecond > 0
+            ? TimeSpan.FromSeconds((double)fs.BatchRows / fs.TargetRowsPerSecond)
+            : TimeSpan.Zero;
+
+        // Both terms read from the LIVE config: demo-down.sh derives its DRAIN_TIMEOUT as
+        // worker.gracefulShutdownTimeout + 15, so raising the grace window raises both sides
+        // and this stays a statement about the reaction time rather than about a literal 45s.
+        var drainAndReact = config.Worker.GracefulShutdownTimeout + batchPeriod;
+        var budget = config.Worker.GracefulShutdownTimeout + TimeSpan.FromSeconds(15);
+
+        // At the shipped config this is 30s + 100ms against 45s.
+        Assert.True(
+            drainAndReact < budget,
+            $"fileScan.batchRows ({fs.BatchRows}) over targetRowsPerSecond " +
+            $"({fs.TargetRowsPerSecond}) is a {batchPeriod} batch period, so a drain is observed " +
+            $"at worst {drainAndReact} after it is signalled, against demo-down.sh's {budget} " +
+            "budget. The scan itself is expected to outlive the budget; its REACTION to a drain " +
+            "is not.");
+    }
+
+    [Fact]
+    public void FileScanTimeoutLadderCoversTheLargestShippedCorpus()
+    {
+        // FILESYSTEM-FREE, so it runs on a fresh clone where sample_files/ does not exist --
+        // the same constraint ValidateFileScan is under, and the reason
+        // LargestShippedCorpusRows above is a hand-maintained constant rather than a
+        // FileInfo().Length.
+        //
+        // This is NOT redundant with ValidateFileScan's rule 6, and the gap is exactly the
+        // place a corpus can outgrow its ladder unnoticed: rule 6 derives its floors from
+        // fileScan.maxRows WHEN THAT IS SET, and goes vacuous entirely when
+        // targetRowsPerSecond is 0. So setting maxRows to something small, or unthrottling,
+        // moves rule 6's floors down and the committed config still validates -- while a run
+        // that later passes --max-rows 0 or --file sample-500mb.txt is provisioned for a scan
+        // that no longer fits. This tripwire pins the ladder against the largest corpus the
+        // generator actually produces, whatever maxRows currently says.
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var fs = config.FileScan;
+
+        Assert.True(fs.TargetRowsPerSecond > 0, "an unthrottled scan has no derivable duration");
+
+        // 8,622,570 rows at 6000 rows/s = 23m57s.
+        var worstScan = TimeSpan.FromSeconds((double)LargestShippedCorpusRows / fs.TargetRowsPerSecond);
+        var headroom = TimeSpan.FromMinutes(2);
+
+        Assert.True(
+            fs.StartToCloseTimeout >= worstScan + headroom,
+            $"fileScan.startToCloseTimeout ({fs.StartToCloseTimeout}) must cover one worst-case " +
+            $"scan of the largest shipped corpus ({LargestShippedCorpusRows} rows at " +
+            $"{fs.TargetRowsPerSecond} rows/s = {worstScan}) plus {headroom}");
+
+        // "attempts x startToClose" is the WRONG model and gives an absurd number. Useful work
+        // is ONE worst-case scan however many attempts it takes; each RESUME adds
+        // heartbeatTimeout (the server noticing) + retry.maximumInterval (backoff) + the
+        // throttle (the reading that is redone). The throttle is the real SDK formula,
+        // min(0.8 x heartbeatTimeout, worker.maxHeartbeatThrottleInterval), so that this
+        // number is the number Core actually takes -- 24s at the shipped config, where the 60s
+        // ceiling is not yet binding.
+        var throttle = TimeSpan.FromTicks(Math.Min(
+            (long)(fs.HeartbeatTimeout.Ticks * 0.8),
+            config.Worker.MaxHeartbeatThrottleInterval.Ticks));
+        var perResume = fs.HeartbeatTimeout + fs.Retry.MaximumInterval + throttle;
+
+        // Nine resumes: maximumAttempts - 1 at the shipped 10. HEARTBEATING.md's recipe does
+        // three kill cycles, and a careless extra kill must not fail the workflow terminally.
+        var scheduleFloor = worstScan + (perResume * 9) + headroom;
+
+        Assert.True(
+            fs.ScheduleToCloseTimeout >= scheduleFloor,
+            $"fileScan.scheduleToCloseTimeout ({fs.ScheduleToCloseTimeout}) must cover " +
+            $"{worstScan} of scanning + 9 x {perResume} of resume cost + {headroom} = " +
+            $"{scheduleFloor}");
+
+        // And the rung ordering, which no arithmetic above implies: schedule-to-close bounds
+        // every attempt together, so a value below start-to-close makes the longer rung
+        // unreachable and turns a mid-scan schedule-to-close into the only way any attempt can
+        // ever end.
+        Assert.True(
+            fs.ScheduleToCloseTimeout > fs.StartToCloseTimeout,
+            $"fileScan.scheduleToCloseTimeout ({fs.ScheduleToCloseTimeout}) must exceed " +
+            $"startToCloseTimeout ({fs.StartToCloseTimeout})");
     }
 }

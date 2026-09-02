@@ -1,10 +1,11 @@
 # Dashboards
 
-Grafana on <http://localhost:3000>, no login. Three folders, nine dashboards:
+Grafana on <http://localhost:3000>, no login. Three folders, ten dashboards:
 
-- `sandbox/` holds the boards written for this topology: 5 dashboards, 68 panels, 99
-  targets. Every one has been probed against a live stack, including all 15 on the new
-  local-activity board; see the measurement below.
+- `sandbox/` holds the boards written for this topology: 6 dashboards, 80 panels, 118
+  targets. The probe result below covers 84 of those targets and is **stale**: the
+  file-scan board's 19 have not been probed against a live stack at all, because that
+  needs a generated corpus. See the note on it below.
 - `temporal-server/` and `temporal-sdk/` hold boards imported from
   [temporalio/dashboards](https://github.com/temporalio/dashboards) as-is, for breadth,
   pinned to commit `4994df2` in `grafana/dashboards/UPSTREAM_SHA`.
@@ -25,8 +26,9 @@ in both directions, because an expression ending in `or vector(0)` always return
 and so proves nothing about whether the metric exists.
 
 ```bash
-python3 grafana/probe-dashboards.py             # the four authored boards
+python3 grafana/probe-dashboards.py             # the six authored boards
 python3 grafana/probe-dashboards.py heartbeat   # one board, by file stem
+python3 grafana/probe-dashboards.py filescan    # the newest one
 python3 grafana/probe-dashboards.py --vendored  # the four imported boards
 python3 grafana/probe-dashboards.py --all       # both
 ```
@@ -45,6 +47,12 @@ is written against" stops being an assertion and becomes a measurement.
 Measured against a live stack brought up by `./scripts/demo-up.sh` with the worker and
 loadgen running, shipped `config.yaml` (`failureRate: 0.15`), on a Prometheus started fresh
 for this run:
+
+**STALE. This block reports 84 targets and 57 panels, against the 118 targets and 80 panels
+that ship today, so it was captured before the newest boards existed and the `sandbox-filescan`
+board is not in it at all. Re-run `python3 grafana/probe-dashboards.py` against a live stack
+with the corpus generated, and paste what it prints.** Nothing in it has been adjusted by
+hand to match the new totals, per the rule at the end of this section.
 
 ```
 authored: 66 OK  +  17 FALLBACK  =  83/84 targets render
@@ -87,6 +95,7 @@ To move the `FALLBACK` targets into `OK`, put the stack in the state each needs:
 | simple-activity `outcome="failed"` | `simpleActivity.requireLiveWeather: true` with an unreachable `simpleActivity.baseUrl` |
 | simple-activity `source="synthetic"` | an unreachable `simpleActivity.baseUrl`, e.g. `http://127.0.0.1:1/forecast`, or no egress |
 | simple-activity `outcome="canceled"` | `temporal workflow cancel -w repro-weather-<hex>` mid-sleep. The third loadgen loop sends no cancels, by design, so this one is hand-only |
+| the whole file-scan board (**NODATA**, not FALLBACK) | generate the corpus: `scripts/gen-samples/gen-samples.sh`. Four series on that board stay empty even with it, each for a named reason; see the file-scan section below |
 
 ## Known-empty official panels
 
@@ -179,7 +188,7 @@ executions per completed run**.
 ### Two panels that need reading carefully
 
 **Custom: repro local-activity outcomes /s** does *not* account for every run, unlike the
-equivalent panel for the other three workflows. A run killed by `runTimeout` is closed
+equivalent panel for the other four workflows. A run killed by `runTimeout` is closed
 without a workflow task, so workflow code never resumes and the counter never increments —
 not even as `timed_out`. The **Workflow outcomes, server view** panel beside it is the only
 place those runs appear.
@@ -221,3 +230,105 @@ One consequence outlives the fix: Prometheus keeps the old `le` layout for its f
 retention, so `sum by (le)` merges two incompatible bucket sets and reports **negative**
 per-bucket counts until the old series age out. If a quantile on this metric reads a flat
 value pinned to a boundary, check for that before believing it.
+
+## Repro / File Scan
+
+12 panels, 19 targets. Its own board, and unlike the local-activity board the reason is not
+mechanical: `WorkflowFileScan` stays in the `default` namespace, so this board **opens on
+`default`** and keeps the 30m default window like every other board here. What earned it a
+board is that half its panels are about the worker's memory and GC, which no other case in
+this repo emits any signal on at all.
+
+Two blocks, in the order you ask the questions. Panels 1 to 6 answer "is the scan working,
+and what did a resume redo". Panels 7 to 12 answer "what is this costing the worker".
+
+Start at **Row cursor vs resume floor vs corpus ceiling**. Three untagged gauges, and every
+drop from the cursor to the floor is work the next attempt has to redo, drawn to scale
+against the whole corpus. At the shipped config a `kill -9` drops it about **144,000 rows,
+8.35% of `sample-100mb.txt`**.
+
+**The ceiling is a metric, not a literal.** `repro_file_scan_rows_expected` is the corpus's
+own first line, so nothing on this board hard-codes 1,724,588 and swapping corpora moves the
+line instead of lying about it. A literal would be wrong for three of the four shipped
+corpora, and wrong in a way that RENDERS: a progress percentage stuck at 20%, or one over
+100%.
+
+### Named NODATA and near-zero reasons
+
+`NODATA` is only acceptable with a named reason. Here are all six on this board. Only the
+first one asks you to do something; the other five are the shipped configuration working
+correctly:
+
+| Series | State | Reason |
+|---|---|---|
+| the whole board | **NODATA** | The corpus is gitignored and generated. Run `scripts/gen-samples/gen-samples.sh` |
+| `loh_bytes` | flat at ~0 | The raw-byte read path is LOH-clean by design: one buffer at 65,536 bytes, below the 85,000-byte threshold a `byte[]` reaches at 84,976. It moves with `fault.slurpWholeFile`, or with `fileScan.bufferBytes >= 84976`. **Note when it moves: at the NEXT GC, not in the sample that allocated the array.** `GCMemoryInfo` describes the last collection, so measured, a 100 MB `File.ReadAllBytes` left this gauge reporting the previous collection's value until a forced blocking gen2 collect |
+| `gc_collected{gen="2"}` | **absent, not zero** | Core creates a series on first increment, and no gen2 collection happens in a shipped-config scan. Needs `fault.retainScannedRows` (promotes the retained rows) or `fault.slurpWholeFile` (one LOH object, and the LOH is collected with gen2). The panel carries no `or vector(0)` on purpose: a standalone `sum by (gen)` with one returns a series with NO `gen` label, a blank legend that joins nothing and reads as a real generation |
+| `bytes_allocated` rate | near 0 | The default path allocates nothing per row. Needs `fault.decodeRowsToStrings`. **This is not a broken counter**, and the dominant contributor is not the sampler either: it is the per-batch heartbeat at 117 B, so a 4m47s scan reports about 415 KB in total, which is 1.4 KB/s against 348 KB/s of reading |
+| `staleness` p50/p95 | **NODATA** | Recorded only when an attempt RESUMES from a checkpoint. A clean scan records it never, and the target carries no `or vector(0)`, so it reads NODATA until you run the `kill -9` recipe in [HEARTBEATING.md](HEARTBEATING.md). Same shape as the seed board's staleness target |
+| `verified{result=...}` | empty until a scan finishes | Both values are absent until one completes inside the range. No `or vector(0)`: the fallback would print a confident **0** in the place where the idempotency verdict goes |
+
+### Panels that need reading carefully
+
+**Rows redone this range** uses `max_over_time` per attempt-series, **not** `increase()`,
+and the difference is not cosmetic. `rows_read` is tagged with the attempt, so each
+`(attempt, instance)` series is monotone and never resets within itself: its last sample IS
+its total. `increase()` would extrapolate to both range edges *and* have to cross the gap
+where a killed worker's target is down, which is to say it would approximate in exactly the
+region this panel measures.
+
+It is honest about its accuracy. Exact for an attempt that drains, cancels or fails, because
+that attempt survives to the next scrape. Low **only** for `kill -9`, and then only by the
+rows read since the last scrape: one 1s scrape at 6000 rows/s is 6,000 rows against a
+144,000-row signal, so at most **~4.2% low**. That contrast is the punchline, because
+`kill -9` loses the work AND the record of having done it.
+
+**A negative reading means the scan is still in flight**, not that something is broken: the
+ceiling is the whole corpus and the attempts have not reached it yet. Read it once
+"Idempotency verdict" says `match`, and keep the range around ONE run, because two completed
+scans in range sum two corpora of reads against one corpus of ceiling.
+
+**Memory: managed heap, LOH, working set** uses `max()`, never `sum()`. These are properties
+of a PROCESS, and two workers scrape into this board, so `sum()` would add two unrelated
+heaps and report a number no process has. Last-writer-wins inside one process is not a
+defect here and is why they carry no tags: eight concurrent scans read one heap and write the
+same number, so the only artifact is a higher update rate.
+
+**They nest, they do not partition.** The LOH is inside the managed heap, which is inside the
+working set. That is why these are separate metric NAMES instead of one metric with a
+`region` label. `sum by (region)` is this repo's reflex idiom, and over nested quantities it
+would count the managed heap twice and the LOH three times, producing a total larger than
+the process.
+
+**The working set staying flat through a 500 MB scan is the proof, not a broken gauge.** The
+read path streams one 64 KiB buffer and the file's bytes live in the kernel page cache,
+never entering this process's address space. A reader who expects RSS to climb with bytes
+read will conclude the gauge is wrong; the flat line is the cleanest evidence available that
+the scan is really streaming.
+
+**GC collections /s by generation** shows three lines that **nest rather than partition**.
+`GC.CollectionCount(g)` counts collections of generation g or higher, so one gen2 collection
+increments all three counters and `gen="0"` is always at least `gen="1"`, which is always at
+least `gen="2"`. `sum by (gen)` groups rather than adds, so the three lines are each correct;
+what is wrong is adding them together to get "total collections", which triple-counts every
+gen2. They are published raw because raw is what `dotnet-counters` and every other .NET
+exporter reports.
+
+**GC pause time** is a LEVEL, not a rate. `GCMemoryInfo.PauseTimePercentage` is computed by
+the runtime at the end of a collection over its own window, not over `$__rate_interval`, and
+it does not move between collections. Measured: it read 0.73 immediately after a forced gen2
+collect and still read 0.73 after 500 ms of idle. So on a scan that triggers no collection it
+reports the WORKER'S STARTUP GCs forever. Only believe movement in it when the collections
+panel is moving too.
+
+### What this board changed on the Heartbeating board
+
+The two activity-slot expressions on the Heartbeating board now pin
+`task_queue="repro-task-queue"`. Their descriptions claimed this repo has exactly one
+activity type and it always heartbeats, which `FetchWeather` already falsified and
+`ScanFile` would have made worse: `temporal_worker_task_slots_used` carries `worker_type`
+but no `activity_type`, so a second heartbeating activity type on the shared queue would
+have corrupted that panel with nothing to filter it back out. That is a pre-existing defect
+this case was the trigger to fix, and it is the reason `WorkflowFileScan` has a queue of
+its own at all. **Activity slot saturation on repro-scan-queue** is the other half of the
+same pin.

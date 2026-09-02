@@ -22,7 +22,7 @@ using var loggerFactory = LoggerFactory.Create(b => b
     .SetMinimumLevel(LogLevel.Information));
 var log = loggerFactory.CreateLogger("replay");
 
-// All FOUR types, because the replayer FAILS on a history whose workflow type it was not
+// All FIVE types, because the replayer FAILS on a history whose workflow type it was not
 // given. No activity registration: the replayer does not execute them.
 //
 // The failure is LOUD, which is worth knowing because the previous wording here claimed the
@@ -47,7 +47,19 @@ var options = new WorkflowReplayerOptions()
     //
     // Note the namespace is irrelevant here. The replayer never connects; it reads a history
     // JSON off disk, so a fixture from repro-local-activity replays with no second client.
-    .AddWorkflow<WorkflowLocalActivity>();
+    .AddWorkflow<WorkflowLocalActivity>()
+    // WorkflowFileScan, whose omission is the easiest one in this list to miss. It fails the way
+    // the paragraph above describes -- InvalidWorkflowOperationException, ApplicationFailureInfo
+    // type NotFoundError, no TMPRL1100 -- while every other fixture in the same directory still
+    // reports "replay OK", so a run of the whole history/ directory reads as four passes and one
+    // puzzling failure rather than as a missing registration.
+    //
+    // Its histories are the plainest in the set: one ScheduleActivityTask and one long-running
+    // attempt, possibly several of them after a kill -9. The interesting part of this case lives
+    // in the ACTIVITY's heartbeat details, which a replay never executes and therefore never
+    // checks -- so a green replay here proves the workflow's own determinism and nothing at all
+    // about resume idempotence. That is what repro_file_scan_verified is for.
+    .AddWorkflow<WorkflowFileScan>();
 options.LoggerFactory = loggerFactory;
 
 // MEASURED: the .NET replayer emits NOTHING through this runtime.

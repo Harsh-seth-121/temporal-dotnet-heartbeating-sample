@@ -5,12 +5,20 @@ temporal workflow show --workflow-id repro-workflow --output json > history/hear
 dotnet run --project src/Repro.Replay -- --history history/heartbeat-job.json
 
 # All FIVE committed fixtures at once. `history/` holds heartbeat-job.json,
-# simple-no-activity.json and workflow-simple-activity.json. The second carries
+# simple-no-activity.json, workflow-simple-activity.json, workflow-local-activity.json and
+# workflow-local-activity-wft-timeout.json. The second carries
 # WORKFLOW_EXECUTION_UPDATE_ACCEPTED and _UPDATE_COMPLETED events, and MEASURED,
 # HistoryJsonFixer handles those enum shorthands from `workflow show --output json` with
 # no help.
 dotnet run --project src/Repro.Replay -- --history history/
 ```
+
+**Five fixtures, five registered workflow types, and they are not the same five.**
+`Repro.Replay` registers
+`HeartbeatWorkflow`, `SimpleNoActivity`, `WorkflowSimpleActivity`,
+`WorkflowLocalActivity` and `WorkflowFileScan`; nothing has been captured for the last of
+those yet, and the section below has the command. Five is the fixture count and it does not
+change until you capture one.
 
 `Repro.Replay` must be given every workflow type it might meet. It FAILS on a history
 whose type it was not registered with. The failure is loud and specific, not a disguised
@@ -130,3 +138,32 @@ description stops being prose.
 Note the replayer never connects, so a fixture captured from the `repro-local-activity`
 namespace needs no second client and no namespace flag. Namespace is a client property; a
 history JSON on disk has already forgotten it mattered.
+
+## Capturing the file-scan fixture, which does not exist yet
+
+`WorkflowFileScan` is registered in `Repro.Replay` and has **no committed fixture**. Capture
+one after a run that resumed at least once, so it carries the resume path rather than one
+clean attempt:
+
+```bash
+# needs the corpus: scripts/gen-samples/gen-samples.sh
+dotnet run --project src/Repro.Starter -- --file-scan
+# then kill -9 the worker mid-scan, per docs/HEARTBEATING.md, and let it finish
+
+temporal workflow show --workflow-id repro-file-scan --output json \
+  > history/workflow-file-scan.json
+
+dotnet run --project src/Repro.Replay -- --history history/
+```
+
+Know what a green result there does and does not prove. These histories are the plainest in
+the set: one `ScheduleActivityTask` and one long-running attempt, possibly several of them
+after a `kill -9`. Everything the case is actually about lives in the ACTIVITY's heartbeat
+details, and a replay never executes activities, so it checks the workflow's own determinism
+and says **nothing at all** about resume idempotence.
+`repro_file_scan_verified{result="match"}` is what checks that.
+
+Watch for `InvalidWorkflowOperationException` / `NotFoundError` rather than a nondeterminism
+error if it fails. That means the type was not registered, and the other five fixtures still
+report `replay OK`, so it reads as one puzzling failure rather than as a missing
+registration. [GOTCHAS.md](GOTCHAS.md) has it as an entry.
