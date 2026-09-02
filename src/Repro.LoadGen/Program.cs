@@ -194,6 +194,83 @@ else
         "this process makes no connection to the local-activity namespace");
 }
 
+// FIFTH LOOP, and like the fourth it brings a CLIENT and a WORKER of its own -- but for a
+// weaker reason, and the difference is worth knowing. localActivity needs its own client
+// because a namespace is a client property. fileScan.taskQueue is only a QUEUE, in the namespace
+// this process is already connected to, so all a second client buys here is an IDENTITY:
+// identity is role@machine:pid, and a second client sharing role "loadgen" would be
+// byte-identical to the first, so `temporal workflow describe` could not tell you which of them
+// holds a run. Hence "loadgen-scan", and no namespace argument.
+//
+// Constructed HERE, after the readiness banner, for the demo-lib.sh:70 reason the fourth loop
+// records at length: ConnectAsync can throw, and anything that can throw before that literal is
+// logged turns a working start into a demo-up.sh timeout.
+//
+// Gated on the loop being enabled, so --no-file-scan leaves this process with no scan client,
+// no scan worker and no dependency on the corpus at all.
+var fileScanOn = config.FileScan.Enabled && !flags.Switch("--no-file-scan");
+TemporalWorker? scanWorker = null;
+var scanWorkerTask = Task.CompletedTask;
+var fileScanTask = Task.CompletedTask;
+
+if (fileScanOn)
+{
+    var scanClient = await ClientFactory.ConnectAsync(
+        config, runtime, "loadgen-scan", loggerFactory);
+
+    var scanOptions = new TemporalWorkerOptions(config.FileScan.TaskQueue)
+        .AddWorkflow<WorkflowFileScan>()
+        // Its OWN AddAllActivities call: the method takes exactly ONE instance. config.Worker is
+        // not decoration -- the activity's drain line reports how long it has before
+        // ctx.CancellationToken fires, which is worker.gracefulShutdownTimeout, and without it
+        // that line names the SDK default instead of the window this process is using.
+        .AddAllActivities(new FileScanActivities(config.Fault, config.Worker));
+
+    // The same knobs Repro.Worker sets on its scan worker, by hand in both places rather than
+    // shared through Repro.Core the way LocalActivityWorkerOptions is -- these two differ in the
+    // client they bind, so there is no single For(config) to call. If a third copy appears,
+    // extract it then, and read LocalActivityWorkerOptions first for what drift costs.
+    //
+    // MaxHeartbeatThrottleInterval is load-bearing rather than tidy: it is the ceiling in
+    // min(0.8 x heartbeatTimeout, this), which IS the heartbeat throttle, which is exactly how
+    // many rows a kill -9 destroys the record of.
+    scanOptions.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
+    scanOptions.MaxHeartbeatThrottleInterval = config.Worker.MaxHeartbeatThrottleInterval;
+    scanOptions.DefaultHeartbeatThrottleInterval = config.Worker.DefaultHeartbeatThrottleInterval;
+    if (config.Worker.MaxCachedWorkflows > 0)
+    {
+        scanOptions.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
+    }
+
+    if (config.Worker.MaxConcurrentActivities > 0)
+    {
+        scanOptions.MaxConcurrentActivities = config.Worker.MaxConcurrentActivities;
+    }
+
+    if (config.Worker.MaxConcurrentWorkflowTasks > 0)
+    {
+        scanOptions.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
+    }
+
+    scanWorker = new TemporalWorker(scanClient, scanOptions);
+    scanWorkerTask = scanWorker.ExecuteAsync(shutdown.Token);
+
+    // The corpus check lives in the DRIVER, not here: it is one File.Exists at construction and
+    // the loop skips itself with a named banner if the corpus is absent, which is what keeps
+    // demo-up.sh green on a fresh clone where sample_files/ has never been generated. The worker
+    // above is started either way, so a corpus generated later needs no restart.
+    var fileScanDriver = new FileScanDriver(
+        scanClient, config.FileScan, loggerFactory.CreateLogger("file-scan"));
+
+    fileScanTask = fileScanDriver.RunAsync(shutdown.Token);
+}
+else
+{
+    log.LogInformation(
+        "file-scan: OFF (fileScan.enabled is false, or --no-file-scan was passed); " +
+        "this process neither polls the scan queue nor touches the corpus");
+}
+
 var started = 0;
 var input = new JobInput(
     steps,
@@ -288,13 +365,29 @@ catch (Exception e)
 
 try
 {
-    // Task.WhenAll, NOT one await then the other, and the difference is a SIGKILL. Each worker
+    await fileScanTask;
+}
+catch (Exception e)
+{
+    log.LogWarning("file-scan driver ended in error: {Message}", e.Message);
+}
+
+try
+{
+    // Task.WhenAll, NOT one await then the next, and the difference is a SIGKILL. Each worker
     // waits for its own executing activities on shutdown; awaited in sequence the second would
-    // not start draining until the first had finished, serialising two gracefulShutdownTimeout
-    // windows into 60s against demo-down.sh's budget of gracefulShutdownTimeout + 15 = 45s.
-    // Concurrently the two windows overlap. laWorkerTask is Task.CompletedTask when the
-    // local-activity loop is off, so this is unchanged for --no-local-activity.
-    await Task.WhenAll(workerTask, laWorkerTask);
+    // not start draining until the first had finished, serialising THREE gracefulShutdownTimeout
+    // windows into 90s against demo-down.sh's budget of gracefulShutdownTimeout + 15 = 45s.
+    // Concurrently the three windows overlap. laWorkerTask and scanWorkerTask are
+    // Task.CompletedTask when their loops are off, so this is unchanged for
+    // --no-local-activity and --no-file-scan.
+    //
+    // The scan worker is the one that makes this bite: its activity is not meant to finish
+    // inside the grace window. It checkpoints on the WorkerShutdownToken EDGE, keeps reading,
+    // and unwinds only when ctx.CancellationToken fires at the END of that window, so it spends
+    // the full gracefulShutdownTimeout on every teardown that lands mid-scan -- which at a 4m47s
+    // scan on a 6m rate is most of them.
+    await Task.WhenAll(workerTask, laWorkerTask, scanWorkerTask);
 }
 catch (OperationCanceledException)
 {
@@ -304,6 +397,7 @@ catch (OperationCanceledException)
 finally
 {
     laWorker?.Dispose();
+    scanWorker?.Dispose();
 }
 
 return 0;

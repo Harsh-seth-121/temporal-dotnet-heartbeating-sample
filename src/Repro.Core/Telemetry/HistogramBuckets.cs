@@ -67,8 +67,14 @@ public static class HistogramBuckets
 
         // Core default tops out at 60s. The seed activity is configured
         // (job.steps x job.stepDuration) to run LONGER than that on purpose.
+        // EXTENDED past 600_000 for WorkflowFileScan. At fileScan.targetRowsPerSecond 6000
+        // the 350 and 500 MB corpora scan for 16m46s and 23m57s, which landed every one of
+        // those attempts in +Inf and pinned the p95 on both the worker board and the
+        // filescan board at a plausible constant forever. Purely additive: adding
+        // boundaries above the old top changes no existing case's resolution.
         ("activity_execution_latency", false,
-            [10, 50, 100, 250, 500, 1000, 5000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000]),
+            [10, 50, 100, 250, 500, 1000, 5000, 10_000, 30_000, 60_000, 120_000, 300_000,
+             600_000, 1_200_000, 1_800_000]),
 
         // Unmatched by Core's own latency-bucket table, so it gets the catch-all.
         ("activity_succeed_endtoend_latency", false,
@@ -194,6 +200,31 @@ public static class HistogramBuckets
         //     -> [1,10,20,50,100,200,500,1000]: 1ms floor, good spread already
         //   workflow_endtoend_latency
         //     -> already spans 100ms..24h
+
+        // WorkflowFileScan. Custom=true: the name is final, no temporal_ prefix.
+        //
+        // The sub-60s boundaries are NOT padding. A corpus-identity mismatch fails in
+        // MILLISECONDS, and without them those runs pile into the same bucket as a real
+        // 4m47s scan -- the below-the-floor failure the local-activity row documents.
+        // 300_000 straddles the shipped 100 MB scan; 900_000 and 1_800_000 cover the 350
+        // and 500 MB corpora.
+        ("repro_file_scan_latency", true,
+            [1000, 5000, 10_000, 30_000, 60_000, 120_000, 300_000, 600_000, 900_000,
+             1_800_000, 3_600_000]),
+
+        // The 24_000 boundary IS THE POINT: it is 0.8 x fileScan.heartbeatTimeout, i.e.
+        // Core's throttle, so the bound a checkpoint's staleness cannot beat shows up as a
+        // visible shoulder -- the role 4s and 8s play on repro_heartbeat_staleness. Samples
+        // run past it to roughly 64s: throttle plus the server noticing plus retry backoff.
+        //
+        // SUBSTRING CHECK, since Core matches scrape overrides with Contains() in
+        // nondeterministic order: these two diverge from each other at index 16 (l vs s) and
+        // from every other key in this table at index 6. Neither contains the other, in
+        // either direction.
+        ("repro_file_scan_staleness", true,
+            [100, 500, 1000, 5000, 10_000, 16_000, 20_000, 24_000, 30_000, 45_000, 60_000,
+             90_000]),
+
     ];
 
     /// <summary>Keyed the way BOTH paths present the name: prefixed unless custom.</summary>

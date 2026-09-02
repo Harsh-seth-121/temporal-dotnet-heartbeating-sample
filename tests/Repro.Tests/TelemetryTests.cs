@@ -59,9 +59,16 @@ public class HistogramBucketsTests
     [InlineData(MetricNames.SimpleActivityLatency)]
     [InlineData(MetricNames.HeartbeatStaleness)]
     [InlineData(MetricNames.LocalActivityLatency)]
+    // The file-scan pair, and the one where the catch-all is furthest from the truth: a scan
+    // of the shipped 100 MB corpus runs 4m47s and the 500 MB corpus 23m57s, both of which land
+    // in DefaultMs' +Inf bucket, so p95 would read a plausible 10s constant forever. Staleness
+    // is the same failure at a smaller scale -- its samples cluster at the 24s throttle, still
+    // past the catch-all's top boundary.
+    [InlineData(MetricNames.FileScanLatency)]
+    [InlineData(MetricNames.FileScanStaleness)]
     public void CustomHistogramsHaveTheirOwnRow(string name) =>
         // A missing row does not read "no data", it reads a plausible CONSTANT out of
-        // Core's catch-all, which tops out at 10s while all four of these run longer.
+        // Core's catch-all, which tops out at 10s while every one of these runs longer.
         //
         // HeartbeatStaleness was the missing fourth for one commit, and the gap was not
         // theoretical: MEASURED, flipping its row's Custom flag to false left the whole
@@ -143,6 +150,61 @@ public class HistogramBucketsTests
         // repo actually ships rather than against a literal, so lowering one and not the other
         // is a test failure instead of a silently unreadable panel.
         Assert.Contains(HeartbeatTimeoutMs, buckets);
+    }
+
+    [Fact]
+    public void FileScanStalenessBucketsResolveTheThrottleShoulderAndTheFastFailures()
+    {
+        // TWO failures at opposite ends of the row, in the shape of the local-activity test
+        // above, and neither reads "no data".
+        //
+        // AT THE THROTTLE. The 24_000 boundary is not a round number, it is Core's heartbeat
+        // throttle: min(0.8 x fileScan.heartbeatTimeout, worker.maxHeartbeatThrottleInterval).
+        // That is the bound a checkpoint's staleness cannot beat, so it is where the
+        // distribution has an edge, and a histogram with no boundary there cannot resolve the
+        // one feature the row exists to show. Derived from the LIVE config for the same reason
+        // the local-activity row reads its floor out of config.yaml: raising heartbeatTimeout
+        // without moving this boundary is then a test failure rather than a shoulder that
+        // quietly slides into the middle of a bucket.
+        //
+        // MEASURED: moving the row's 24_000 boundary to 25_000 fails only this test.
+        // NoScrapeKeyIsASubstringOfAnother, EveryCustomHistogramRowIsReachableUnderItsOwnName
+        // and CustomHistogramsHaveTheirOwnRow all stayed green, because none of the three looks
+        // at a boundary VALUE -- they check that the row EXISTS and is reachable, which a row
+        // full of wrong numbers satisfies completely.
+        var config = ConfigLoader.Load(ConfigLoader.Resolve(null));
+        var throttleMs = Math.Min(
+            config.FileScan.HeartbeatTimeout.TotalMilliseconds * 0.8,
+            config.Worker.MaxHeartbeatThrottleInterval.TotalMilliseconds);
+
+        var buckets = HistogramBuckets.ForInstrument(MetricNames.FileScanStaleness);
+
+        Assert.Contains(throttleMs, buckets);
+
+        // The shoulder is only a shoulder if the approach to it is resolvable. With boundaries
+        // only AT and above the throttle, every sub-throttle sample -- which is all of them,
+        // since the throttle is an upper bound on how stale a checkpoint can be -- shares one
+        // bucket and the panel is a single step.
+        Assert.True(
+            buckets.Count(b => b < throttleMs) >= 4,
+            $"repro_file_scan_staleness needs boundaries BELOW the {throttleMs}ms throttle or " +
+            $"every sample shares one bucket; got {string.Join(", ", buckets)}");
+
+        // ABOVE THE THROTTLE. Samples run past it to roughly 64s -- throttle, plus the server
+        // noticing the heartbeat timeout, plus retry backoff -- so a row that stopped at the
+        // throttle would put every real resume in +Inf and read as a constant.
+        Assert.Contains(buckets, b => b >= 64_000);
+
+        // AND THE MILLISECOND END. A corpus-identity or schema-drift refusal happens before a
+        // single byte is read, so its staleness sample is whatever the checkpoint's age was at
+        // a resume that lasted milliseconds. Without sub-second boundaries those pile into the
+        // same bucket as a real 24s checkpoint, which is the below-the-floor failure the
+        // local-activity row documents, arrived at from the other direction.
+        Assert.True(
+            buckets.Count(b => b < 1000) >= 2,
+            $"repro_file_scan_staleness needs sub-second boundaries so a resume that is refused " +
+            $"in milliseconds is distinguishable from one at the throttle; got " +
+            $"{string.Join(", ", buckets)}");
     }
 
     [Fact]

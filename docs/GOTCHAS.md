@@ -56,8 +56,8 @@ p95 to a flat ~47 ms forever. Same for schedule-to-start (flat ~99 ms) and for a
 execution latency, whose top default bucket is 60 s while the seed activity
 deliberately runs longer.
 
-`HistogramBuckets.cs` overrides ten metrics for this reason, six SDK ones plus the
-four `repro_*` histograms. Two traps in that mechanism: Core matches override keys by
+`HistogramBuckets.cs` overrides fourteen metrics for this reason, seven SDK ones plus the
+seven `repro_*` histograms. Two traps in that mechanism: Core matches override keys by
 **substring** against the already-prefixed name and iterates them in nondeterministic
 order, so keys must be disjoint and prefixed. And changing `MetricPrefix` breaks Core's
 own default-bucket lookup, which strips a hard-coded `"temporal_"`.
@@ -188,12 +188,154 @@ namespace — not by task queue, not by workflow type. Server default is **30m**
 (`common/dynamicconfig/constants.go`, v1.31.2).
 
 That is the entire reason `WorkflowLocalActivity` has a namespace of its own. Lowering the
-setting namespace-wide would have been worse than useless here: the other three workflows use
+setting namespace-wide would have been worse than useless here: the other four workflows use
 no local activities, so they would never visibly react, and the override would sit in the
 config file looking scoped when it was not.
 
 Temporal's own integration suite overrides it to 5s, so lowering it is supported rather than
 a hack.
+
+## `StreamReader` cannot tell you the logical byte offset it has reached
+
+There is no public API for it, and both obvious substitutes are wrong. `BaseStream.Position`
+is past the last line you were handed, because the reader buffers ahead. Summing
+`line.Length + 1` counts **chars, not bytes**, and drifts one byte per row on CRLF.
+
+Neither substitute throws. The drift is silent, it accumulates for the whole scan, and what
+you get is a resume that lands mid-row several hundred thousand rows into the corpus, at
+which point the row parser reports a malformed corpus for a file that is perfectly well
+formed. That is why `FileScanActivities` reads into one `byte[]` and finds its own line
+breaks with `IndexOf((byte)'\n')`: the cursor is then a byte count that nothing else can
+move.
+
+The same choice is what makes the allocation half of that case legible, because a raw-byte
+loop produces no `string` and no `char[]` per row.
+
+## A checkpoint cannot measure the work a crash made you redo
+
+The field to add is a cumulative `RowsRead`, and it carries no information at all. It would
+have to be `A_k = A_(k-1) + (C_k - C_(k-1))`, where `C_k` is the checkpoint row attempt `k`
+resumed from, and that **telescopes to `A_k = C_k` identically**. So it equals the row
+cursor the checkpoint already carries.
+
+The reason is structural rather than arithmetic: the reads that get lost are exactly the
+reads that were never checkpointed. A checkpoint knows nothing about them by construction.
+
+So redone work has to come from somewhere the crash cannot rewind, which means a
+per-attempt counter emitted from activity code (`repro_file_scan_rows_read`, tagged
+`attempt`) differenced against the expected total on the board. It is a derived panel, not
+a metric, and `MetricNames.cs` says so at the definition so nobody adds one.
+
+## Tagging a gauge with `attempt` hides the drop it was added to show
+
+The obvious symmetry is to tag the cursor gauge the way the cost counter is tagged. It
+destroys the panel, and it does it quietly.
+
+When attempt 1 is killed, its tagged series does not vanish. Prometheus keeps serving that
+series' **last sample for the full 5-minute staleness window**, so `max()` across attempts
+holds the dead attempt's peak flat while attempt 2 climbs from the resume floor underneath
+it. The drop never renders, on a panel whose entire job is to draw it.
+
+`repro_file_scan_row_cursor` is therefore deliberately untagged: one last-writer-wins series,
+and the drop is immediate. The counter beside it keeps the tag, because on a monotone
+per-attempt counter staleness is harmless and the tag is what makes `max_over_time` per
+series correct.
+
+The general rule this sits on: process-wide and all writers agree gives an untagged gauge;
+process-wide and cumulative gives a counter with a watermark; per-activity gives a counter.
+
+## `GC.CollectionCount(g)` counts generation g OR HIGHER
+
+The three counters **nest**, they do not partition, and the API name says nothing about it.
+Measured: from 0/0/0, two forced gen0 collects then one gen1 then one gen2 read **4/2/1**,
+not 2/1/1. A single gen2 collection increments all three.
+
+So `gen="0"` is always at least `gen="1"`, which is always at least `gen="2"`, and each line
+reads "collections of this generation or higher". `sum by (gen)` groups rather than adds, so
+a per-generation panel renders three correct lines. **What is wrong is adding those three
+lines together to get "total collections", which triple-counts every gen2.**
+
+`repro_file_scan_gc_collected` publishes them raw anyway, and that is deliberate: raw is
+what `GC.CollectionCount` means, what `dotnet-counters` prints and what every other .NET
+exporter publishes. Differencing them into an exclusive partition here would produce a gen0
+line that agrees with no other tool on the machine.
+
+## `GCMemoryInfo` describes the LAST collection, not now
+
+Every value read off `GC.GetGCMemoryInfo()` is a snapshot taken at the end of a GC. Two of
+them are published as gauges and both are read wrong by default:
+
+- **`GenerationInfo[3].SizeAfterBytes`**, the LOH. Measured: a 100 MB `File.ReadAllBytes`
+  left `repro_file_scan_loh_bytes` reporting the **previous** collection's value until a
+  forced blocking gen2 collect. So `fault.slurpWholeFile` steps that gauge **at the next
+  GC**, not in the sample that allocated the array.
+- **`PauseTimePercentage`**. It is not a rolling window. Measured: 0.73 immediately after a
+  forced gen2 collect, and still 0.73 after 500 ms of idle with no GC in between. On a scan
+  that triggers no collection at all it reports the **worker's startup GCs forever**. Only
+  believe movement in it when the collection counters are moving too.
+
+`GC.GetTotalMemory(false)` and `Environment.WorkingSet` are the live ones. Never
+`GetTotalMemory(true)`, which forces a blocking collection, so the sampler would flatten
+the sawtooth it exists to draw and add its own pause to the pause gauge.
+
+And note what reads **0**: `TotalCommittedBytes` and every `GenerationInfo` entry are zero
+before the process's first GC. `Environment.WorkingSet` is fine on macOS arm64 despite
+having historically returned 0 on some Unix targets (measured 37.2 MiB, 1.3 us per call,
+zero allocation), so there is no fallback path, and the obvious fallback would have been the
+broken one.
+
+## A near-zero allocation counter is the read path working, not a dead metric
+
+`repro_file_scan_bytes_allocated` reads about **1.4 KB/s** against 348 KB/s of reading in
+the shipped configuration, and the first conclusion a reader reaches is that the panel is
+broken.
+
+It is not. The raw-byte loop allocates nothing per row: no `string`, no `char[]`, one
+65,536-byte buffer for the whole attempt. What is left is fixed overhead, and the dominant
+part of it is **not** the pressure sampler either, which is the guess the code's own
+comments used to make. Measured on the full 100 MB corpus: the per-batch heartbeat is 117 B
+(one `FileScanCheckpoint` plus the `params object[]` carrying it into `Heartbeat()`), so a
+4m47s scan allocates about **415 KB in total**: roughly 336 KB of checkpoints, 71 KB of
+fixed read-buffer and `FileStream` cost, and 8.4 KB of pressure samples (29 x 288 B). That
+is 0.4% of the bytes read.
+
+A provable zero floor is the point rather than an accident: every movement on that panel is
+then attributable to a fault knob you turned on, instead of read as a step change against a
+non-zero baseline. Turn on `fault.decodeRowsToStrings` and the same counter reports **2.41x**
+bytes read.
+
+## An unregistered workflow type in the replayer is not a nondeterminism error
+
+`Repro.Replay` must be given every workflow type it might meet, and the failure when it is
+not looks nothing like the failure you are hunting. It arrives as
+`InvalidWorkflowOperationException` with `ApplicationFailureInfo` type **`NotFoundError`**,
+naming the missing type and listing the registered ones. There is no
+`WorkflowNondeterminismException` and no `TMPRL1100`.
+
+What makes it easy to miss is that **every other fixture in the same directory still reports
+`replay OK`**, so a run of `--history history/` reads as four passes and one puzzling
+failure rather than as a missing registration. `WorkflowFileScan` was the most recent
+addition to that list and the easiest one to have forgotten. Both messages are side by side
+in [REPLAY.md](REPLAY.md).
+
+## `--rows-per-second` can only make a scan SHORTER, never slower
+
+The starter's CLI overrides land **after** `ConfigLoader.Validate`, so they cannot inherit
+the timeout ladder's floors and have to repeat the rules instead. `--rows-per-second` is
+therefore accepted only at `0` (the unthrottled sentinel) or at **at least**
+`fileScan.targetRowsPerSecond`, and `--max-rows` only inside `[1, fileScan.maxRows]` when
+that is bounded.
+
+A faster rate or a smaller row bound both shorten the worst case the ladder was checked
+against and are allowed. Slowing a scan down lengthens it, which would put
+`startToCloseTimeout` and `scheduleToCloseTimeout` below their derived floors with nothing
+re-deriving them, so that is a `config.yaml` edit and the error message says so.
+
+The ladder constants are private to `ConfigLoader`. Copying them into the starter so it
+could re-derive the floors itself would have created a drift pair, which is the failure
+`LocalActivityWorkerOptions` exists in this repo to prevent: two processes building the
+same options separately, and the two copies having already drifted by the time anyone
+looked.
 
 ## `.editorconfig` does NOT scope anything to `.workflow.cs`
 

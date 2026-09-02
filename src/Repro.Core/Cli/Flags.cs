@@ -7,7 +7,7 @@ namespace Repro.Core.Cli;
 /// Hand-rolled arg parser. Supports both <c>--flag value</c> and <c>--flag=value</c>.
 /// </summary>
 /// <remarks>
-/// Thirteen flags do not justify System.CommandLine. Note also that samples-dotnet and
+/// Nineteen flags do not justify System.CommandLine. Note also that samples-dotnet and
 /// omes still pin System.CommandLine 2.0.0-beta4, whose API differs substantially
 /// from the 2.0.11 stable release: copying their AddOption/SetHandler code into a
 /// net10 repo does not compile. Fifty lines here, zero surprises.
@@ -39,14 +39,15 @@ public sealed class Flags
     private static readonly HashSet<string> Switches = new(StringComparer.Ordinal)
     {
         "--restart", "--no-cancel-on-interrupt", "--delete-push-group", "--no-simple",
-        "--no-simple-activity", "--no-local-activity",
+        "--no-simple-activity", "--no-local-activity", "--no-file-scan",
+        "--file-scan",
     };
 
     /// <summary>Flags that CONSUME the next argv entry. Register a value flag here only.</summary>
     private static readonly HashSet<string> ValueFlags = new(StringComparer.Ordinal)
     {
         "--config", "--rate", "--concurrency", "--steps", "--step-duration",
-        "--history", "--metrics",
+        "--history", "--metrics", "--file", "--rows-per-second", "--max-rows",
     };
 
     /// <summary>Every recognised flag. Derived, never hand-maintained.</summary>

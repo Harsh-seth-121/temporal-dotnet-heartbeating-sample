@@ -68,6 +68,9 @@ public sealed class ReproConfig
     /// </remarks>
     public LocalActivityConfig LocalActivity { get; set; } = new();
 
+    /// <summary>Everything about WorkflowFileScan: the corpus, the pace, and its own queue.</summary>
+    public FileScanConfig FileScan { get; set; } = new();
+
     public FaultConfig Fault { get; set; } = new();
 }
 
@@ -670,4 +673,219 @@ public sealed class FaultConfig
     /// returns. THIS WEDGES YOUR TERMINAL FOR THE REST OF THE BATCH. That is the demo.
     /// </summary>
     public bool IgnoreCancellation { get; set; }
+    /// <summary>
+    /// Decode every scanned row to a string and throw it away. Proves ALLOCATION IS
+    /// NOT GROWTH: about 140 bytes of Gen0 garbage per row, so allocated lands near
+    /// 2.4x bytes read, the gen0 rate climbs, and the live heap floor stays flat.
+    /// </summary>
+    /// <remarks>
+    /// The default scan path reads raw bytes and allocates essentially nothing, which
+    /// is what makes this knob legible: the baseline is provably zero rather than a
+    /// floor you have to read the step change against.
+    /// </remarks>
+    public bool DecodeRowsToStrings { get; set; }
+
+    /// <summary>
+    /// Same decode, but every string is retained in a List for the life of the attempt.
+    /// Proves RETENTION grows the heap: the same garbage becomes promoted live Gen2, the
+    /// managed-heap gauge becomes a staircase with no falling edge, and rows/s decays as
+    /// GC time rises.
+    /// </summary>
+    /// <remarks>
+    /// The list is PRE-SIZED from the corpus header. An un-sized List grown to 8.6M
+    /// elements doubles into a 128 MiB backing array while the previous 64 MiB one is
+    /// still garbage, which moves the LOH panel for a second, unrelated reason and
+    /// destroys the attribution this knob exists for.
+    /// <para>
+    /// ConfigLoader REFUSES this together with fileScan.concurrency > 1: eight
+    /// concurrent retained scans of the 500 MB corpus is about 10 GB, and the failure
+    /// is an OOM-killed worker rather than an empty panel.
+    /// </para>
+    /// </remarks>
+    public bool RetainScannedRows { get; set; }
+
+    /// <summary>
+    /// File.ReadAllBytes the whole corpus before scanning. Proves a large read is ONE
+    /// LOH OBJECT, and the LOH is not compacted by default, so committed bytes and RSS
+    /// step up in a single sample and do not come back when the array dies.
+    /// </summary>
+    /// <remarks>
+    /// It does NOT produce a heartbeat timeout: 500 MB off page cache or NVMe is well
+    /// under a second. For that you want <see cref="StallPastHeartbeatTimeout"/>.
+    /// ReadAllBytes is also SYNCHRONOUS, so it holds an activity-task thread for its
+    /// whole duration, which is what moves the thread-pool panel.
+    /// </remarks>
+    public bool SlurpWholeFile { get; set; }
+}
+
+/// <summary>
+/// WorkflowFileScan: a long, resumable scan of one generated corpus in sample_files/.
+/// </summary>
+/// <remarks>
+/// Single-humped property names throughout. CamelCaseNamingConvention lowers only the
+/// FIRST character, so a name like MaxRowCount would map to the YAML key maxRowCount
+/// while a reader would write max_row_count or maxRowcount, and an unmatched key is a
+/// hard error here by design.
+/// <para>
+/// NOTE this is WORKSTATION GC: ServerGarbageCollection is unset in Directory.Build.props.
+/// DOTNET_gcServer=1 raises the gen0 budget dramatically and invalidates every magnitude
+/// quoted in docs/WORKFLOWS.md for this case; DOTNET_GCgen0size is how to pin the budget
+/// for a reproducible gen0 count.
+/// </para>
+/// </remarks>
+public sealed class FileScanConfig
+{
+    /// <remarks>Paired with --no-file-scan, which turns the loadgen loop off without editing this file.</remarks>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>The corpus to scan. Resolved to an absolute path against the CONFIG FILE's directory.</summary>
+    /// <remarks>
+    /// Not against the working directory, and the difference is a silent wrong answer.
+    /// docs/HEARTBEATING.md's kill-the-worker recipe runs the built binary from the repo
+    /// root while demo-up.sh runs from elsewhere; a cwd-relative path would mean two
+    /// different files across a resume, and the checkpoint's corpus-identity check is the
+    /// only thing that would notice.
+    /// <para>
+    /// sample_files/ is GITIGNORED and generated, so on a fresh clone this file is absent.
+    /// ConfigLoader validates the SHAPE of this value and never stats it -- ConfigTests
+    /// loads the committed config.yaml, so a stat would break dotnet test on every fresh
+    /// clone. The loadgen driver checks existence once and skips its loop with a named
+    /// banner; the activity throws NON-RETRYABLE if invoked with the corpus missing.
+    /// </para>
+    /// </remarks>
+    public string Path { get; set; } = "sample_files/sample-100mb.txt";
+
+    /// <summary>Its OWN task queue, in the SAME namespace as everything else.</summary>
+    /// <remarks>
+    /// Not for isolation of the interesting kind -- GC, the thread pool and RSS are
+    /// process-wide and stay shared, which is the point. It exists because
+    /// temporal_worker_task_slots_used carries NO activity_type label, and the heartbeat
+    /// board's headline stat sums it unfiltered while its description claims this repo has
+    /// exactly one heartbeating activity type. A second heartbeating activity on
+    /// repro-task-queue would corrupt that panel with no way to filter it back out. A
+    /// separate queue lets the panel pin task_queue and excludes the scan exactly.
+    /// <para>
+    /// Same namespace means no second CLIENT, unlike localActivity -- only a second
+    /// TemporalWorker. ConfigLoader requires this to be prefix-DISJOINT from the other two
+    /// queues, not merely different.
+    /// </para>
+    /// </remarks>
+    public string TaskQueue { get; set; } = "repro-scan-queue";
+
+    /// <summary>Rows per second. 0 means unthrottled: read at the machine's ceiling.</summary>
+    /// <remarks>
+    /// THE KNOB THAT MAKES THIS A LONG-RUNNING ACTIVITY. An unthrottled raw-byte scan of
+    /// the 500 MB corpus finishes in single-digit seconds, which is shorter than one
+    /// heartbeat throttle interval: the case would emit one heartbeat and demonstrate
+    /// nothing about resume or about pressure.
+    /// <para>
+    /// The shipped 6000 puts the 100 MB corpus at 4m47s, and at heartbeatTimeout 30s the
+    /// throttle is 24s, so a kill -9 redoes 24 x 6000 = 144,000 rows -- 8.35% of the
+    /// corpus, an unmissable drop on the cursor panel. At the seed case's 5s timeout the
+    /// throttle is 4s and the same drop is 1.4%: visible on a panel, invisible in a demo.
+    /// </para>
+    /// <para>
+    /// Pacing is also what makes GC pressure legible. Unthrottled, rows/s is a noisy
+    /// function of the page cache; pinned below the ceiling the line is flat and any dip
+    /// is unambiguously pressure.
+    /// </para>
+    /// </remarks>
+    public long TargetRowsPerSecond { get; set; } = 6000;
+
+    /// <summary>Rows between one pace / cancel / drain / heartbeat / log check and the next.</summary>
+    /// <remarks>
+    /// Batched, never per row: Task.Delay has a floor near 1ms and cannot express the
+    /// 167us per row the shipped rate implies, so a per-row sleep would run at about
+    /// 1000 rows/s regardless of configuration and TargetRowsPerSecond would be a lie.
+    /// Same reasoning as PiActivities.CheckEvery.
+    /// <para>
+    /// 600 rows at 6000 rows/s is a 100ms batch period, which is also the loop's reaction
+    /// time to a drain or a cancel. ConfigLoader caps the batch period at 2s for exactly
+    /// that reason: batchRows 1000000 would be a 167-second batch, and the activity could
+    /// then observe neither a drain nor a cancel nor emit a heartbeat inside any window.
+    /// </para>
+    /// </remarks>
+    public int BatchRows { get; set; } = 600;
+
+    /// <summary>Read buffer, bytes. One byte[] -- there is no second buffer.</summary>
+    /// <remarks>
+    /// The scan reads raw bytes and finds line breaks itself, so unlike a StreamReader
+    /// path there is no char[] alongside this one. A byte[n] reaches the 85,000-byte LOH
+    /// threshold at n >= 84,976, so the shipped 65536 is SOH and the LOH gauge sits at a
+    /// true zero. Raising this past ~83 KiB moves the buffer to the LOH and is the
+    /// cheapest possible one-line demonstration of that threshold.
+    /// </remarks>
+    public int BufferBytes { get; set; } = 65_536;
+
+    /// <summary>Stop after this many rows. 0 means the whole file.</summary>
+    /// <remarks>
+    /// A checkpoint written under a LARGER maxRows is a different job and the activity
+    /// refuses to resume from it, rather than silently answering a question nobody asked.
+    /// </remarks>
+    public long MaxRows { get; set; }
+
+    /// <summary>How often the activity prints a progress line and samples the pressure gauges.</summary>
+    /// <remarks>
+    /// WALL CLOCK, not a row count, and one interval feeds both sinks. A row-count cadence
+    /// goes sparse exactly when the system slows down, which is when you need it; and two
+    /// independent samples would make the console and Grafana disagree by one tick, sending
+    /// a reader after a discrepancy that does not exist.
+    /// </remarks>
+    public TimeSpan LogInterval { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>Chosen for the STALENESS it produces, not for liveness.</summary>
+    /// <remarks>
+    /// The maximum gap between two Heartbeat() calls is one batch period, 100ms, so 30s is
+    /// 300x margin. What it actually sets is the throttle, min(0.8 x this,
+    /// worker.maxHeartbeatThrottleInterval) = 24s, and therefore how much work a kill -9
+    /// destroys the record of.
+    /// <para>
+    /// CEILING: worker.maxHeartbeatThrottleInterval is 60s, so raising this past 75s stops
+    /// increasing the throttle and the redone work plateaus at 60s x rate. The knob for
+    /// "make the lesson louder" saturates.
+    /// </para>
+    /// </remarks>
+    public TimeSpan HeartbeatTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
+    /// <summary>Bounds ONE attempt, which for attempt 1 is the whole file.</summary>
+    /// <remarks>
+    /// Covers the shipped corpora rather than guarding anything: the 500 MB corpus at 6000
+    /// rows/s is 23m57s. It becomes a live guard the moment you drop the rate or point at
+    /// something bigger, and then ValidateFileScan fails at startup naming the value it needs.
+    /// Its honest role is catching an attempt that keeps heartbeating and never finishes.
+    /// </remarks>
+    public TimeSpan StartToCloseTimeout { get; set; } = TimeSpan.FromMinutes(30);
+
+    /// <summary>Total across every attempt, including the cost of every resume.</summary>
+    /// <remarks>
+    /// "attempts x startToClose" is the WRONG model and gives an absurd number. Useful work
+    /// is one worst-case scan regardless of how many attempts it takes; each RESUME adds
+    /// heartbeatTimeout (the server noticing) + retry.maximumInterval (backoff) + throttle
+    /// (the reading that is redone) = 64s at the shipped values. Nine resumes on the 500 MB
+    /// corpus is 23m57s + 9 x 64s + 2m = 35m33s, so 1h leaves about 1.7x headroom.
+    /// </remarks>
+    public TimeSpan ScheduleToCloseTimeout { get; set; } = TimeSpan.FromHours(1);
+
+    /// <remarks>
+    /// maximumAttempts 10, not the usual 5, and NOT 0 -- zero means UNLIMITED in
+    /// Temporalio.Common.RetryPolicy, and an unbounded chain of half-hour scans holds an
+    /// activity slot forever. Each kill -9 consumes one attempt and the HEARTBEATING.md
+    /// recipe does three cycles, so 5 leaves little room: one careless extra kill fails the
+    /// workflow terminally, which READS AS "resume is broken" and is the worst way for this
+    /// case to fail.
+    /// </remarks>
+    public RetryConfig Retry { get; set; } = new() { MaximumAttempts = 10 };
+
+    /// <summary>One scan started every rate, plus or minus jitter.</summary>
+    public TimeSpan Rate { get; set; } = TimeSpan.FromMinutes(6);
+
+    /// <summary>Fraction of Rate to jitter by, 0 to 1.</summary>
+    public double Jitter { get; set; } = 0.2;
+
+    /// <summary>In-flight scans the loadgen will allow. Over capacity it SKIPS, never queues.</summary>
+    /// <remarks>
+    /// A pure multiplier on every byte, allocation and buffer in the case, sharing ONE heap
+    /// and ONE thread pool. See fault.retainScannedRows, which ConfigLoader refuses above 1.
+    /// </remarks>
+    public int Concurrency { get; set; } = 1;
 }

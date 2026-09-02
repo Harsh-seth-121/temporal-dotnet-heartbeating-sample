@@ -150,6 +150,44 @@ fault:
   # THIS WEDGES YOUR TERMINAL FOR THE REST OF THE BATCH. That is the demo.
   ignoreCancellation: false
 
+  # The three knobs below belong to fileScan, and they are a LADDER: one claim each,
+  # named panels each, meant to be turned on ONE AT A TIME. All three ship false.
+  #
+  # NOTE THIS IS WORKSTATION GC. ServerGarbageCollection is unset in
+  # Directory.Build.props, so DOTNET_gcServer=1 raises the gen0 budget dramatically and
+  # invalidates every magnitude quoted here and in docs/WORKFLOWS.md. DOTNET_GCgen0size
+  # is how to pin the budget for a reproducible gen0 count.
+
+  # Decode every scanned row to a string and throw it away.
+  # Proves ALLOCATION IS NOT GROWTH: about 140 bytes of gen0 garbage per row, so
+  # allocated lands near 2.4x bytes read and the LIVE heap floor stays flat.
+  # Panels: repro_file_scan_bytes_allocated rate and gc_collected{gen="0"} climb, while
+  # managed_heap_bytes sawtooths on a floor that does not move. Legible only because
+  # the default raw-byte path allocates essentially nothing.
+  decodeRowsToStrings: false
+
+  # The same decode, retained in a List for the life of the attempt -- PRE-SIZED from
+  # the corpus header, so the list's own doubling does not move the LOH panel for a
+  # second, unrelated reason.
+  # Proves RETENTION GROWS THE HEAP: the identical garbage becomes promoted live gen2.
+  # Panels: managed_heap_bytes becomes a staircase with no falling edge, gen="1" and
+  # gen="2" appear, gc_pause_percent rises and rows/s dips below target.
+  # ConfigLoader REFUSES this together with fileScan.concurrency > 1: eight retained
+  # scans of the 500 MB corpus is over 10 GB, and that failure is an OOM-killed worker
+  # rather than the empty panel you were expecting.
+  retainScannedRows: false
+
+  # File.ReadAllBytes the whole corpus before the loop.
+  # Proves A BIG READ IS ONE LOH OBJECT, and the LOH is not compacted by default, so
+  # committed bytes step up and do not come back when the array dies.
+  # Panels: loh_bytes steps to the file size AT THE NEXT GC -- MEASURED: it is read from
+  # GCMemoryInfo, which describes the LAST collection, so a 100 MB ReadAllBytes left the
+  # gauge on the previous GC's value until a gen2 collect landed. working_set_bytes steps and
+  # stays, gen="2" appears. It does NOT produce a heartbeat timeout -- 500 MB off page
+  # cache or NVMe is well under a second; that is stallPastHeartbeatTimeout. It is also
+  # SYNCHRONOUS, so it holds an activity-task thread for its whole duration.
+  slurpWholeFile: false
+
 # SimpleNoActivity: a workflow with NO activities, driven entirely by messages. The
 # loadgen runs this as a SECOND loop alongside the heartbeat one, on the same task queue
 # and the same worker. Turn it off with `enabled: false` or `--no-simple`.
@@ -390,3 +428,146 @@ localActivity:
   # Local activities have their own slot type, so this does not come out of
   # worker.maxConcurrentActivities. Core reports it as worker_type="LocalActivityWorker".
   maxConcurrentLocalActivities: 4
+
+# ---------------------------------------------------------------------------
+# WorkflowFileScan: a long, resumable scan of one generated corpus, paced on purpose.
+#
+# WHAT THIS CASE DEMONSTRATES, and what the other four cannot. The seed
+# HeartbeatWorkflow heartbeats a Task.Delay step loop, and two things are out of that
+# loop's reach no matter how you tune it:
+#
+#   RESUME CORRECTNESS. Nothing there is genuinely reprocessed, because a synthetic
+#   step is idempotent by construction and there is no state a resume could get wrong.
+#   Here the checkpoint carries a byte offset, a row cursor AND a running indexSum, the
+#   accumulator is rewound to the checkpoint's value together with the read cursor, and
+#   at the end the scan checks itself against the closed form n(n+1)/2. A resume that
+#   double-counts is caught arithmetically instead of argued about.
+#
+#   WORKER RESOURCE PRESSURE. A sleeping task allocates nothing and touches no I/O, so
+#   every slot, GC and memory panel reads identically whether the activity is working
+#   or idle. A real read loop moves them, and the three fault knobs above move them one
+#   claim at a time.
+#
+# The PACE is what makes both halves legible. Unthrottled, a raw-byte scan of the
+# 500 MB corpus finishes in single-digit seconds -- shorter than ONE heartbeat throttle
+# interval -- so the case would emit a single heartbeat and demonstrate neither.
+#
+# THE CORPUS IS GITIGNORED AND GENERATED: run scripts/gen-samples/gen-samples.sh first.
+# Nothing in ConfigLoader stats it. Every value below is validated for SHAPE only, with
+# no filesystem access at all, because the test suite loads THIS file and a fresh clone
+# has no sample_files/. Existence is checked where it can be handled instead: the
+# loadgen skips its loop with a named banner, and the activity throws NON-retryably,
+# because a missing corpus is a config bug and burning ten retries proves nothing.
+# ---------------------------------------------------------------------------
+fileScan:
+  enabled: true
+
+  # RESOLVED AGAINST THIS FILE'S DIRECTORY, not the working directory, and rewritten to
+  # an absolute path during validation. docs/HEARTBEATING.md's kill-the-worker recipe
+  # runs the built binary from the repo root while demo-up.sh runs from elsewhere, so a
+  # cwd-relative path would silently mean two DIFFERENT files across a resume, and the
+  # checkpoint's corpus-identity check is the only thing that would ever notice.
+  path: sample_files/sample-100mb.txt
+
+  # Its OWN queue, in the SAME namespace as everything else -- so no second client,
+  # only a second TemporalWorker. Not for isolation of the interesting kind: GC, the
+  # thread pool and RSS are process-wide and stay shared, which is the point. It exists
+  # because temporal_worker_task_slots_used carries NO activity_type label while the
+  # heartbeat board's headline stat sums it unfiltered and claims this repo has exactly
+  # one heartbeating activity type. A separate queue lets that panel pin task_queue and
+  # exclude the scan exactly. ConfigLoader requires this name to be prefix-DISJOINT
+  # from taskQueue and localActivity.taskQueue, not merely different from them.
+  taskQueue: repro-scan-queue
+
+  # THE KNOB THAT MAKES THIS A LONG-RUNNING ACTIVITY. 0 means unthrottled.
+  #
+  # 6000 puts the 100 MB corpus (1,724,588 rows) at 4m47s. At heartbeatTimeout 30s the
+  # throttle is min(0.8 x 30s, worker.maxHeartbeatThrottleInterval) = 24s, so a kill -9
+  # destroys the RECORD of 24 x 6000 = 144,000 rows: 8.35% of the corpus and an
+  # unmissable drop on the cursor panel. At the seed case's 5s heartbeat timeout the
+  # same drop is 1.4% -- visible on a panel, invisible in a demo.
+  #
+  # Pacing is also what makes GC pressure readable. Unthrottled, rows/s is a noisy
+  # function of the page cache; pinned below the machine's ceiling the line is flat and
+  # any dip in it is unambiguously pressure.
+  targetRowsPerSecond: 6000
+
+  # Rows between one pace, cancel, drain, heartbeat and log check and the next. 600 at
+  # 6000 rows/s is a 100ms batch period, which IS the loop's reaction time to a drain.
+  #
+  # Batched, never per row: Task.Delay has a floor near 1ms and cannot express the
+  # 167us a row implies, so a per-row sleep would run at about 1000 rows/s whatever
+  # this file said and targetRowsPerSecond would be a lie. ConfigLoader keeps the batch
+  # period inside [10ms, 2s] for both halves of that: batchRows 1000000 would be a
+  # 167-second batch, inside which the activity could observe neither a drain nor a
+  # cancel nor emit one heartbeat.
+  batchRows: 600
+
+  # One byte[] -- the scan finds line breaks itself, so unlike a StreamReader path
+  # there is no char[] alongside it. A byte[n] reaches the 85,000-byte LOH threshold at
+  # n >= 84,976, so 65536 is SOH and repro_file_scan_loh_bytes sits at a TRUE zero.
+  # Raise it past ~83 KiB and the buffer moves to the LOH: the cheapest one-line
+  # demonstration of that threshold in the repo, and the reason ConfigLoader's range
+  # for this key deliberately spans it.
+  bufferBytes: 65536
+
+  # Stop after this many rows; 0 is the whole file. A checkpoint written under a LARGER
+  # maxRows is a different job, and the activity refuses to resume from it rather than
+  # silently answering a question nobody asked. It is also what the timeout ladder
+  # below is derived against when set -- otherwise the largest SHIPPED corpus is.
+  maxRows: 0
+
+  # WALL CLOCK, not a row count, and one interval feeds both sinks: the console line
+  # and the pressure sampler. A row-count cadence goes sparse exactly when the system
+  # slows down, which is when you need it, and two independent samples would make
+  # Grafana and the console disagree by a tick and send a reader after a discrepancy
+  # that does not exist.
+  logInterval: 10s
+
+  # Chosen for the STALENESS it produces, NOT for liveness: the maximum gap between
+  # two Heartbeat() calls here is one batch period, 100ms, so 30s is 300x margin. What
+  # it actually sets is the throttle, and therefore how much work a kill -9 destroys
+  # the record of.
+  #
+  # CEILING: worker.maxHeartbeatThrottleInterval is 60s, so raising this past 75s stops
+  # increasing the throttle and the redone work plateaus at 60s x rate. The knob for
+  # "make the lesson louder" saturates.
+  heartbeatTimeout: 30s
+
+  # Bounds ONE attempt, which for attempt 1 is the whole file. It COVERS the shipped
+  # corpora rather than guarding anything -- the 500 MB corpus at 6000 rows/s is 23m57s
+  # -- and it becomes a live guard the moment you drop the rate or point at something
+  # bigger, at which point ConfigLoader fails at startup naming the value it needs. Its
+  # honest role is catching an attempt that keeps heartbeating and never finishes.
+  startToCloseTimeout: 30m
+
+  # Total across every attempt, INCLUDING the cost of every resume. "attempts x
+  # startToClose" is the wrong model and gives an absurd number: useful work is one
+  # worst-case scan however many attempts it takes, and each RESUME adds
+  # heartbeatTimeout (the server noticing) + retry.maximumInterval (backoff) + throttle
+  # (the reading that is redone) = 64s at these values. Nine resumes on the 500 MB
+  # corpus is 23m57s + 9 x 64s + 2m = 35m33s, so 1h leaves about 1.7x headroom.
+  scheduleToCloseTimeout: 1h
+
+  retry:
+    initialInterval: 1s
+    backoffCoefficient: 2.0
+    maximumInterval: 10s
+    # 10, not the usual 5, and NOT 0 -- zero means UNLIMITED in
+    # Temporalio.Common.RetryPolicy, and an unbounded chain of half-hour scans holds an
+    # activity slot forever. Each kill -9 spends one attempt and HEARTBEATING.md's
+    # recipe does three cycles, so 5 leaves little room: one careless extra kill fails
+    # the workflow terminally, which READS AS "resume is broken" and is the worst way
+    # for this case to fail.
+    maximumAttempts: 10
+
+  # Loadgen's fifth loop. Same jittered-interval, skip-at-capacity contract as the
+  # other three; 6m is just over one 4m47s scan, so a scan is in flight essentially
+  # always without a second one ever being started.
+  rate: 6m
+  jitter: 0.2
+
+  # A pure multiplier on every byte, allocation and buffer in this case, all sharing
+  # ONE heap and ONE thread pool -- which is the reason it is 1 here, and the reason
+  # ConfigLoader REFUSES it above 1 while fault.retainScannedRows is on.
+  concurrency: 1
