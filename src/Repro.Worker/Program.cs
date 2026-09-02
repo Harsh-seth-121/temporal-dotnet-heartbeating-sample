@@ -18,16 +18,12 @@ using var loggerFactory = LoggerFactory.Create(b => b
     .SetMinimumLevel(LogLevel.Information));
 var log = loggerFactory.CreateLogger("worker");
 
-// FIRST, before any TemporalClient exists. A client that connects first binds to
-// TemporalRuntime.Default and its metrics are lost with no error anywhere.
+// Resolved before any TemporalClient exists. See docs/GOTCHAS.md, "TemporalRuntime must be
+// built once, first, and shared".
 var bind = flags.Str("--metrics") ?? config.Metrics.ListenAddress;
 
-// `--metrics off` is how you run a SECOND worker on this host without fighting the
-// first one for :8077. The "kill the worker mid-activity" recipe needs two. Off
-// means NO EXPORTER, not no runtime: ClientFactory requires a runtime, and a client
-// that connects without one binds to TemporalRuntime.Default, which is the silent
-// metrics loss ReproRuntime exists to prevent. Adopt a telemetry-free runtime so the
-// single-shot guard still owns this process.
+// `--metrics off` lets a second worker share this host without fighting for :8077, which the
+// "kill the worker mid-activity" recipe needs. No exporter, but still a runtime.
 var metricsOff = BindAddress.IsOff(bind);
 var runtime = metricsOff
     ? ReproRuntime.Adopt(new TemporalRuntime(new TemporalRuntimeOptions()))
@@ -47,28 +43,19 @@ var options = new TemporalWorkerOptions(config.TaskQueue)
     .AddWorkflow<HeartbeatWorkflow>()
     .AddWorkflow<SimpleNoActivity>()
     .AddWorkflow<WorkflowSimpleActivity>()
-    // Instance registration is the SetFaultConfig replacement: the fault config is
-    // reachable only from this object, so no workflow can read it.
+    // Instance registration keeps the fault config reachable only here, never from a workflow.
     .AddAllActivities(new HeartbeatActivities(config.Fault, config.Worker))
-    // A SECOND call, not a second argument: AddAllActivities takes exactly ONE instance,
-    // so a new activity CLASS needs its own. The two classes must not declare an activity
-    // of the same name. A duplicate throws at registration, before the worker polls.
+    // A second call, not a second argument: AddAllActivities takes one instance, and two
+    // classes declaring the same activity name throw at registration.
     .AddAllActivities(new WeatherActivities(config.SimpleActivity));
 
-// All six worker: knobs, including the grace period this repo's ignoreCancellation hang
-// depends on and the heartbeat throttle the file-scan numbers depend on. WorkerKnobs holds
-// them, and the reasons, for all four workers in this repo.
+// The six worker: knobs, and why they live in one place. See WorkerKnobs.
 WorkerKnobs.Apply(options, config.Worker);
 
 using var shutdown = new CancellationTokenSource();
 
-// Console.CancelKeyPress catches SIGINT only. `docker compose down`, `docker stop`
-// and most process supervisors send SIGTERM, which it never sees, so a worker
-// wired only to CancelKeyPress hangs until it is SIGKILLed and never drains.
-// scripts/demo-down.sh relies on the SIGTERM registration below: it is the only
-// reason a scripted teardown drains this worker instead of killing it.
-// Both are registered even though this process is meant to run on the host,
-// because the failure mode is silent and the fix is three lines.
+// Console.CancelKeyPress catches SIGINT only, so a worker wired to it alone is SIGKILLed
+// without draining when scripts/demo-down.sh sends SIGTERM.
 Console.CancelKeyPress += (_, e) =>
 {
     e.Cancel = true;
@@ -82,59 +69,28 @@ using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx =>
 
 using var worker = new TemporalWorker(client, options);
 
-// SECOND WORKER, SAME CLIENT, for WorkflowFileScan and its ScanFile activity alone.
-//
-// NO second client here, unlike the local-activity worker below, and the reason is the whole
-// difference between the two cases: a namespace is a CLIENT property, but fileScan.taskQueue is
-// a QUEUE in the namespace this client is already bound to. What the separate queue buys is a
-// FILTERABLE panel -- temporal_worker_task_slots_used carries no activity_type label, and the
-// heartbeat board's headline stat sums it while claiming this repo has exactly one heartbeating
-// activity type, so a second heartbeating activity on repro-task-queue would corrupt that panel
-// with no way to filter it back out. See FileScanConfig.TaskQueue.
+// Second worker, same client: fileScan.taskQueue is a queue inside the namespace this client
+// already holds. The separate queue keeps the heartbeat board's slot panel filterable; see
+// FileScanConfig.TaskQueue.
 var scanOptions = new TemporalWorkerOptions(config.FileScan.TaskQueue)
     .AddWorkflow<WorkflowFileScan>()
-    // Its OWN AddAllActivities call, for the reason the two above record: the method takes
-    // exactly ONE instance. config.Worker is not decoration -- the activity's drain line
-    // reports how long it has before ctx.CancellationToken fires, which is
-    // worker.gracefulShutdownTimeout, and a FileScanActivities built without it names the SDK
-    // default instead of the window this process is actually using.
+    // config.Worker is not decoration: the activity's drain line reports its
+    // gracefulShutdownTimeout, and without it names the SDK default.
     .AddAllActivities(new FileScanActivities(config.Fault, config.Worker));
 
-// The same knobs as the main worker, from the same place. The CLIENT still differs between this
-// scan worker and the loadgen's -- this one reuses the process client, the loadgen builds a
-// "loadgen-scan" one for its identity -- but a client is a TemporalWorker constructor argument,
-// not an option, so it never stood in the way of sharing the knobs.
 WorkerKnobs.Apply(scanOptions, config.Worker);
 
-// NOT gated on fileScan.enabled and NOT on the corpus existing. `enabled` and --no-file-scan
-// turn off the loadgen's driver LOOP, not this process's ability to run a scan somebody starts
-// by hand; and registering the activity while the corpus is absent is what lets a corpus
-// generated later be scanned with no worker restart. A scan invoked before then fails
-// non-retryably on attempt 1, which is the right outcome for a config bug -- see the warning
-// below the banners.
+// Not gated on fileScan.enabled or on the corpus existing: `enabled` turns off the loadgen's
+// driver loop, and registering now means a corpus generated later needs no restart.
 using var scanWorker = new TemporalWorker(client, scanOptions);
 
-// SECOND CLIENT, THIRD WORKER, SECOND NAMESPACE, for WorkflowLocalActivity alone.
-//
-// A namespace is a CLIENT property and a worker binds one client, so this is the price of
-// putting that workflow somewhere else -- and it has to be somewhere else, because
-// history.workflowTaskHeartbeatTimeout is declared server-side as NewNamespaceDurationSetting
-// and filters by namespace and nothing finer. Dropping it to 1m in its own namespace is the
-// only way to make that case reproducible without changing behaviour for the other three.
-//
-// Same runtime, deliberately. ReproRuntime's guard counts runtime CONSTRUCTIONS, not client
-// bindings, so N clients on one runtime is legal by design and is what keeps both namespaces'
-// series on the one :8077 exporter. Building a second runtime here would bind nothing and
-// serve an empty registry.
-//
-// Role is "worker-la", not "worker". Identity is role@machine:pid, so two clients in one
-// process sharing a role produce a byte-identical identity and `temporal workflow describe`
-// stops being able to tell you which one holds a run.
+// Second client, third worker, second namespace, for WorkflowLocalActivity alone; see
+// docs/GOTCHAS.md, "history.workflowTaskHeartbeatTimeout is namespace-scoped and nothing finer".
+// Same runtime, so both namespaces keep exporting on the one :8077. Role "worker-la".
 var laClient = await ClientFactory.ConnectAsync(
     config, runtime, "worker-la", loggerFactory, config.LocalActivity.Namespace);
 
-// Options come from Repro.Core so this process and Repro.LoadGen cannot drift apart; see
-// LocalActivityWorkerOptions for the copied-knobs failure that motivated pulling them out.
+// Options from Repro.Core, so this process and Repro.LoadGen cannot drift.
 using var laWorker = new TemporalWorker(laClient, LocalActivityWorkerOptions.For(config));
 
 log.LogInformation(
@@ -154,15 +110,8 @@ log.LogInformation(
     config.FileScan.TargetRowsPerSecond, config.FileScan.BatchRows,
     GoDuration.ToGoString(config.FileScan.HeartbeatTimeout));
 
-// CHECKED ONCE, WARNED ABOUT, AND OTHERWISE IGNORED. sample_files/ is gitignored and
-// generated, so on a fresh clone this file is absent while fileScan.enabled is still true --
-// and ConfigLoader.ValidateFileScan deliberately never stats it, because ConfigTests loads
-// this same config.yaml and a stat would fail `dotnet test` on every fresh clone.
-//
-// The worker still polls and still registers ScanFile, so generating the corpus later needs no
-// restart. Not a fatal, and not a retry loop either: a missing corpus is a CONFIG bug, so the
-// activity throws non-retryably on attempt 1 rather than burning ten attempts and burying the
-// cause under an ActivityFailure chain.
+// Checked once and warned about, never fatal and never retried: a missing corpus is a config
+// bug. See docs/CONFIG.md, "Absent corpus, and why `dotnet test` still passes without one".
 if (!File.Exists(config.FileScan.Path))
 {
     log.LogWarning(
@@ -175,20 +124,10 @@ if (!File.Exists(config.FileScan.Path))
 
 try
 {
-    // Task.WhenAll, NOT three sequential awaits, and the difference is a SIGKILL.
-    //
-    // No call succeeds; each only fails or is cancelled. On shutdown each waits for its own
-    // executing activities to return. Awaited one after another, a worker would not even begin
-    // draining until the one before it had finished, serialising THREE
-    // gracefulShutdownTimeout windows into 90s against demo-down.sh's budget of
-    // gracefulShutdownTimeout + 15 = 45s. Run concurrently the three windows overlap and the
-    // teardown drains instead of being killed.
-    //
-    // The scan worker is the one that makes this bite. Its activity does not finish inside the
-    // grace window and is not meant to: it checkpoints on the WorkerShutdownToken EDGE, keeps
-    // reading, and unwinds when ctx.CancellationToken fires at the end of that window. So it
-    // spends the full gracefulShutdownTimeout every single teardown, where the other two
-    // usually return early.
+    // Task.WhenAll, not three sequential awaits: each worker drains its own activities, so in
+    // sequence the three gracefulShutdownTimeout windows serialise into 90s against
+    // demo-down.sh's budget of gracefulShutdownTimeout + 15 = 45s. The scan worker always
+    // spends its full window, so this is what keeps a teardown inside the budget.
     await Task.WhenAll(
         worker.ExecuteAsync(shutdown.Token),
         laWorker.ExecuteAsync(shutdown.Token),

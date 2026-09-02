@@ -3,19 +3,10 @@ using System.Text.RegularExpressions;
 
 namespace Repro.Core.Config;
 
-/// <summary>
-/// Parses Go-style duration strings: <c>150ms</c>, <c>10s</c>, <c>1m30s</c>, <c>0</c>.
-/// </summary>
+/// <summary>Parses Go-style duration strings: <c>150ms</c>, <c>10s</c>, <c>1m30s</c>, <c>0</c>.</summary>
 /// <remarks>
-/// The whole readability of config.yaml rides on this. The alternative is
-/// TimeSpan's own format, which YamlDotNet parses natively but which turns
-/// <c>latency: 150ms</c> into <c>latency: "00:00:00.150"</c> and
-/// <c>heartbeatTimeout: 5s</c> into <c>"00:00:05"</c>. In a file whose entire job
-/// is to be dialled up and down while watching Grafana, that is a real cost.
-/// <para>
-/// It also keeps the port honest: the Go config.yaml this repo mirrors used
-/// <c>latency: "150ms"</c>, and the READMEs quote those literals.
-/// </para>
+/// The alternative is TimeSpan's own format, which YamlDotNet parses natively but which writes
+/// <c>latency: 150ms</c> as <c>"00:00:00.150"</c>. The docs quote the Go literals.
 /// </remarks>
 public static partial class GoDuration
 {
@@ -27,9 +18,7 @@ public static partial class GoDuration
         ArgumentNullException.ThrowIfNull(text);
         var s = text.Trim();
 
-        // Go writes the zero duration as a bare "0" with no unit, and so does
-        // `temporal workflow describe`. Accept it; requiring "0s" would be a
-        // gratuitous divergence.
+        // Go and `temporal workflow describe` both write the zero duration as a bare "0".
         if (s is "0" or "-0")
         {
             return TimeSpan.Zero;

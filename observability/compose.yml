@@ -1,27 +1,13 @@
 # Temporal sandbox: server 1.31.2 + PostgreSQL + Web UI, Prometheus metrics enabled.
-#
-# The .NET worker, loadgen, starter and replay processes run on the HOST, not here.
-# same topology as the Go original. Prometheus reaches them over host.docker.internal.
-# That is why there is no app service and no stop_grace_period tuning in this file:
-# worker drain is governed by TemporalWorkerOptions.GracefulShutdownTimeout, in-process.
 # Eight services: Postgres, two one-shot admin-tools jobs, the server, the Web UI,
-# Prometheus, Pushgateway, Grafana.
+# Prometheus, Pushgateway, Grafana. The .NET worker, loadgen, starter and replay run on
+# the host and Prometheus reaches them over host.docker.internal, so worker drain is
+# governed in-process by TemporalWorkerOptions.GracefulShutdownTimeout.
 #
-# Every published port binds 127.0.0.1, not 0.0.0.0. Grafana here runs with anonymous
-# Admin and Prometheus with --web.enable-lifecycle, so a 0.0.0.0 bind would hand
-# anyone on the LAN an admin console and an unauthenticated shutdown endpoint. It also
-# keeps 5432 from colliding with a local Postgres. Container-to-container traffic is
-# unaffected: that goes over the compose network by service name.
-#
-# All images verified multi-arch, linux/amd64 and linux/arm64, so no platform overrides.
-# No top-level `version:` key: obsolete in Compose v2+.
-#
-# Run these from this directory, or from the repo root, where ../compose.yml `include`s
-# this file and pins the same project name, so both resolve to one stack.
-#
-#   docker compose up -d
-#   docker compose down       # keep data
-#   docker compose down -v    # wipe everything (REQUIRED if NUM_HISTORY_SHARDS changes)
+# Every published port binds 127.0.0.1: Grafana runs anonymous Admin and Prometheus with
+# --web.enable-lifecycle, so a 0.0.0.0 bind would hand the LAN an admin console and an
+# unauthenticated shutdown endpoint. Run from this directory or from the repo root,
+# where ../compose.yml `include`s this file and pins the same project name.
 
 name: temporal-dotnet-sandbox
 
@@ -80,15 +66,14 @@ services:
       - POSTGRES_PWD=${POSTGRES_PASSWORD}
       # Immutable after first schema init. `docker compose down -v` to change.
       - NUM_HISTORY_SHARDS=4
-      # Without this the config template binds services to 127.0.0.1 and the
-      # published ports are unreachable from the host.
+      # Without this the config template binds to 127.0.0.1 and the published ports
+      # are unreachable from the host.
       - BIND_ON_IP=0.0.0.0
-      # THIS single var turns on the server's Prometheus listener. It renders
-      # global.metrics.prometheus.listenAddress in the embedded config template.
-      # Do NOT set PROMETHEUS_TIMER_TYPE: deprecated and ignored in 1.31
-      # (timers are always histograms).
+      # This one var turns on the server's Prometheus listener, rendering
+      # global.metrics.prometheus.listenAddress in the embedded config template. Do not
+      # set PROMETHEUS_TIMER_TYPE: deprecated and ignored in 1.31.
       - PROMETHEUS_ENDPOINT=0.0.0.0:8000
-      # REQUIRED. See the dynamicconfig file header for why.
+      # Required. See the dynamicconfig file header.
       - DYNAMIC_CONFIG_FILE_PATH=/etc/temporal/config/dynamicconfig/development-sql.yaml
       - LOG_LEVEL=info
     networks: [temporal-network]
@@ -115,18 +100,13 @@ services:
     environment:
       - TEMPORAL_ADDRESS=temporal:7233
       - DEFAULT_NAMESPACE=default
-      # WorkflowLocalActivity's own namespace. It exists so
-      # history.workflowTaskHeartbeatTimeout can be dropped to 1m for that workflow alone:
-      # the setting is namespace-scoped server-side, so there is no finer knob. Must match
-      # localActivity.namespace in config.yaml and the constraint in
-      # dynamicconfig/development-sql.yaml; nothing cross-checks the three, and a mismatch
-      # is silent (the worker fails to connect, or the override applies to nothing).
+      # WorkflowLocalActivity's own namespace, so history.workflowTaskHeartbeatTimeout
+      # can be dropped to 1m for that workflow alone. Must match localActivity.namespace
+      # in config.yaml and the constraint in dynamicconfig/development-sql.yaml; nothing
+      # cross-checks the three and a mismatch is silent.
       - LOCAL_ACTIVITY_NAMESPACE=repro-local-activity
-      # 7d, not the 1d the Go original used. Retention caps how long a CLOSED
-      # workflow's history survives, and this repo's whole replay workflow depends on
-      # `temporal workflow show` still finding it. At 1d, a history captured on Friday
-      # is gone on Monday and docs/REPLAY.md's capture recipe fails with a
-      # not-found error that looks like a bug in the replayer.
+      # 7d, not 1d, so docs/REPLAY.md's capture recipe can still `temporal workflow show`
+      # a run from last week. See docs/GOTCHAS.md, "Namespace retention is 7d".
       - DEFAULT_NAMESPACE_RETENTION=7d
     networks: [temporal-network]
     volumes:
@@ -159,19 +139,14 @@ services:
       # `command:` overrides the image CMD wholesale, so the defaults must be repeated.
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
-      # MEASURED: a 1s scrape over this topology writes ~11 GB/day (945 MB in the
-      # first 2h, ~24k active series). The Go original's 7d would be ~78 GB, which is
-      # not a thing to leave running on a laptop. A repro session is hours, not days.
+      # Measured: a 1s scrape over this topology writes ~11 GB/day (945 MB in the
+      # first 2h, ~24k active series). A repro session is hours, not days.
       - --storage.tsdb.retention.time=2d
-      # Hard ceiling regardless of the time window. Whichever limit is hit first
-      # wins. This is the one that actually protects the disk.
+      # Hard ceiling regardless of the time window; whichever limit is hit first wins.
       - --storage.tsdb.retention.size=8GB
-      # enables: curl -XPOST localhost:9090/-/reload
-      #
-      # It ALSO enables an unauthenticated POST /-/quit that shuts Prometheus down.
-      # Verified: it returns 200 and the process exits. That is acceptable only
-      # because every port in this file is published on 127.0.0.1. Do not widen
-      # any of them without dropping this flag first.
+      # Enables curl -XPOST localhost:9090/-/reload, and also an unauthenticated
+      # POST /-/quit that shuts Prometheus down (verified: 200, then the process exits).
+      # Acceptable only because every port here binds 127.0.0.1.
       - --web.enable-lifecycle
     ports:
       - "127.0.0.1:9090:9090"
@@ -179,9 +154,8 @@ services:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - prometheus-data:/prometheus
     extra_hosts:
-      # Required on Linux Docker Engine. On Docker Desktop for Mac the embedded DNS
-      # already resolves host.docker.internal, so it is redundant but harmless and keeps this
-      # file portable.
+      # Required on Linux Docker Engine. Docker Desktop for Mac resolves
+      # host.docker.internal already, so it is redundant there but keeps this portable.
       - "host.docker.internal:host-gateway"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
@@ -195,23 +169,8 @@ services:
     image: prom/pushgateway:v1.11.3
     container_name: dotnet-sandbox-pushgateway
     restart: unless-stopped
-    # NO --persistence.file, deliberately. That is a change from the Go original.
-    #
-    # Persistence makes a pushed group outlive `docker compose down`, and the
-    # Pushgateway then keeps SERVING it: Prometheus scrapes a fresh sample every 5s
-    # for a starter that is not running, so the series looks perpetually live. Worse
-    # for this repo specifically, a group pushed before a HistogramBucketOverrides
-    # change keeps its old `le` layout, and `sum by (le, operation)` silently merges
-    # two incompatible bucket sets.
-    #
-    # The Go original's justification, "so a starter run from minutes ago is still
-    # visible", does not need persistence: Prometheus already scraped those samples
-    # and keeps them for its own retention window, which this file sets to 2d below.
-    # (DEFAULT_NAMESPACE_RETENTION above is 7d and is a different thing entirely.)
-    # Dropping the group just lets the series
-    # go stale, which is the truthful outcome when nothing is pushing.
-    #
-    # Clear a group without restarting:
+    # No --persistence.file, deliberately: see docs/GOTCHAS.md, "The Pushgateway does NOT
+    # persist, deliberately". Clear a group without restarting:
     #   dotnet run --project src/Repro.Starter -- --delete-push-group
     ports:
       - "127.0.0.1:9091:9091"
@@ -250,10 +209,9 @@ services:
     networks: [temporal-network]
 
 networks:
-  # SERVICE names (temporal, prometheus, pushgateway, grafana) are what compose DNS
-  # resolves, and they are deliberately unchanged: TEMPORAL_ADDRESS=temporal:7233
-  # and the prometheus target temporal:8000 still work. Only the container_name and
-  # network `name:` values are prefixed, because THOSE are global to the Docker
+  # Service names are what compose DNS resolves and are deliberately unchanged, so
+  # TEMPORAL_ADDRESS=temporal:7233 and the target temporal:8000 still work. Only
+  # container_name and the network `name:` are prefixed: those are global to the Docker
   # daemon and would collide with the Go sandbox.
   temporal-network:
     driver: bridge

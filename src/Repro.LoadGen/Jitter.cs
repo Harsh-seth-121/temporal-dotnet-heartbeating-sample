@@ -2,18 +2,9 @@ namespace Repro.LoadGen;
 
 /// <summary>The jittered-interval formula, shared by every driver loop that has one.</summary>
 /// <remarks>
-/// Extracted rather than copied, and not for the eight lines. The formula's
-/// correctness rests on a rule enforced in a THIRD file: ConfigLoader.Validate rejecting
-/// jitter outside [0, 1) and rate at or below zero, which is why the floor below is
-/// belt-and-braces rather than the thing standing between you and a spin loop. FOUR config
-/// blocks are validated by that rule now (<c>simple.jitter</c>, <c>simpleActivity.jitter</c>,
-/// <c>localActivity.jitter</c> and <c>fileScan.jitter</c>), so four copies of the formula plus
-/// four copies of the prose explaining which rule makes it safe is how the next change to the
-/// jitter contract lands in one loop and not the other three. The symptom is a busy spin
-/// against the frontend in exactly one driver.
-/// <para>
-/// Client code, so Random.Shared is fine. Nothing here may leak into workflow code.
-/// </para>
+/// What keeps this safe lives in a third file: ConfigLoader.Validate rejects jitter outside
+/// [0, 1) and rate at or below zero for all four blocks carrying them. The 1ms floor below is
+/// belt and braces, not what stands between you and a spin loop.
 /// </remarks>
 internal static class Jitter
 {

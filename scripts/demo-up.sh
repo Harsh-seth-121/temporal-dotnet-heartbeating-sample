@@ -4,32 +4,19 @@
 #
 #   ./scripts/demo-up.sh [--config PATH] [--no-loadgen]
 #
-# Replaces this by hand:
+# Replaces `dotnet build`, `docker compose up -d` and three `dotnet run` terminals, and
+# waits until Prometheus has actually scraped the worker. See docs/DEMO.md, "What up does".
 #
-#   dotnet build
-#   docker compose up -d
-#   dotnet run --project src/Repro.Worker      # terminal 2
-#   dotnet run --project src/Repro.LoadGen     # terminal 3
-#   dotnet run --project src/Repro.Starter     # terminal 4
-#
-# and adds the part that sequence has no way to express: waiting until Prometheus has
-# actually scraped the worker, so a board that looks broken really is broken.
-#
-# `#!/bin/bash` is pinned, NOT `#!/usr/bin/env bash`: on a machine with Homebrew on
-# PATH that picks bash 5 while /bin/bash is 3.2.57, and the two disagree under
-# `set -e`. See the header of scripts/demo-lib.sh for the full rule set.
-#
-# `set -eu` without pipefail, deliberately: pipefail turns an early-closed pipe into
-# status 141 and would kill the script mid-gate.
+# `#!/bin/bash` is pinned and `set -eu` runs without pipefail. scripts/demo-lib.sh
+# has both rules and the bash 3.2 constraints.
 set -eu
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
 # shellcheck source=scripts/demo-lib.sh
 . "$REPO_ROOT/scripts/demo-lib.sh"
 
-# ConfigLoader.Resolve searches UPWARD from the working directory, so everything below
-# runs from the repo root. --config is also passed explicitly to every binary, so the
-# behaviour does not depend on this cd surviving future edits.
+# ConfigLoader.Resolve searches upward, so everything below runs from the repo root.
+# --config is also passed to every binary, so nothing depends on this cd surviving.
 cd "$REPO_ROOT"
 
 PHASES=8
@@ -74,15 +61,14 @@ done
 
 CONFIG="${CONFIG:-${REPRO_CONFIG:-config.yaml}}"
 case "$CONFIG" in /*) ;; *) CONFIG="$REPO_ROOT/$CONFIG" ;; esac
-# Belt and braces: --config wins inside ConfigLoader.Resolve anyway, but exporting
-# this means a process someone adds later without the flag still reads the same file.
+# --config wins inside ConfigLoader.Resolve anyway; exporting also covers a process
+# added later without the flag.
 export REPRO_CONFIG="$CONFIG"
 
 mkdir -p "$DEMO_DIR"
 
-# Ctrl-C leaves everything running on purpose. Rolling back would kill workers that
-# are mid-drain and leave them holding :8077 for another 30 seconds, which is a worse
-# state than "still up".
+# Ctrl-C leaves everything running on purpose: rolling back would kill workers
+# mid-drain and leave them holding :8077 for another 30 seconds.
 demo_on_interrupt() {
     printf '\n'
     demo_info "interrupted. The stack and any process this run started are LEFT RUNNING."
@@ -95,12 +81,8 @@ WORKFLOW_ID=$(grep -E '^workflowId:' "$CONFIG" 2>/dev/null \
     | head -1 | sed 's/^workflowId:[[:space:]]*//; s/[[:space:]]*#.*$//' | tr -d '"' || true)
 WORKFLOW_ID="${WORKFLOW_ID:-repro-workflow}"
 
-# ---------------------------------------------------------------------------
-# 1. Preflight
-# ---------------------------------------------------------------------------
-#
-# Collects EVERY failure and exits once. Learning that Docker is down and the SDK is
-# missing should take one round trip, not three. Every later phase fails fast.
+# 1. Preflight. Collects every failure and exits once, so a missing Docker and a
+# missing SDK take one round trip. Every later phase fails fast.
 
 PF_FAILED=0
 pf_ok()   { printf '  ok    %s\n' "$*"; }
@@ -158,9 +140,8 @@ else
     pf_bad "observability/.env is missing. Without it every \${...} in the compose file interpolates to a blank string and you get \`image: postgres:\`."
 fi
 
-# compose.yml's own header: compose reads the PROJECT-DIRECTORY .env, and it wins over
-# both observability/.env and the `name:` key, so a COMPOSE_PROJECT_NAME there splits
-# the stack in two, one project per directory you run from.
+# Compose reads the project-directory .env in preference to observability/.env, and it
+# overrides the `name:` key, so a root .env splits the stack in two.
 if [ -e "$REPO_ROOT/.env" ]; then
     pf_bad "a root .env exists. Compose reads it in preference to observability/.env and it overrides \`name: temporal-dotnet-sandbox\`, which splits the stack in two. Remove or rename it."
 else
@@ -179,9 +160,8 @@ else
     pf_bad "config file not found: $CONFIG"
 fi
 
-# ConfigLoader.ApplyEnvironmentOverrides lets these WIN over config.yaml. Exported for
-# Temporal Cloud, they give you a demo that quietly talks to Cloud while every gate
-# below checks a local stack.
+# ConfigLoader.ApplyEnvironmentOverrides lets these win over config.yaml, so a Cloud
+# export gives a demo talking to Cloud while every gate below checks the local stack.
 case "${TEMPORAL_ADDRESS:-}" in
     ''|localhost:7233|127.0.0.1:7233) pf_ok "TEMPORAL_ADDRESS is unset or local" ;;
     *) pf_bad "TEMPORAL_ADDRESS=${TEMPORAL_ADDRESS} overrides config.yaml, so the processes would connect there and not to this stack. Retry with: env -u TEMPORAL_ADDRESS ./scripts/demo-up.sh" ;;
@@ -203,9 +183,8 @@ for tool in curl lsof nc; do
     fi
 done
 
-# Only 8077 and 8078 get checked. The eight compose-published ports are compose's
-# business: a busy 7233 means the stack is already up, which is the state we want, and
-# compose gives a precise error of its own if a binding really collides.
+# Only 8077 and 8078. A busy 7233 means the stack is already up, which is the state we
+# want, and compose reports its own error if a binding really collides.
 WORKER_STATE=$(port_state worker)
 LOADGEN_STATE=$(port_state loadgen)
 report_port() {
@@ -236,9 +215,7 @@ if [ "$PF_FAILED" -gt 0 ]; then
     demo_die 3 "$PF_FAILED preflight check(s) failed. Nothing was started."
 fi
 
-# ---------------------------------------------------------------------------
 # 2. Build
-# ---------------------------------------------------------------------------
 
 demo_phase 2 $PHASES "build"
 
@@ -246,10 +223,9 @@ SKIP_BUILD_REASON=""
 if [ -n "${DEMO_SKIP_BUILD:-}" ]; then
     SKIP_BUILD_REASON="DEMO_SKIP_BUILD is set"
 else
-    # macOS returns ETXTBSY when you write a file that is currently executing, and
-    # AssemblyName makes bin/Debug/net10.0/worker exactly that file. MSBuild then
-    # fails the apphost copy, but only when a source file changed, so it looks
-    # intermittent.
+    # macOS returns ETXTBSY when writing a file that is executing, and AssemblyName
+    # makes bin/Debug/net10.0/worker that file. MSBuild fails the apphost copy only when
+    # a source file changed, so it looks intermittent.
     case "$WORKER_STATE" in ours\ *) SKIP_BUILD_REASON="the worker binary is running (writing it would fail with ETXTBSY)" ;; esac
     case "$LOADGEN_STATE" in ours\ *) SKIP_BUILD_REASON="the loadgen binary is running (writing it would fail with ETXTBSY)" ;; esac
 fi
@@ -275,9 +251,7 @@ for name in worker loadgen starter; do
 done
 demo_info "  three binaries present"
 
-# ---------------------------------------------------------------------------
 # 3. Containers
-# ---------------------------------------------------------------------------
 
 demo_phase 3 $PHASES "docker compose up -d"
 demo_note "first boot pulls seven images and initialises two Postgres schemas, so it can take several minutes. This step is deliberately not time-bounded."
@@ -287,21 +261,12 @@ if ! docker compose up -d; then
     demo_die 5 "docker compose up -d failed. Its own \"dependency failed to start\" line says nothing useful, so the tail of the two relevant containers is above."
 fi
 
-# ---------------------------------------------------------------------------
 # 4. Readiness gates
-# ---------------------------------------------------------------------------
 #
-# `up -d` does honour the whole depends_on graph, so postgres healthy, schema-setup
-# exited 0, temporal healthy and prometheus healthy are already true when it returns
-# 0. Four things are not, and every one of them matters here:
-#
-#   temporal-create-namespace   nothing depends on it, so compose only STARTS it
-#   pushgateway                 has a healthcheck, but nothing depends_on it
-#   grafana, temporal-ui        no healthcheck at all
-#
-# The gates below are written to be sufficient even if `up -d` had waited for nothing.
-# That property is worth more than the shortcut: a regression in compose's dependency
-# handling then costs a slower up, not a broken one.
+# `up -d` honours depends_on, so postgres, schema-setup, temporal and prometheus are ready
+# when it returns. temporal-create-namespace, pushgateway, grafana and temporal-ui are not:
+# nothing depends_on the first two and the last two have no healthcheck. The gates below
+# are sufficient even if `up -d` had waited for nothing.
 
 demo_phase 4 $PHASES "readiness gates"
 
@@ -314,22 +279,11 @@ fi
 demo_gate "frontend on :7233" 30 dotnet-temporal demo_tcp_ok 127.0.0.1 7233 \
     || demo_die 5 "the server's healthcheck passes inside the container but 127.0.0.1:7233 is not reachable from this host."
 
-# BOTH namespaces, checked by EXISTENCE rather than by the container's exit code, and that
-# distinction is the whole reason this gate exists separately from the one above.
-#
-# create-namespace.sh skips a namespace that already exists and exits 0, which is correct. But
-# it means the exit-code gate above passes just as happily when the script created two
-# namespaces, one, or none at all. Before this stack grew a second namespace that was
-# harmless: there was only one, and if it was missing nothing else worked either. Now the
-# common case is a stack created before the local-activity feature, where `default` exists,
-# the script has nothing to do for it, and repro-local-activity may or may not have been made.
-# Without this probe the first symptom is the loadgen failing its 45s readiness gate two
-# phases later with an opaque namespace-not-found, pointing at the wrong thing entirely.
-#
-# Skipped rather than failed when the host CLI is absent: `temporal` is a documented
-# prerequisite, but demo-up.sh's other optional-CLI use (see the tail of this script) treats a
-# missing one as "not checkable", not as "broken", and a gate that hard-fails on a missing
-# tool would be the only one here that does.
+# Both namespaces, by existence rather than by the container's exit code:
+# create-namespace.sh skips one that already exists and exits 0, so the gate above passes
+# whether it made two, one or none. On a stack predating the local-activity case the first
+# symptom is the loadgen failing its 45s gate two phases later with an opaque
+# namespace-not-found. Skipped, not failed, when the host `temporal` CLI is absent.
 if command -v temporal >/dev/null 2>&1; then
     for ns in default repro-local-activity; do
         if ! demo_gate "namespace ${ns}" 30 dotnet-temporal \
@@ -346,9 +300,8 @@ demo_gate "pushgateway" 60 dotnet-sandbox-pushgateway \
     demo_http_ok "http://127.0.0.1:9091/-/ready" \
     || demo_die 5 "the pushgateway is not ready, and the seed run's final client-metrics push lands there."
 
-# /-/ready, not /-/healthy. The compose healthcheck uses /-/healthy, which only means
-# the process is alive; /-/ready means the TSDB is loaded and it can answer queries,
-# which is what the target gate in phase 6 needs.
+# /-/ready, not the /-/healthy the compose healthcheck uses: /-/healthy only means the
+# process is alive, /-/ready means the TSDB can answer the phase 6 target gate.
 demo_gate "prometheus" 60 dotnet-sandbox-prometheus \
     demo_http_ok "http://127.0.0.1:9090/-/ready" \
     || demo_die 5 "prometheus is not ready"
@@ -371,9 +324,7 @@ if ! demo_gate "web UI on :8080" 60 dotnet-temporal-ui demo_http_ok "http://127.
     demo_warn "the Temporal Web UI is not answering on :8080. Everything else in this demo works without it."
 fi
 
-# ---------------------------------------------------------------------------
 # 5. Host processes
-# ---------------------------------------------------------------------------
 
 demo_phase 5 $PHASES "worker and loadgen"
 
@@ -424,9 +375,7 @@ else
     demo_info "  loadgen skipped (--no-loadgen); :8078 is free"
 fi
 
-# ---------------------------------------------------------------------------
 # 6. Prometheus targets
-# ---------------------------------------------------------------------------
 
 demo_phase 6 $PHASES "prometheus targets"
 
@@ -438,10 +387,8 @@ if [ "$WITH_LOADGEN" -eq 1 ]; then
         || demo_die 5 "prometheus never scraped the loadgen on :8078"
 fi
 
-# Reported, never gated on. temporal-server serves a few hundred metric families
-# against a 900ms scrape_timeout and genuinely flaps under a laptop's first-boot load,
-# and the prometheus and grafana jobs scrape every 15s so they read "unknown" for up
-# to 15 seconds after boot. Gating on all six turns a healthy stack into a timeout.
+# Reported, never gated. temporal-server serves hundreds of families against a 900ms
+# scrape_timeout and flaps under first-boot load; prometheus and grafana scrape every 15s.
 for job in prometheus temporal-server pushgateway grafana; do
     if demo_pool_up "$job"; then
         printf '  %-30s up\n' "$job"
@@ -451,12 +398,8 @@ for job in prometheus temporal-server pushgateway grafana; do
 done
 demo_note "those four are reported, not gated. http://localhost:9090/targets has the live answer."
 
-# ---------------------------------------------------------------------------
-# 7. Summary
-# ---------------------------------------------------------------------------
-#
-# Printed BEFORE the seed run, which blocks for over a minute and can fail. The table
-# is the output the user is waiting for, so it must not be hostage to phase 8.
+# 7. Summary, printed before the seed run: that blocks for over a minute and can fail,
+# and this table is the output the user is waiting for.
 
 demo_phase 7 $PHASES "the demo is live"
 demo_url_table
@@ -465,19 +408,15 @@ printf '  logs   %s\n' "${DEMO_DIR#$REPO_ROOT/}/{worker,loadgen,starter}.log"
 printf '  stop   ./scripts/demo-down.sh\n'
 printf '  boards Grafana needs no login. Open the "sandbox" folder.\n'
 
-# ---------------------------------------------------------------------------
 # 8. Seed workflow
-# ---------------------------------------------------------------------------
 
 demo_phase 8 $PHASES "seed workflow $WORKFLOW_ID"
 STARTER_BIN=$(demo_field starter bin)
 STARTER_LOG=$(demo_log_path starter)
 demo_note "60 steps of 1s plus 150ms injected latency, so about 70s at best. fault.failureRate 0.15 with 5 attempts can add retry backoff."
 
-# --restart is mandatory and must be written bare. Without it a second demo-up.sh hits
-# WorkflowAlreadyStartedException, ATTACHES to the previous repro-workflow, and waits
-# for however long that run has left behind one log line nobody connects to the cause.
-# It is in Flags.Switches, so `--restart=true` is a hard error by design.
+# --restart is mandatory and must be written bare: without it a second demo-up.sh attaches
+# to the previous repro-workflow. It is in Flags.Switches, so `--restart=true` is an error.
 demo_launch_attached starter "$REPO_ROOT/$STARTER_BIN" "$STARTER_LOG" \
     --restart --config "$CONFIG"
 SEED_PID=$DEMO_LAUNCHED_PID

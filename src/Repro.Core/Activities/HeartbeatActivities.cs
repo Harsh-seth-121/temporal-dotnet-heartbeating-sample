@@ -7,33 +7,22 @@ using Temporalio.Exceptions;
 namespace Repro.Core.Activities;
 
 /// <summary>
-/// The seed activity: a long, resumable, heartbeating batch, plus the fault
-/// injector that gives the dashboards something to show.
+/// The seed activity: a long, resumable, heartbeating batch, plus the fault injector that
+/// gives the dashboards something to show.
 /// </summary>
 /// <remarks>
-/// Registered as an INSTANCE with
-/// <c>.AddAllActivities(new HeartbeatActivities(cfg.Fault, cfg.Worker))</c>.
-/// That is the .NET replacement for the Go original's package-level
-/// <c>faultConfig</c> + <c>SetFaultConfig</c>: with constructor injection there is
-/// no ambient global for workflow code to reach, so "workflows must never read the
-/// fault config" is enforced by the type system rather than by a comment.
-/// <para>
-/// The WORKER config arrives the same way, for a duller reason: the throttle gauge
-/// below has to report the intervals this worker was actually built with. Hard-coded
-/// constants agree with them right up until someone edits config.yaml, and then the
-/// gauge lies on a panel whose entire job is to explain the throttle.
-/// </para>
-/// <para>
-/// Randomness and wall-clock are fine in here. This is activity code, not workflow code.
-/// </para>
+/// Registered as an instance with
+/// <c>.AddAllActivities(new HeartbeatActivities(cfg.Fault, cfg.Worker))</c>. Constructor
+/// injection leaves no ambient global for workflow code to reach, so "workflows must never
+/// read the fault config" is a type-system rule. Canonical site for that argument. The worker
+/// config arrives the same way so <see cref="ThrottleMs"/>'s gauge reports the intervals this
+/// worker was built with. Randomness and wall clock are fine here: this is activity code.
 /// </remarks>
 public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker = null)
 {
-    // Optional so a caller that has not been taught to pass it still lands on the
-    // SDK's own throttle defaults (60s/30s) rather than a null deref. Any worker
-    // built from a config.yaml whose worker.*HeartbeatThrottleInterval differ MUST
-    // pass its WorkerConfig here, or repro_heartbeat_throttle_ms reports a number
-    // that nothing in the process is using.
+    // Optional so a caller that omits it lands on the SDK's throttle defaults (60s/30s). A
+    // worker whose config.yaml sets different worker.*HeartbeatThrottleInterval values must
+    // pass its WorkerConfig, or repro_heartbeat_throttle_ms reports an unused number.
     private readonly WorkerConfig workerConfig = worker ?? new WorkerConfig();
 
     [Activity]
@@ -41,9 +30,9 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        // Capture ONCE. ActivityExecutionContext.Current is an AsyncLocal lookup and
-        // it throws outside an activity — which matters the moment you move a
-        // heartbeat into a background timer or a Task.Run loop.
+        // Capture once. Canonical note for all four activities: ActivityExecutionContext.Current
+        // is an AsyncLocal lookup that throws outside an activity and does not flow into a
+        // Task.Run, a Parallel.For, a continuation or a background timer.
         var ctx = ActivityExecutionContext.Current;
         var meter = ctx.MetricMeter;
         var log = ctx.Logger;
@@ -51,18 +40,13 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
         var heartbeatTimeout = ctx.Info.HeartbeatTimeout ?? TimeSpan.Zero;
         var stepDuration = TimeSpan.FromMilliseconds(input.StepDurationMs);
 
-        // The REAL gap between two Heartbeat() calls, which is stepDuration PLUS the
-        // injected latency: DoStepAsync awaits both before the loop reaches the
-        // heartbeat. Publishing stepDuration alone under-reports the cadence by
-        // exactly fault.latency (400 vs a measured 550 at the shipped 400ms/150ms),
-        // which is a fine way to conclude the throttle is doing something it is not.
+        // The real gap between Heartbeat() calls: DoStepAsync awaits step plus injected
+        // latency. stepDuration alone under-reports it by fault.latency, 400 against a
+        // measured 550 at the shipped 400ms/150ms.
         var heartbeatCallInterval = stepDuration + fault.Latency;
 
-        // These three gauges are what make the throttle legible on the heartbeat
-        // board. They come from the ACTIVITY meter, never TemporalRuntime.MetricMeter:
-        // the runtime meter carries no root tags, so those series would arrive with
-        // no namespace/task_queue and every {namespace="$namespace"} selector on
-        // every panel would silently drop them.
+        // Activity meter, never TemporalRuntime.MetricMeter: the runtime meter carries no
+        // root tags, so every {namespace="$namespace"} panel selector would drop these.
         meter.CreateGauge<long>(MetricNames.HeartbeatTimeoutMs, "ms")
             .Set((long)heartbeatTimeout.TotalMilliseconds);
         meter.CreateGauge<long>(MetricNames.HeartbeatCallIntervalMs, "ms")
@@ -70,9 +54,8 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
         meter.CreateGauge<long>(MetricNames.HeartbeatThrottleMs, "ms")
             .Set(ThrottleMs(heartbeatTimeout));
 
-        // Resume. There is no HasHeartbeatDetails helper in .NET (unlike Go), and
-        // HeartbeatDetailAtAsync uses ElementAt, which throws if the index is absent
-        // — so the Count check is required, not defensive.
+        // The Count check is required, not defensive: .NET has no HasHeartbeatDetails helper
+        // and HeartbeatDetailAtAsync uses ElementAt, which throws when the index is absent.
         Checkpoint? checkpoint = null;
         if (ctx.Info.HeartbeatDetails.Count > 0)
         {
@@ -81,10 +64,8 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
 
         var start = checkpoint is null ? 1 : checkpoint.Progress + 1;
 
-        // LOWERCASE, via Bool(). .NET's bool.ToString() returns "True"/"False" with a
-        // capital letter, while Go's fmt.Sprintf("%t") returns "true"/"false" — and
-        // every dashboard selector, ported from the Go boards, matches retried="true".
-        // Capitalized values do not error; the panel is just permanently empty.
+        // Lowercased by hand via Bool(). bool.ToString() returns "True", dashboard selectors
+        // match retried="true", and a capitalized value leaves the panel empty without error.
         meter.WithTags(new Dictionary<string, object>
         {
             [MetricNames.Tags.Retried] = Bool(ctx.Info.Attempt > 1),
@@ -93,11 +74,8 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
 
         if (checkpoint is not null)
         {
-            // THE number this repo exists to show. Core throttles heartbeats to
-            // min(HeartbeatTimeout x 0.8, MaxHeartbeatThrottleInterval), so the
-            // details the server holds lag what the activity actually did. This
-            // measures that lag directly, and it is why resume must be idempotent:
-            // some work WILL be redone.
+            // The number this repo exists to show. Core throttles heartbeats (see
+            // ThrottleMs), so the server's details lag the activity and some work is redone.
             var staleness = DateTimeOffset.UtcNow - checkpoint.RecordedAtUtc;
             meter.CreateHistogram<TimeSpan>(MetricNames.HeartbeatStaleness).Record(staleness);
             log.LogInformation(
@@ -110,61 +88,40 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
                 start, input.Steps, ctx.Info.Attempt);
         }
 
-        // LAST-WRITER-WINS, and left that way on purpose. The activity meter's root
-        // tags are namespace/task_queue/activity_type, so this is ONE series per
-        // process: at loadgen.concurrency 8 all eight in-flight activities write it
-        // and the panel shows whichever wrote most recently. The only tags that would
-        // separate them — workflow_id, run_id, activity_id — are unbounded, and a
-        // gauge that ticks once per step is the last place to introduce unbounded
-        // cardinality into the Prometheus you are debugging with. So read it as "some
-        // activity on this worker reached step N", and watch it against a single
-        // execution (the starter, or `--concurrency 1`) when you want the monotone
-        // climb the stopHeartbeating recipe in docs/HEARTBEATING.md describes.
+        // Last-writer-wins, deliberately: one series per process, so at loadgen.concurrency 8
+        // all eight in-flight activities write it and the only separating tags (workflow_id,
+        // run_id, activity_id) are unbounded. Watch a single execution for the monotone climb.
         var progressGauge = meter.CreateGauge<long>(MetricNames.ActivityProgress);
         var heartbeatCounter = meter.CreateCounter<long>(MetricNames.HeartbeatSent);
 
-        // FAULT: fail this ATTEMPT, retryably, with probability fault.failureRate.
-        //
-        // ONE roll per attempt, outside the loop, exactly like the Go original
-        // (activity.go: a single rand.Float64() with no loop to hide in). Rolling
-        // per STEP instead makes P(attempt fails) = 1-(1-r)^steps: at the shipped
-        // r=0.15 and steps=60 that is 99.99%, every attempt dies, all five retries
-        // are consumed and the workflow FAILS terminally — the exact opposite of the
-        // "retried but recovered" signal this knob is documented to produce.
-        //
-        // WHICH step it fails at is a second, independent draw, and it does not
-        // affect that probability. It exists so the failure lands mid-batch, leaving
-        // a checkpoint behind for the next attempt to resume from — that resume is
-        // the only thing under the shipped config that makes repro_heartbeat_staleness
-        // and resumed="true" fire at all.
+        // Fault: fail this attempt, retryably, with probability fault.failureRate. One roll
+        // per attempt, outside the loop, because rolling per step makes
+        // P(attempt fails) = 1-(1-r)^steps: at the shipped r=0.15 and steps=60 that is 99.99%,
+        // every attempt dies and the workflow fails terminally, the opposite of the "retried
+        // but recovered" signal. Which step it fails at is an independent draw that leaves a
+        // checkpoint mid-batch, and that resume is the only thing under the shipped config
+        // that makes staleness and resumed="true" fire.
         var failAtStep = fault.FailureRate > 0 && Random.Shared.NextDouble() < fault.FailureRate
             ? Random.Shared.Next(start, input.Steps + 1)
             : 0;
 
-        // Declared out here so the ignoreCancellation recovery loop in the catch can
-        // see how far we actually got. Scoped to the for-loop it was invisible down
-        // there, so recovery restarted from `start`, redid finished work and walked
-        // repro_activity_progress BACKWARDS on a gauge that is supposed to climb.
+        // Declared out here so the ignoreCancellation recovery loop can see how far we got.
+        // Scoped to the for-loop, recovery restarted from `start` and walked
+        // repro_activity_progress backwards on a gauge that is supposed to climb.
         var progress = start;
 
-        // The drain checkpoint is an EDGE, not a level; see the loop.
+        // The drain checkpoint is an edge, not a level; see the loop.
         var checkpointedForDrain = false;
 
         try
         {
-            // FAULT: stall past the heartbeat timeout, attempt 1 only.
-            //
-            // Every attempt would be an infinite retry loop that reads as a hang.
-            // Two things happen in order and both are the point: the server's
-            // activity-timeout timer fires and times this ATTEMPT out, and we keep
-            // running regardless, because the only channel the server has to tell us
-            // is the response to a heartbeat RPC and we are not sending any.
-            //
-            // It moves the heartbeat board's per-ATTEMPT panel —
-            // activity_task_timeout{timeout_type="Heartbeat"} — and NOTHING ELSE.
-            // The workflow outcome stays `completed`: attempt 2 is not gated, runs
-            // normally, and succeeds well inside MaximumAttempts=5. For an outcome of
-            // timed_out you want stopHeartbeating, below, which starves every attempt.
+            // Fault: stall past the heartbeat timeout, attempt 1 only; on every attempt it
+            // would be an infinite retry loop that reads as a hang. The server times this
+            // attempt out while we keep running, because its only channel to tell us is the
+            // response to a heartbeat RPC and we send none. That moves
+            // activity_task_timeout{timeout_type="Heartbeat"} and nothing else: the outcome
+            // stays completed because attempt 2 is not gated. For timed_out use
+            // stopHeartbeating, below.
             if (fault.StallPastHeartbeatTimeout && ctx.Info.Attempt == 1)
             {
                 var stall = heartbeatTimeout + TimeSpan.FromSeconds(2);
@@ -175,19 +132,12 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
 
             for (; progress <= input.Steps; progress++)
             {
-                // WorkerShutdownToken fires FIRST, at shutdown start; CancellationToken
-                // follows GracefulShutdownTimeout later. That gap is the only chance to
-                // checkpoint, and taking it is what lets the restarted worker resume
-                // near where this one stopped instead of at the last throttled heartbeat.
-                //
-                // ONCE, on the edge. The token stays signalled for the whole graceful
-                // window, so an ungated branch re-fires every step and adds a bogus
-                // heartbeat to repro_heartbeat_sent per step for up to
-                // gracefulShutdownTimeout. There is also nothing to throw here: the
-                // real CancellationToken has not fired yet, which made the
-                // ThrowIfCancellationRequested that used to sit here a no-op for the
-                // entire window. When it does fire, DoStepAsync is awaiting on it and
-                // raises it from there.
+                // WorkerShutdownToken fires at shutdown start, CancellationToken follows
+                // GracefulShutdownTimeout later. That gap is the only chance to checkpoint,
+                // and taking it lets the restarted worker resume near where this one stopped.
+                // Gated on the edge because the token stays signalled for the whole window, so
+                // an ungated branch adds a bogus repro_heartbeat_sent tick every step. Nothing
+                // to throw here: the real CancellationToken has not fired yet.
                 if (!checkpointedForDrain && ctx.WorkerShutdownToken.IsCancellationRequested)
                 {
                     checkpointedForDrain = true;
@@ -207,24 +157,20 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
 
                 progressGauge.Set(progress);
 
-                // FAULT: keep working, stop heartbeating. Proves an activity that
-                // stops heartbeating can never be cancelled — and that its progress
-                // gauge keeps climbing while the heartbeat RPC rate falls to zero.
-                //
-                // Unlike stallPastHeartbeatTimeout this is NOT gated to attempt 1, so
-                // all five attempts heartbeat-time-out, the retry policy is exhausted,
-                // and the terminal failure really is
-                // ActivityFailure -> TimeoutFailure{Heartbeat}. THIS is the knob that
-                // moves the signals board's outcome split to timed_out.
+                // Fault: keep working, stop heartbeating. See docs/GOTCHAS.md, "An activity
+                // that does not heartbeat can never be cancelled". Not gated to attempt 1, so
+                // all five attempts heartbeat-time-out and the terminal failure is
+                // ActivityFailure -> TimeoutFailure{Heartbeat}, which is what moves the
+                // outcome split to timed_out.
                 if (!fault.StopHeartbeating)
                 {
-                    // Safe to call every iteration: Core throttles internally, so this
-                    // does not hammer the server. The cost is staleness, measured above.
+                    // Safe every iteration: Core throttles internally. The cost is the
+                    // staleness measured above.
                     ctx.Heartbeat(new Checkpoint(progress, DateTimeOffset.UtcNow));
 
-                    // Counted at the CALL SITE, before the throttle. Comparing this to
-                    // rate(temporal_request{operation="RecordActivityTaskHeartbeat"})
-                    // is what makes the throttle visible on the heartbeat board.
+                    // Counted at the call site, before the throttle. Compared against
+                    // rate(temporal_request{operation="RecordActivityTaskHeartbeat"}) it is
+                    // what makes the throttle visible.
                     heartbeatCounter.Add(1);
                 }
             }
@@ -239,13 +185,10 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
                 [MetricNames.Tags.Reason] = ctx.CancelReason.ToString(),
             }).CreateCounter<long>(MetricNames.ActivityCancel).Add(1);
 
-            // FAULT: swallow the cancellation and finish anyway.
-            //
-            // The activity is only "cancelled" if this exception escapes. Swallowing
-            // it means TemporalWorker.ExecuteAsync will not return until the batch
-            // finishes on its own — and gracefulShutdownTimeout does NOT bound that,
-            // it only controls when ctx.CancellationToken fires. This wedges your
-            // terminal for the rest of the batch. That is the demo.
+            // Fault: swallow the cancellation and finish anyway. The activity is cancelled
+            // only if this exception escapes, so TemporalWorker.ExecuteAsync will not return
+            // until the batch finishes; gracefulShutdownTimeout only controls when
+            // ctx.CancellationToken fires.
             if (fault.IgnoreCancellation)
             {
                 log.LogWarning(
@@ -253,9 +196,8 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
                     "from step {Progress}. The worker will not exit until this returns.",
                     ctx.CancelReason, progress);
 
-                // Resumes from `progress`, not from `start`. The step the cancellation
-                // interrupted is redone (its await never completed); everything before
-                // it is not.
+                // Resumes from `progress`, not `start`. The interrupted step is redone
+                // because its await never completed; everything before it is not.
                 for (; progress <= input.Steps; progress++)
                 {
                     await DoStepAsync(stepDuration, CancellationToken.None).ConfigureAwait(false);
@@ -273,9 +215,8 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
     /// <summary>One unit of work, plus the injected latency.</summary>
     private async Task DoStepAsync(TimeSpan stepDuration, CancellationToken cancellationToken)
     {
-        // Passing the token into every await is the mechanism by which cancellation
-        // is observed at all. A synchronous CPU-bound loop here would heartbeat fine
-        // and still be uncancellable.
+        // The token in every await is how cancellation is observed. A synchronous CPU-bound
+        // loop here would heartbeat fine and still be uncancellable.
         await Task.Delay(stepDuration, cancellationToken).ConfigureAwait(false);
 
         if (fault.Latency > TimeSpan.Zero)
@@ -291,17 +232,12 @@ public sealed class HeartbeatActivities(FaultConfig fault, WorkerConfig? worker 
     /// Core's throttle: <c>min(HeartbeatTimeout x 0.8, MaxHeartbeatThrottleInterval)</c>,
     /// falling back to <c>DefaultHeartbeatThrottleInterval</c> when the timeout is 0 or unset.
     /// </summary>
-    /// <remarks>
-    /// Recomputed here rather than read from the SDK because Core does not expose it.
-    /// The two intervals come from the SAME WorkerConfig the host used to set
-    /// TemporalWorkerOptions, so the gauge cannot drift from the worker the way a
-    /// pair of literals did.
-    /// </remarks>
+    /// <remarks>Recomputed because Core does not expose it. Both intervals come from the
+    /// same WorkerConfig the host used to set TemporalWorkerOptions, so it cannot drift.</remarks>
     private long ThrottleMs(TimeSpan heartbeatTimeout)
     {
-        // There is a server bug that turns an unset heartbeat timeout into 0, which
-        // is why Core treats 0 and unset identically instead of throttling at zero
-        // and hammering the server.
+        // A server bug turns an unset heartbeat timeout into 0, so Core treats 0 and unset
+        // identically rather than throttling at zero and hammering the server.
         if (heartbeatTimeout <= TimeSpan.Zero)
         {
             return (long)workerConfig.DefaultHeartbeatThrottleInterval.TotalMilliseconds;

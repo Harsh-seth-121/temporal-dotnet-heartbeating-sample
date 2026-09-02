@@ -9,8 +9,8 @@
     0000000001 [amber pebble willow amber lantern brook copper]
 
 Line 1 is the row count. Every row is a 10-digit zero-padded index, a space, then seven
-words from words-1024.txt in brackets. Words may repeat WITHIN a row; no two rows are
-identical and no two share a seven-word tuple, a guarantee rather than a probability. S
+words from words-1024.txt in brackets. Words may repeat within a row; no two rows are
+identical and dont share a seven-word tuple.
 """
 
 import argparse
@@ -28,7 +28,6 @@ from enum import Enum, IntEnum, auto
 from pathlib import Path
 from typing import NamedTuple, Optional
 
-# --- format ----------------------------------------------------------------
 # Row bytes: 10 index digits + ' ' + '[' + 7 words + 6 inner spaces + ']' + '\n'.
 # Everything except the words themselves is fixed, hence ROW_OVERHEAD.
 IDX_WIDTH = 10          # holds 9,999,999,999 rows, well past the billion asked for
@@ -37,9 +36,8 @@ ROW_OVERHEAD = IDX_WIDTH + 1 + 1 + (WORDS_PER_ROW - 1) + 1 + 1   # == 20
 ROW_FMT = b"%010d [%s %s %s %s %s %s %s]\n"
 ROW_RE = re.compile(rb"^[0-9]{10} \[[a-z]+(?: [a-z]+){6}\]$")
 
-# --- the bijection ---------------------------------------------------------
 # WORD_COUNT must be a power of two and BITS_PER_WORD its log2. 1024**7 == 2**70, so a
-# bijection on 70 bits IS a bijection on the space of seven-word tuples.
+# bijection on 70 bits is a bijection on the space of seven-word tuples.
 WORD_COUNT = 1024
 BITS_PER_WORD = 10
 WORD_MASK = WORD_COUNT - 1
@@ -52,7 +50,6 @@ GOLDEN = 0x9E3779B97F4A7C15
 MIX_A = 0xBF58476D1CE4E5B9
 MIX_B = 0x94D049BB133111EB
 
-# --- io --------------------------------------------------------------------
 FLUSH_BYTES = 1 << 20    # buffer rows to ~1 MiB, never one write() per row
 COPY_CHUNK = 1 << 22     # 4 MiB, used for the header-prepend copy
 
@@ -60,15 +57,13 @@ DEFAULT_SIZES = "100MB,200MB,350MB,500MB"
 DEFAULT_SEED = 1234567890123456789
 BENCH_ROWS = 1000000
 
-# Known answer for the documented stream: the seven word INDICES of row 1 of the 200 MB
-# file recorded in MANIFEST.txt, i.e. word_indices(tuple_bits(1, round_keys(file_seed(
-# DEFAULT_SEED, KNOWN_TARGET)))). Indices, not words, so a custom --words list cannot fail
-# it; what it pins is the arithmetic. Change this constant and every sha256 in MANIFEST.txt
-# and the 1.15 GB on disk describe something else, so regenerate rather than re-record.
+# Known answer for the documented stream: the seven word indices of row 1 of the 200 MB
+# file in MANIFEST.txt. Indices, not words, so a custom --words list cannot fail it; what
+# it pins is the arithmetic. Change it and every sha256 in MANIFEST.txt is stale.
 KNOWN_TARGET = 200_000_000
 KNOWN_ROW1_INDICES = (159, 181, 495, 262, 518, 393, 413)
-# Enough rows to cross the 10/100/1000 odometer boundaries inside generate_body, which
-# is where an inlined hot loop is most likely to disagree with the reference.
+# Enough rows to cross the 10/100/1000 odometer boundaries inside generate_body, where an
+# inlined hot loop is most likely to disagree with the reference.
 REFERENCE_ROWS = 2000
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -82,9 +77,9 @@ class Exit(IntEnum):
         member.label = label
         return member
 
-    OK = 0,
-    USAGE = 2,
-    NO_INTERPRETER = 3,
+    OK = 0, "ok"
+    USAGE = 2, "usage error"
+    NO_INTERPRETER = 3, "python older than 3.11"
     BAD_WORDS = 4, "bad word list"
     EXISTS = 5, "output exists without --force"
     VERIFY = 6, "verify failed"
@@ -120,16 +115,12 @@ def round_keys(seed):
 def tuple_bits(i, keys):
     """Map a row index to 70 bits, injectively.
 
-    A balanced Feistel network is a bijection for ANY round function, so distinct i
-    can never collide. That is what makes tuple uniqueness a guarantee with zero
-    memory: no dedupe set, nothing that grows with the 8.6M rows of a 500 MB file.
+    A balanced Feistel network is a bijection for any round function, so distinct i can
+    never collide and tuple uniqueness costs no memory: no dedupe set, nothing that grows
+    with the 8.6M rows of a 500 MB file.
 
-    Reference implementation. The generator inlines this for speed, and check_reference
-    below is what holds the two together: --selftest runs both over the same rows and
-    fails on the first disagreement. It has to, because nothing else notices. --verify
-    is handed a path and no seed, so all it can check is that the tuples are DISTINCT,
-    and any injective map satisfies that -- including a broken one that rewrote the
-    whole corpus.
+    Reference implementation; generate_body inlines it for speed. check_reference is the
+    only thing that catches the two drifting apart.
     """
     left = (i >> HALF_BITS) & HALF_MASK
     right = i & HALF_MASK
@@ -145,10 +136,9 @@ def word_indices(bits):
 def load_words(path):
     """Read and hard-validate the word list.
 
-    Every failure here is fatal rather than a warning. A quietly 1023-entry list would
-    not raise anything; it would just silently void the uniqueness guarantee, because
-    1023**7 is not a power of two and the bit-slicing above would stop being a
-    bijection onto the tuple space.
+    Every failure here is fatal. A quietly 1023-entry list raises nothing but voids the
+    uniqueness guarantee: 1023**7 is not a power of two, so the bit-slicing above stops
+    being a bijection onto the tuple space.
     """
     if not os.path.isfile(path):
         die(Exit.BAD_WORDS, f"word list not found: {path}")
@@ -196,11 +186,10 @@ def output_name(text):
 
 
 def file_seed(base, target):
-    """Per-file seed derived from the TARGET SIZE, not from position in --sizes.
+    """Per-file seed derived from the target size, not from position in --sizes.
 
-    `--sizes 200MB` on its own must reproduce byte-for-byte what the default four-file run
-    produced for 200MB. Keying on list position would make the same file differ depending
-    on what it was generated alongside, quietly invalidating MANIFEST.txt.
+    So `--sizes 200MB` alone reproduces the default run's 200MB file byte-for-byte, and
+    MANIFEST.txt stays valid. See README.md, "Reproducibility".
     """
     return mix(base + target)
 
@@ -208,16 +197,13 @@ def file_seed(base, target):
 def generate_body(handle, target, seed, words, max_rows=None):
     """Write body rows to handle. Returns (rows, body_bytes).
 
-    Stops before the first row that would push header+body past target, or at
-    max_rows if given. max_rows exists for --bench, which wants a fixed row count
-    rather than a fixed byte count and has no business guessing the average row
-    width to convert between them. Header length
-    is monotonic in the row count, so testing it inside the loop is correct and needs
-    no second solve; digits is tracked as an odometer rather than via str(i) because
-    this runs eight million times.
+    Stops before the first row that would push header+body past target, or at max_rows if
+    given; --bench uses max_rows because it wants a row count, not a byte count. Header
+    length is monotonic in the row count, so testing it inside the loop is correct. digits
+    is an odometer rather than str(i) because this runs eight million times.
 
-    This is the hot loop, so mix() and tuple_bits() are inlined and every constant is
-    bound to a local. Keep it in step with the reference versions above.
+    Hot loop: mix() and tuple_bits() are inlined and every constant is bound to a local.
+    Keep it in step with them.
     """
     encoded = [w.encode("ascii") for w in words]
     lengths = [len(w) for w in encoded]
@@ -294,15 +280,9 @@ def check_reference(words):
     """Fail if the emitted stream has drifted from the documented one.
 
     Two halves, because they catch different edits. The known answer pins the reference
-    itself against the stream MANIFEST.txt was built from; the row-by-row comparison
-    pins generate_body's inlined copy against the reference. Neither alone is enough: a
-    maintainer who "tidies" the hot loop breaks only the second, and one who tidies both
-    the same way breaks only the first.
-
-    Without this the reference above is unreachable code and the comment telling you to
-    keep the two in agreement is unenforced. --selftest would still pass, because it
-    compares one build to itself, and --verify would still pass, because distinct tuples
-    are all it looks for -- while every corpus on disk quietly became a different file.
+    against the stream MANIFEST.txt was built from; the row-by-row comparison pins
+    generate_body's inlined copy against the reference. Nothing else notices a drift:
+    --selftest compares a build to itself, and --verify only asks for distinct tuples.
     """
     seed = file_seed(DEFAULT_SEED, KNOWN_TARGET)
     keys = round_keys(seed)
@@ -337,13 +317,11 @@ def check_reference(words):
 def published_atomically(final_path, mode):
     """Open a sibling '.<name>.part', hand it over, and os.replace it into place.
 
-    Nothing ever appears under the final name half-written. os.replace is atomic within a
-    filesystem and the staging file sits in final_path's own directory, so it is the same
-    filesystem by construction. If the body raises, the staging file goes and final_path is
-    left alone; the exception keeps propagating, so callers wanting an exit code rather than
-    a traceback catch it OUTSIDE the with. Plain open, not mkstemp, because mkstemp hands
-    back 0600 instead of the umask-respecting mode every other file here gets. The staging
-    path uses final_path AS SPELLED, not an abspath, since os.replace only needs siblings.
+    Nothing appears under the final name half-written; a sibling staging file makes
+    os.replace same-filesystem and atomic. If the body raises, the staging file goes and
+    final_path is left alone, and the exception keeps propagating, so a caller wanting an
+    exit code catches it outside the with. Plain open, not mkstemp, which forces 0600
+    instead of the umask-respecting mode every other file here gets.
     """
     final = Path(final_path)
     staged = final.parent / f".{final.name}.part"
@@ -362,13 +340,11 @@ def finalize(tmp_path, final_path, rows):
     """Prepend the header and hash the result in the same pass.
 
     The row count is only known once the body exists and the header is variable width, so
-    there is no reserving space up front. One copy beats a second generation pass and reads
-    every byte anyway, so the sha256 for MANIFEST.txt is free. It lands in a second temp
-    published with os.replace, never streamed into final_path, and costs about a third of a
-    second on the 500 MB file. A partial write under the FINAL name is the worst wreck
-    available: valid header, thousands of valid rows, nothing saying the run did not finish,
-    and the next run refusing with "pass --force". With --force it is worse, because
-    open(final_path, "wb") truncates a good corpus before one new byte is known writable.
+    space cannot be reserved up front. The copy reads every byte anyway, so MANIFEST.txt's
+    sha256 is free, at about a third of a second on the 500 MB file. It publishes through a
+    second temp rather than streaming into final_path: a partial write under the final name
+    looks like a finished file, and --force truncates a good corpus before one new byte is
+    known writable.
     """
     digest = hashlib.sha256()
     header = f"{rows}\n".encode("ascii")
@@ -415,10 +391,8 @@ def generate_one(out_dir, size_text, base_seed, words, force):
                     f"target {size_text} is too small to hold even one row")
             size, digest = finalize(tmp_path, final_path, rows)
         except OSError as exc:
-            # A full or read-only volume is the ordinary way to get here, and without this
-            # the user gets a raw traceback out of the middle of finalize(), which reads as
-            # a tool bug rather than as "your disk is full". SystemExit from die() is not an
-            # OSError, so the rows==0 path above still passes through.
+            # A full or read-only volume is the ordinary way here. SystemExit from die()
+            # is not an OSError, so the rows==0 path above still passes through.
             die(Exit.IO, f"cannot write {final_path}: {exc}")
     finally:
         if os.path.exists(tmp_path):
@@ -450,9 +424,8 @@ def read_manifest(path):
 
 class HeaderState(Enum):
     ABSENT = auto()
-    # The state read_manifest_header reports when the file HAS a "# base seed" line
-    # that will not parse. Deliberately distinct from "no header line at all", which is
-    # the documented opt-out for a hand-written manifest.
+    # What read_manifest_header reports when the file has a "# base seed" line that will
+    # not parse. Distinct from no header line at all, the documented opt-out.
     MALFORMED = auto()
     PARSED = auto()
 
@@ -466,14 +439,11 @@ class ManifestHeader(NamedTuple):
 def read_manifest_header(path):
     r"""Recover the (base seed, out dir) a manifest was written for.
 
-    HeaderState.ABSENT covers a missing file or one with no such comment: that is how a
-    hand-written or pre-header manifest opts out of the identity check instead of tripping
-    it. A line that starts like a header and will not parse is MALFORMED, which
-    manifest_conflict refuses, since this tool only writes headers this pattern reads back.
-    The seed pattern is -?\d+ rather than \d+ because argparse accepts `--seed=-5` and
-    write_manifest formats it with %d. A header written one command ago and unreadable now
-    reports ABSENT, manifest_conflict reads ABSENT as consent, and the guard is off for that
-    manifest permanently, for every later seed and every later --out.
+    ABSENT covers a missing file or one with no such comment, which is how a hand-written or
+    pre-header manifest opts out of the identity check. A line that starts like a header and
+    will not parse is MALFORMED, which manifest_conflict refuses; reporting ABSENT instead
+    would read as consent and disable the guard for that manifest permanently. The seed
+    pattern is -?\d+ rather than \d+ because argparse accepts `--seed=-5`.
     """
     if not Path(path).is_file():
         return ManifestHeader(HeaderState.ABSENT)
@@ -500,14 +470,10 @@ def resolve_recorded_out(manifest_path, recorded):
 
     write_manifest records the path relative to the manifest's own directory, so the first
     candidate below is exact from any working directory. Older manifests recorded the raw
-    --out string, "sample_files" rather than today's "../../sample_files". Resolving that
-    against the CURRENT cwd, as this used to, is how `cd /tmp && gen-samples.sh` merged a run
-    that wrote /tmp/sample_files into the manifest describing the repository's, while
-    `--out <repo>/sample_files` was refused. A relative value is therefore tried against the
-    manifest's directory and then each parent, deepest first, first hit wins: a pre-fix
-    scripts/gen-samples/MANIFEST.txt resolves "sample_files" to <repo>/sample_files, and
-    deepest-first stays deterministic when two ancestors both hold one. None means
-    undecidable, and manifest_conflict refuses rather than guessing.
+    --out string; resolved against the current cwd, as this used to, `cd /tmp &&
+    gen-samples.sh` merged a /tmp run into the manifest describing the repository's corpus.
+    A relative value is therefore tried against the manifest's directory and then each
+    parent, deepest first. None means undecidable, and manifest_conflict refuses.
     """
     recorded_path = Path(recorded)
     if recorded_path.is_absolute():
@@ -523,15 +489,11 @@ def resolve_recorded_out(manifest_path, recorded):
 def manifest_conflict(path, out_dir, base_seed):
     """Message if writing this run into `path` would relabel rows it did not produce.
 
-    Entries are keyed on the bare file name, not the directory the file went to and not the
-    seed that made it. --manifest defaults to the COMMITTED MANIFEST.txt beside this script,
-    so without this check a scratch run with a different --out or --seed overwrites the row
-    describing the real corpus in sample_files, and rebuilds the header lines besides,
-    leaving "base seed 7   out /tmp/scratch" above rows produced by another seed into
-    another directory. The README's own recipe, shasum a corpus and grep its name in
-    MANIFEST.txt, then disagrees for a perfectly intact file and sends the reader hunting a
-    corruption bug that does not exist. Refusing is the same contract as an output file that
-    already exists.
+    Entries are keyed on the bare file name, not on the --out directory or the seed, and
+    --manifest defaults to the committed MANIFEST.txt beside this script. Without this check
+    a scratch run overwrites the row describing the real corpus in sample_files and rewrites
+    the header above rows another seed produced elsewhere, so the README's shasum-and-grep
+    recipe then disagrees for a perfectly intact file.
     """
     entries = read_manifest(path)
     if not entries:
@@ -544,10 +506,9 @@ def manifest_conflict(path, out_dir, base_seed):
                 "--manifest PATH.")
     if header.state is HeaderState.ABSENT:
         return None
-    # Identity is the resolved DIRECTORY on both sides, never the spelling. "sample_files"
-    # from the repository root, an absolute path, and "../../sample_files" from
-    # scripts/gen-samples all name one corpus; "sample_files" typed in /tmp names another.
-    # realpath alone cannot tell those apart, which is what resolve_recorded_out is for.
+    # Identity is the resolved directory on both sides, never the spelling: "sample_files"
+    # from the repo root and "../../sample_files" from here name one corpus, one typed in
+    # /tmp names another. resolve_recorded_out is what separates them.
     recorded_dir = resolve_recorded_out(path, header.out)
     if recorded_dir is None:
         return (f"{path} records out {header.out}, a relative path, and no directory "
@@ -558,8 +519,7 @@ def manifest_conflict(path, out_dir, base_seed):
     out_resolved = Path(out_dir).resolve()
     if header.seed == base_seed and recorded_dir == out_resolved:
         return None
-    # Resolved directories in the message, not the raw spellings: "out sample_files, but
-    # this run is out sample_files" would be the least helpful refusal imaginable.
+    # Resolved directories in the message; the raw spellings would refuse uselessly.
     return (f"{path} records base seed {header.seed} out {recorded_dir}, but this run is "
             f"base seed {base_seed} out {out_resolved}. "
             "Entries there are keyed on file name alone, so writing this run into it "
@@ -570,15 +530,13 @@ def manifest_conflict(path, out_dir, base_seed):
 def manifest_unwritable(path):
     """Message if the manifest cannot be used, or None.
 
-    main() calls this before generating, write_manifest again at the end. The default set is
-    46 seconds of work, and a chmod 444 MANIFEST.txt, a --manifest pointing into a directory
-    that does not exist, or a checkout on a read-only mount used to surface only after all
-    of it, as a traceback and an undocumented exit 1 rather than the exit 8 README promises.
+    main() calls this before generating and write_manifest again at the end, so a chmod 444
+    MANIFEST.txt or a --manifest in a directory that does not exist exits 8 in a second, as
+    the README promises, rather than tracebacking after the 46 seconds the default set takes.
     Unreadable counts as unwritable: merging by name reads the entries, the identity check
-    reads the header. The DIRECTORY has to be writable even when the file is, because the
-    manifest publishes through a sibling temp and os.replace like finalize(); a read-only
-    manifest is refused anyway, since chmod 444 means "do not overwrite this". os.access is
-    advisory, so write_manifest also catches OSError. Early warning, not enforcement.
+    reads the header. The directory has to be writable even when the file is, because the
+    manifest publishes through a sibling temp. os.access is advisory, so write_manifest also
+    catches OSError.
     """
     directory = parent_dir(path)
     if not directory.is_dir():
@@ -597,17 +555,13 @@ def manifest_unwritable(path):
 
 
 def record_out(manifest_path, out_dir):
-    """The `out` value to write into the header, relative to the MANIFEST'S directory.
+    """The `out` value to write into the header, relative to the manifest's directory.
 
-    Absolute looks safer and is worse. MANIFEST.txt is COMMITTED, so an absolute path bakes
-    one machine's home directory into git and gets a teammate's clone refused by
-    manifest_conflict on their very first run. Verified: a clone under /tmp exited 2 against
-    a header reading /Users/<someone>/repos/... Relative to the manifest survives a clone or
-    a move and is the anchor resolve_recorded_out already uses; it is NOT cwd-relative, the
-    thing that made the original guard answer differently depending on where it ran. realpath
-    both sides so /var versus /private/var on macOS cannot make one directory look like two.
-    Absolute is the fallback when no relative path exists at all, a different Windows drive,
-    which resolve_recorded_out still handles.
+    MANIFEST.txt is committed, so an absolute path bakes one machine's home directory into
+    git and gets a teammate's very first run refused by manifest_conflict. Relative survives
+    a clone or a move, is not cwd-relative, and is the anchor resolve_recorded_out uses.
+    Both sides are realpath'd so /var and /private/var on macOS cannot make one directory
+    look like two.
     """
     target = Path(out_dir).resolve()
     base = parent_dir(manifest_path).resolve()
@@ -636,15 +590,12 @@ def write_manifest(path, results, out_dir, base_seed):
     """Merge by name rather than truncate.
 
     A partial run (--sizes 100MB) must not erase the provenance of the three files still on
-    disk from the previous full run. Merging is only sound when the file on disk describes
-    the same corpus this run is producing, hence the guard; main() runs the identical checks
-    up front so a mistake costs a second rather than a 46-second generate, but these are the
-    ones that hold for a caller who skipped the pre-flight. Published through a staging file
-    and os.replace like finalize(), with a stronger case: this file is the only record of
-    four gitignored corpora totalling 1.15 GB, including the sha256s the README tells you to
-    grep, and open(path, "w") truncates it before one new byte is known writable. A full
-    volume turned a 492-byte manifest into a 0-byte one, traceback on top, after the
-    generation itself had succeeded. A rename cannot lose the old record.
+    disk from the previous full run. Merging is only sound when the manifest describes the
+    corpus this run produces, hence check_manifest_ok; main() runs the same checks up front,
+    but these are the ones that hold for a caller who skipped the pre-flight. Published
+    through a staging file like finalize(), with a stronger case: this is the only record of
+    four gitignored corpora totalling 1.15 GB, and a full volume once turned a 492-byte
+    manifest into a 0-byte one after generation had already succeeded.
     """
     check_manifest_ok(path, out_dir, base_seed)
     entries = read_manifest(path)
@@ -653,10 +604,8 @@ def write_manifest(path, results, out_dir, base_seed):
     lines = [
         "# gen-samples manifest. Regenerate with: ./gen-samples.sh",
         "# Corpora are gitignored; this file is the record of what was produced.",
-        # Resolved, never the raw --out string: read back from another working directory
-        # that string names a different corpus or none, and this line's one job is to say
-        # which corpus the rows below it describe. realpath rather than abspath, so a
-        # symlinked path cannot compare unequal to itself on the next run.
+        # Resolved, never the raw --out string, which names a different corpus when read
+        # back elsewhere. realpath, not abspath, so a symlink compares equal to itself.
         f"# base seed {base_seed}   out {record_out(path, out_dir)}",
         f"# {'name':<18} {'target':<12} {'bytes':<12} {'rows':<10} sha256",
     ]
@@ -677,9 +626,9 @@ def write_manifest(path, results, out_dir, base_seed):
 def verify(path, words):
     """Stream a generated file and check every claim it makes about itself.
 
-    The tuple set is the memory-hungry part, roughly 250 MB on a 100 MB file. That is
-    fine on the small file and the point of checking the small one: the Feistel is a
-    bijection, so a clean result on any one file is evidence for all of them.
+    The tuple set is the memory-hungry part, roughly 250 MB on a 100 MB file. That is fine
+    on the small file and the point of checking the small one: the Feistel is a bijection,
+    so a clean result on any one file is evidence for all of them.
     """
     if not os.path.isfile(path):
         die(Exit.VERIFY, f"no such file: {path}")
@@ -719,12 +668,10 @@ def verify(path, words):
             else:
                 seen.add(tuple_bytes)
 
-    # Only meaningful if the scan reached EOF. Bailing out after six problems leaves `rows`
-    # wherever it got to, and comparing THAT against the header invents a "file holds 6
-    # rows" line on top of the real failures and sends the reader after the wrong bug.
+    # Only meaningful if the scan reached EOF: bailing out after six problems leaves `rows`
+    # short, and comparing that against the header invents an extra failure line.
     if truncated:
-        # insert, not append: only the first six are printed, and "there is more"
-        # is the one line that must survive that cap.
+        # insert, not append: only the first six print, and "there is more" must survive.
         problems.insert(0, "stopped after the first few problems; there may be more, and the row count was not checked")
     elif declared != rows:
         problems.append(f"header says {declared} rows, file holds {rows}")
@@ -764,14 +711,13 @@ def bench(rows, words):
 def selftest(words, words_path):
     """Prove the tool works with nothing but a temp directory.
 
-    Exists because "standalone" is a claim, and a claim should be checkable in one
-    command on a machine that has none of this repository.
+    "Standalone" is a claim, and a claim should be checkable in one command on a machine
+    that has none of this repository.
     """
     tmp_dir = tempfile.mkdtemp(prefix="gen-samples-selftest-")
     try:
         info(f"selftest in {tmp_dir}")
-        # First, because everything after it only proves this build agrees with itself: the
-        # determinism comparisons run the same code twice, and verify() gets no seed.
+        # First, because everything after it only proves this build agrees with itself.
         info(f"  reference agrees with the generator for {check_reference(words)} rows")
         results = [generate_one(tmp_dir, "2MB", DEFAULT_SEED, words, False)]
         path = os.path.join(tmp_dir, results[0].name)
@@ -846,18 +792,15 @@ def main(argv):
     if args.selftest:
         selftest(words, args.words)
         return 0
-    # `is not None`, not truthiness, exactly as --bench above. --verify "" is a wrapper
-    # whose "$CORPUS" came out empty, and reading that as "no --verify given" does not
-    # skip a check, it falls through to the generate path below with every default in
-    # place: 1.15 GB into ./sample_files, the committed manifest rewritten, exit 0 for a
-    # verification that never ran.
+    # `is not None`, not truthiness, as with --bench. --verify "" is a wrapper whose
+    # "$CORPUS" came out empty; read as "no --verify given" it falls through to generate,
+    # 1.15 GB into ./sample_files and exit 0 for a check that never ran.
     if args.verify is not None:
         verify(args.verify, words)
         return 0
 
     out_dir = args.out
-    # Both of these are caller mistakes rather than IO failures, and both used to reach
-    # os.makedirs and come out as a traceback with the undocumented exit 1.
+    # Caller mistakes, not IO failures; both used to reach os.makedirs and exit 1.
     if not out_dir:
         die(Exit.USAGE, "--out is empty")
     if os.path.exists(out_dir) and not os.path.isdir(out_dir):
@@ -866,9 +809,7 @@ def main(argv):
         try:
             os.makedirs(out_dir)
         except OSError as exc:
-            # The first write a run makes, outside generate_one's OSError wrapper. README
-            # advertises --out as "created if missing" and documents exit 8 for a full or
-            # read-only volume; a traceback out of main() reads as a tool bug.
+            # The first write a run makes, outside generate_one's OSError wrapper.
             die(Exit.IO, f"cannot create {out_dir}: {exc}")
 
     sizes = [s for s in (t.strip() for t in args.sizes.split(",")) if s]
@@ -876,8 +817,7 @@ def main(argv):
         die(Exit.USAGE, "--sizes is empty")
 
     if not args.no_manifest:
-        # Up front, not at the end: write_manifest enforces both too, but finding out after
-        # 46 seconds of generation that the record cannot be written is a waste.
+        # Up front: write_manifest enforces both too, but only after 46s of generation.
         check_manifest_ok(args.manifest, out_dir, args.seed)
 
     info(f"generating {len(sizes)} file(s) into {os.path.abspath(out_dir)}")

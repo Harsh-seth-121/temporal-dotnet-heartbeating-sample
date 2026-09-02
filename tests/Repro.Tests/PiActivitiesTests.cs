@@ -11,23 +11,12 @@ namespace Repro.Tests;
 /// The Monte Carlo burn, and the drain behaviour the whole case's teardown depends on.
 /// </summary>
 /// <remarks>
-/// EVERY TEST GOES THROUGH <see cref="ActivityEnvironment"/>, and it is not optional.
-/// <c>EstimatePi</c> reads <c>ActivityExecutionContext.Current</c>, which is an AsyncLocal
-/// that throws <c>InvalidOperationException</c> outside an activity, so calling the method
-/// directly from a test fails before it does anything. This is the first test in this repo to
-/// need that harness: WeatherActivitiesTests sidesteps it by only exercising the pure static
-/// <c>IsTransportFailure</c>.
-/// <para>
-/// Two traps in the harness itself, both of which silently weaken a test rather than failing
-/// it. Its MetricMeter is a NO-OP unless assigned, so <c>repro_pi_attempt_started</c> records
-/// nothing here and no test may assert on it. And its <c>DefaultInfo</c> has
-/// <c>IsLocal = false</c>, so a test that wants the local-activity shape has to say so.
-/// </para>
-/// <para>
-/// Durations are in the low hundreds of milliseconds. The shipped config draws 30s-2m; a test
-/// that used those numbers would be a five-minute suite proving arithmetic that a quarter of a
-/// second proves just as well.
-/// </para>
+/// Every test runs inside <see cref="ActivityEnvironment"/>. <c>EstimatePi</c> reads
+/// <c>ActivityExecutionContext.Current</c>, an AsyncLocal that throws outside an activity, so a
+/// direct call fails before it does anything. Two traps in the harness silently weaken a test:
+/// its MetricMeter is a no-op unless assigned, so no test may assert on
+/// <c>repro_pi_attempt_started</c>, and its <c>DefaultInfo</c> has <c>IsLocal = false</c>.
+/// Durations here are hundreds of milliseconds where the shipped config draws 30s to 2m.
 /// </remarks>
 public class PiActivitiesTests
 {
@@ -35,16 +24,9 @@ public class PiActivitiesTests
     private const int ShortBurnMs = 250;
 
     /// <summary>Run one burn inside <paramref name="env"/> and hand back its estimate.</summary>
-    /// <remarks>
-    /// The ONE construction site for LocalActivityInput in this file, so the named arguments
-    /// its record remarks ask for are written once rather than six times.
-    /// <para>
-    /// The environment is a PARAMETER rather than something this method creates, because two
-    /// of these tests fire a token on it before the burn starts and WHICH token that is is the
-    /// entire point of the test. Every caller therefore still names the harness it runs under,
-    /// which is also the harness no test may skip.
-    /// </para>
-    /// </remarks>
+    /// <remarks>The one construction site for LocalActivityInput here. The environment is a
+    /// parameter because two tests fire a token on it before the burn starts, and which token
+    /// fires is the point of those tests.</remarks>
     private static Task<PiEstimate> BurnAsync(ActivityEnvironment env, int durationMs, int seed) =>
         env.RunAsync(() => new PiActivities().EstimatePi(
             new LocalActivityInput(DurationMs: durationMs, Seed: seed)));
@@ -54,11 +36,8 @@ public class PiActivitiesTests
     {
         var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 42);
 
-        // Monte Carlo error falls as 1/sqrt(n), and a quarter second is millions of samples,
-        // so the true error is around three decimal places. The tolerance is deliberately far
-        // looser: this asserts "the estimator is not broken", not "the machine is fast". A
-        // tight bound here would fail on a loaded CI box for reasons that have nothing to do
-        // with the code.
+        // Monte Carlo error falls as 1/sqrt(n), so a quarter second is good to three decimals.
+        // The tolerance is far looser so a loaded CI box does not fail it.
         Assert.InRange(result.Pi, 3.0, 3.3);
         Assert.True(result.Iterations > 0, "a 250ms burn recorded no samples at all");
     }
@@ -66,11 +45,8 @@ public class PiActivitiesTests
     [Fact]
     public async Task ReportsIsLocalFromTheActivityContext()
     {
-        // The trap this class's remarks describe, finally exercised. ActivityEnvironment's
-        // DefaultInfo has IsLocal = FALSE, so a test that ran a plain burn and asserted
-        // IsLocal would be asserting the harness default: it would pass, and it would prove
-        // nothing about the local-activity path. Assigning Info is the only way to make the
-        // assertion mean anything.
+        // ActivityEnvironment.DefaultInfo has IsLocal = false, so asserting it on a plain burn
+        // would assert the harness default.
         var env = new ActivityEnvironment
         {
             Info = ActivityEnvironment.DefaultInfo with { IsLocal = true },
@@ -79,9 +55,8 @@ public class PiActivitiesTests
         var local = await BurnAsync(env, durationMs: ShortBurnMs, seed: 3);
         Assert.True(local.IsLocal, "PiEstimate.IsLocal did not follow ActivityInfo.IsLocal");
 
-        // The negative half, and it is not padding: without it this test also passes if
-        // IsLocal is hardcoded true, which is the one wrong implementation a reader would
-        // never suspect given the activity is only ever registered as a local one.
+        // The negative half: without it a hardcoded true passes, which is plausible given the
+        // activity is only ever registered as a local one.
         var plain = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 3);
         Assert.False(plain.IsLocal, "PiEstimate.IsLocal is not reading ActivityInfo.IsLocal at all");
     }
@@ -89,10 +64,8 @@ public class PiActivitiesTests
     [Fact]
     public async Task PiIsExactlyDerivableFromInsideAndIterations()
     {
-        // The one invariant that catches a swapped NAMED argument in the PiEstimate
-        // construction, which is the failure that record's remarks warn about. Iterations and
-        // Inside are adjacent longs, so swapping them positionally compiles clean; if they
-        // were swapped this identity would not hold, because Inside is always the smaller.
+        // Iterations and Inside are adjacent longs, so a positional swap compiles clean. The
+        // identity does not hold under a swap, because Inside is always the smaller.
         var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 7);
 
         Assert.True(result.Inside <= result.Iterations, "more points landed inside than were sampled");
@@ -104,17 +77,13 @@ public class PiActivitiesTests
     {
         var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 1);
 
-        // RequestedMs and ElapsedMs are ADJACENT ints in PiEstimate, so a positional swap
-        // would report the duration that was asked for as the one that was measured. That is
-        // the exact number this whole case exists to show, and it would compile clean.
+        // RequestedMs and ElapsedMs are adjacent ints, so a positional swap would report the
+        // duration asked for as the one measured, which is the number this case exists to show.
         Assert.Equal(ShortBurnMs, result.RequestedMs);
 
-        // The loop only checks its clock on a batch boundary, so it always overshoots and can
-        // never undershoot: it breaks only once GetElapsedTime >= budget, and ElapsedMs is
-        // read AFTER that, from a strictly later timestamp. So the bound is exact and needs no
-        // slack -- the truncation to int can only discard the fractional overshoot, never take
-        // the value below the budget. Asserting >= rather than a window keeps this from being
-        // a machine-speed test.
+        // The loop checks its clock only on a batch boundary, so it always overshoots: it breaks
+        // once GetElapsedTime >= budget and reads ElapsedMs from a strictly later timestamp, and
+        // truncation to int can only discard the overshoot.
         Assert.True(
             result.ElapsedMs >= ShortBurnMs,
             $"burn ended at {result.ElapsedMs}ms, before the {ShortBurnMs}ms it was asked for");
@@ -125,15 +94,11 @@ public class PiActivitiesTests
     [Fact]
     public async Task StopsEarlyOnWorkerShutdown()
     {
-        // THE TEST THIS FILE EXISTS FOR. A local activity does not observe worker shutdown
-        // through ActivityExecutionContext.CancellationToken: in sdk-core the graceful
-        // shutdown period is applied only to server-scheduled activities, and
-        // local_activities.rs has no cancel path on shutdown at all. WorkerShutdownToken is
-        // the one that fires.
-        //
-        // If this ever regresses, the symptom is not a red test in CI. It is demo-down.sh
-        // SIGKILLing the worker, because its budget is gracefulShutdownTimeout + 15 = 45s and
-        // this activity is configured to run for up to two minutes.
+        // The test this file exists for. A local activity does not observe worker shutdown
+        // through ActivityExecutionContext.CancellationToken: sdk-core applies the graceful
+        // shutdown period only to server-scheduled activities, and local_activities.rs has no
+        // cancel path on shutdown. WorkerShutdownToken is the one that fires. A regression shows
+        // up as demo-down.sh SIGKILLing the worker, not as a red test.
         var env = new ActivityEnvironment();
         env.WorkerShutdownTokenSource.CancelAfter(TimeSpan.FromMilliseconds(150));
 
@@ -143,18 +108,10 @@ public class PiActivitiesTests
 
         Assert.Equal(MetricNames.Endings.Shutdown, result.EndedBy);
 
-        // THE ONLY PLACE the RequestedMs/ElapsedMs swap is actually catchable, which is why
-        // this assertion lives in the shutdown test rather than next to the other one.
-        //
-        // MEASURED against a real run: a 40,124ms burn reported ElapsedMs 40124 exactly. The
-        // loop only overshoots by one batch, and at the ~93M iterations/s this machine manages
-        // that batch is under a millisecond, so the overshoot rounds away entirely. The two
-        // adjacent ints are therefore EQUAL on any healthy completing run, and a positional
-        // swap of them would pass every assertion in
+        // The only place the RequestedMs/ElapsedMs swap is catchable. The loop overshoots by one
+        // batch, under a millisecond at ~93M iterations/s, so the two are equal on any healthy
+        // completing run and a swap passes every assertion in
         // ReportsTheRequestedAndMeasuredDurationsSeparately.
-        //
-        // A cut-short burn is the one case where they genuinely differ, by orders of
-        // magnitude.
         Assert.Equal(60_000, result.RequestedMs);
         Assert.True(
             result.ElapsedMs < result.RequestedMs / 2,
@@ -162,15 +119,13 @@ public class PiActivitiesTests
             $"{result.RequestedMs}; if these two are equal on a burn that was cut short, they " +
             "are probably the same value and PiEstimate was constructed positionally");
 
-        // Generous by two orders of magnitude against the 60s it was asked for. The claim is
-        // "it noticed and stopped", not "it stopped in exactly 150ms" -- the loop only checks
-        // on a batch boundary and a loaded machine makes batches longer.
+        // Generous by two orders of magnitude: the claim is "it noticed and stopped", and the
+        // loop only checks on a batch boundary.
         Assert.True(
             elapsed < TimeSpan.FromSeconds(10),
             $"a 60s burn took {elapsed.TotalSeconds:F1}s to notice worker shutdown");
 
-        // Still a usable estimate. A drain must not turn the result into garbage, because it
-        // is returned rather than thrown and it lands in the history like any other.
+        // Still a usable estimate: the result is returned rather than thrown.
         Assert.True(result.Iterations > 0, "a burn cut short by a drain recorded no samples at all");
         Assert.InRange(result.Pi, 3.0, 3.3);
     }
@@ -178,14 +133,10 @@ public class PiActivitiesTests
     [Fact]
     public async Task StopsEarlyOnActivityCancellation()
     {
-        // The other token, and in production it is the BUSY one. Measured against the live
-        // stack: every burn cut short in a demo run was this token firing at ~64s against a 1m
-        // workflow task heartbeat timeout, i.e. the workflow task timing out underneath the
-        // activity -- not a drain, and not a user cancel.
-        //
-        // It must report `canceled` and not `shutdown`. The two were folded into one check
-        // originally, and the result was an activity that logged "worker drain cut the burn
-        // short" seventeen times during a demo in which nothing had drained.
+        // The other token, and the busy one in production: every burn cut short in a demo run
+        // was this firing at ~64s against a 1m workflow task heartbeat timeout, the workflow task
+        // timing out underneath the activity. It must report canceled and not shutdown; folding
+        // the two into one check made the activity blame a drain that never happened.
         var env = new ActivityEnvironment();
         env.CancellationTokenSource.CancelAfter(TimeSpan.FromMilliseconds(150));
 
@@ -194,8 +145,7 @@ public class PiActivitiesTests
         Assert.Equal(MetricNames.Endings.Canceled, result.EndedBy);
         Assert.NotEqual(MetricNames.Endings.Shutdown, result.EndedBy);
 
-        // The same generous bound as the shutdown test, made from the same claim: "it noticed
-        // and stopped", not "it stopped in exactly 150ms".
+        // The same generous bound as the shutdown test.
         Assert.True(
             result.ElapsedMs < 10_000,
             $"a 60s burn ran {result.ElapsedMs}ms before it noticed activity cancellation");
@@ -206,14 +156,12 @@ public class PiActivitiesTests
     {
         var result = await BurnAsync(new ActivityEnvironment(), durationMs: ShortBurnMs, seed: 5);
 
-        // IterationsPerSecond is the third adjacent long in PiEstimate. This is the only thing
-        // that would catch it being constructed from the wrong one, since any of the three is
-        // a plausible-looking number on its own.
+        // IterationsPerSecond is the third adjacent long, and any of the three looks plausible
+        // alone, so this is the only thing that catches a construction from the wrong one.
         var expected = (long)(result.Iterations / TimeSpan.FromMilliseconds(result.ElapsedMs).TotalSeconds);
 
-        // Within 1%, not exact: ElapsedMs is the truncated-to-milliseconds copy of the
-        // TimeSpan the activity divided by, so the two disagree by up to one millisecond of
-        // rounding.
+        // Within 1%, not exact: ElapsedMs is the truncated copy of the TimeSpan the activity
+        // divided by, so the two disagree by up to a millisecond of rounding.
         Assert.InRange(result.IterationsPerSecond, (long)(expected * 0.99), (long)(expected * 1.01));
     }
 }

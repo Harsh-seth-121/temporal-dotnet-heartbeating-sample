@@ -10,33 +10,18 @@ public static class ClientFactory
 {
     /// <param name="config">Loaded configuration.</param>
     /// <param name="runtime">
-    /// The process's single runtime. Passing null here is how metrics get silently
-    /// lost, so it is required rather than optional — see <c>ReproRuntime</c>.
+    /// The process's single runtime. Required, not optional: a client that connects without one
+    /// binds to TemporalRuntime.Default and loses its metrics silently. See <c>ReproRuntime</c>.
     /// </param>
     /// <param name="role">
-    /// worker / loadgen / starter / replay. Becomes part of the client identity.
-    /// <para>
-    /// MUST BE DISTINCT PER CLIENT WITHIN A PROCESS, which stopped being automatic when the
-    /// local-activity case introduced a second namespace. Identity is
-    /// <c>role@machine:pid</c>, so two clients in one process sharing a role produce a
-    /// byte-identical identity and `temporal workflow describe` can no longer tell you which
-    /// one is holding a run -- which is the entire reason this field is set. The worker and
-    /// loadgen pass <c>worker-la</c> and <c>loadgen-la</c> for their second client.
-    /// </para>
+    /// worker / loadgen / starter / replay, distinct per client in a process: identity is
+    /// <c>role@machine:pid</c>, so a shared role is indistinguishable in `workflow describe`.
     /// </param>
     /// <param name="loggerFactory">Logger factory for SDK-level logging.</param>
     /// <param name="namespaceOverride">
-    /// Connect to this namespace instead of <see cref="ReproConfig.Namespace"/>.
-    /// <para>
-    /// A namespace is a CLIENT property and a worker binds one client, so this is what makes
-    /// <c>WorkflowLocalActivity</c> able to live somewhere else. It has to: the setting that
-    /// case depends on, <c>history.workflowTaskHeartbeatTimeout</c>, is declared server-side as
-    /// NewNamespaceDurationSetting and filters by namespace and nothing finer.
-    /// </para>
-    /// <para>
-    /// An OVERRIDE rather than a second connect method, so the API key, TLS and runtime paths
-    /// below stay shared. Those are the parts that are easy to get subtly wrong twice.
-    /// </para>
+    /// Connect to this namespace instead of <see cref="ReproConfig.Namespace"/>. A namespace is a
+    /// client property and a worker binds one client, so this is what lets
+    /// <c>WorkflowLocalActivity</c> live elsewhere, without a second connect method.
     /// </param>
     public static async Task<ITemporalClient> ConnectAsync(
         ReproConfig config,
@@ -53,8 +38,7 @@ public static class ClientFactory
             Runtime = runtime,
             LoggerFactory = loggerFactory,
 
-            // Default identity is pid@hostname, which tells you nothing when four
-            // processes share a task queue. `temporal workflow describe` prints this.
+            // The default identity is pid@hostname, useless when four processes share a queue.
             Identity = $"{role}@{Environment.MachineName}:{Environment.ProcessId}",
         };
 
@@ -62,14 +46,9 @@ public static class ClientFactory
         {
             options.ApiKey = config.ApiKey;
 
-            // REQUIRED even when there is nothing to put in it. TlsOptions must be
-            // non-null for TLS to be enabled at all; an API key over a plaintext
-            // connection is both a credential leak and rejected by Cloud.
-            //
-            // Domain is carried in here too, exactly as the Go original did in this
-            // same branch (config.go:140). `new()` on its own dropped tls.serverName,
-            // and an API key against a host whose cert CN differs from config.address
-            // then fails the handshake with nothing pointing back at this line.
+            // Required even when empty: TlsOptions must be non-null for TLS at all, and an API
+            // key over plaintext is a credential leak Cloud rejects. Domain is carried here too,
+            // because a bare `new()` drops tls.serverName and the handshake then fails silently.
             options.Tls = new()
             {
                 Domain = string.IsNullOrEmpty(config.Tls.ServerName) ? null : config.Tls.ServerName,
@@ -83,9 +62,8 @@ public static class ClientFactory
                 throw new ArgumentException("tls.certPath and tls.keyPath must be set together");
             }
 
-            // Go took file paths straight through; .NET's TlsOptions wants PEM BYTES.
-            // The config keeps paths (so config.local.yaml stays readable) and the
-            // reading happens here.
+            // .NET's TlsOptions wants PEM bytes. The config keeps paths, so config.local.yaml
+            // stays readable, and the reading happens here.
             options.Tls = new()
             {
                 ClientCert = await File.ReadAllBytesAsync(config.Tls.CertPath).ConfigureAwait(false),

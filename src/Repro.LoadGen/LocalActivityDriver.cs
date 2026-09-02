@@ -9,38 +9,17 @@ namespace Repro.LoadGen;
 
 /// <summary>
 /// The fourth loadgen loop: starts <c>WorkflowLocalActivity</c> runs on a jittered interval,
-/// each with its own randomly drawn burn duration, in the LOCAL-ACTIVITY namespace.
+/// each with its own randomly drawn burn duration, in the local-activity namespace.
 /// </summary>
 /// <remarks>
-/// TWO THINGS MAKE THIS DIFFERENT from the other three drivers, and both are load-bearing.
-/// <para>
-/// It runs against a DIFFERENT CLIENT, bound to <c>localActivity.namespace</c>. The others
-/// share the process's main client. That is not organisation: the setting this whole case
-/// depends on, <c>history.workflowTaskHeartbeatTimeout</c>, is namespace-scoped server-side,
-/// so a separate namespace is the only way to lower it here without lowering it everywhere.
-/// </para>
-/// <para>
-/// It DRAWS THE DURATION PER RUN and puts it in the workflow input, where the other three
-/// project a fixed config value. Uniform on [minDuration, maxDuration], so with the shipped
-/// 30s..2m against a 1m heartbeat timeout, exactly two-thirds of runs are expected to outlive
-/// the timeout and re-execute their local activity from zero. Because the draw lands in the
-/// INPUT rather than being re-rolled per attempt, a doomed run stays doomed: every
-/// re-execution reads the same duration and times out again.
-/// </para>
-/// <para>
-/// EXPECT MOST TICKS TO SKIP, and do not read that as breakage. A timed-out run holds its slot
-/// for the whole of <c>localActivity.runTimeout</c>, so mean occupancy is roughly
-/// (1/3)(a completing run) + (2/3)(runTimeout), which at shipped values is minutes rather than
-/// seconds. The summary line prints skipped alongside started for exactly this reason.
-/// </para>
-/// <para>
-/// Everything here is CLIENT code, so Random.Shared and wall-clock are fine. Nothing in this
-/// file may leak into workflow code.
-/// </para>
-/// <para>
-/// NO SemaphoreSlim, for the reason <see cref="SimpleDriver"/> records at length. Interlocked
-/// counters have no disposal semantics at all.
-/// </para>
+/// Pacing and the shared counters come from <see cref="DriverLoop{TRun}"/>. Two things differ.
+/// It runs against its own client, bound to <c>localActivity.namespace</c>; see docs/GOTCHAS.md,
+/// "history.workflowTaskHeartbeatTimeout is namespace-scoped and nothing finer". And it draws
+/// the burn duration per run, uniform on [minDuration, maxDuration], into the workflow input, so
+/// at the shipped 30s..2m against a 1m heartbeat timeout two-thirds of runs are expected to
+/// outlive the timeout and re-execute their local activity from zero. The draw lives in the
+/// input rather than being re-rolled per attempt, so a doomed run stays doomed, and expect most
+/// ticks to skip while a timed-out run holds its slot for all of <c>localActivity.runTimeout</c>.
 /// </remarks>
 internal sealed class LocalActivityDriver(
     ITemporalClient client,
@@ -50,11 +29,7 @@ internal sealed class LocalActivityDriver(
     /// <summary>Bounds the StartWorkflowAsync RPC, so a wedged frontend cannot park the loop.</summary>
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
 
-    /// <summary>
-    /// The tick loop, its capacity accounting, and the started/skipped/interrupted/failed
-    /// counters. Its <c>TRun</c> is the per-run draw, which is why the type argument is a tuple
-    /// here and a plain input in the other three drivers.
-    /// </summary>
+    /// <summary>The shared tick loop. Its <c>TRun</c> is the per-run draw, hence the tuple.</summary>
     private readonly DriverLoop<(int DurationMs, int Seed)> loop =
         new(localActivity.Rate, localActivity.Jitter, localActivity.Concurrency);
 
@@ -75,19 +50,15 @@ internal sealed class LocalActivityDriver(
             GoDuration.ToGoString(localActivity.MaxDuration), localActivity.Namespace,
             localActivity.TaskQueue, GoDuration.ToGoString(localActivity.RunTimeout));
 
-        // Skip-at-capacity fires far more often here than in the other three loops; see the class
-        // remarks for why that is the designed behaviour and not breakage.
+        // Skip-at-capacity fires far more often here than in the other loops; see the remarks.
         await loop.RunAsync(
 
-            // Next(min, max + 1) for a CLOSED interval. Next's upper bound is exclusive, so
-            // without the +1 the configured maxDuration is the one value that can never be
-            // drawn -- and it is the value the whole case is tuned around.
+            // Next(min, max + 1) for a closed interval: the upper bound is exclusive, and
+            // maxDuration is the value the case is tuned around.
             () => (Random.Shared.Next(minMs, maxMs + 1), Random.Shared.Next()),
             (run, token) => OneRunAsync(run.DurationMs, run.Seed, token),
 
-            // The failure line names the duration that was ASKED for, which is the number that
-            // explains the run: it is what every re-execution reads and what decides whether the
-            // run was doomed from the draw.
+            // The failure line names the duration asked for: every re-execution reads it.
             (run, e) => log.LogWarning(
                 "local-activity run failed after a {DurationMs}ms burn: {Message}",
                 run.DurationMs, e.Message),
@@ -103,23 +74,15 @@ internal sealed class LocalActivityDriver(
         var handle = await client.StartWorkflowAsync(
             (WorkflowLocalActivity wf) => wf.RunAsync(input),
 
-            // "repro-pi-", checked disjoint as a string PREFIX against every other id this
-            // repo generates: repro-loadgen-, repro-simple-, repro-weather-, repro-workflow.
-            // The reason is the one SimpleActivityDriver records: a prefix collision makes
-            // `WorkflowId STARTS_WITH` visibility queries and `grep` silently merge two cases
-            // and report a count that is quietly too high.
+            // "repro-pi-", prefix-disjoint from every other id this repo generates; see
+            // SimpleActivityDriver.
             new WorkflowOptions(id: $"repro-pi-{Guid.NewGuid():N}", taskQueue: localActivity.TaskQueue)
             {
-                // THE ONLY BOUND THAT ACTUALLY ENDS A RE-EXECUTING RUN, which is why it is set
-                // here rather than left to the workflow's activity options. Neither
-                // scheduleToClose nor startToClose nor the retry policy survives a workflow
-                // task timeout; this does, because the server enforces it on its own timer
-                // queue with no worker involvement.
-                //
-                // It is also why this driver counts `timedOut` client-side. A run ended this
-                // way is closed WITHOUT a workflow task, so workflow code never resumes and
-                // repro_local_activity_completed never increments for it. The client handle is
-                // the only place in this process that observes those runs at all.
+                // The only bound that ends a re-executing run: no activity timeout or retry
+                // policy survives a workflow task timeout, and the server enforces this one on
+                // its own timer queue. It is also why `timedOut` is counted client-side; see
+                // docs/GOTCHAS.md, "A run killed by `RunTimeout` records no outcome, because
+                // workflow code never runs again".
                 RunTimeout = localActivity.RunTimeout,
 
                 Rpc = new RpcOptions { CancellationToken = cancellationToken, Timeout = RpcTimeout },
@@ -128,21 +91,16 @@ internal sealed class LocalActivityDriver(
         PiEstimate estimate;
         try
         {
-            // NO Timeout here, unlike the start call: GetResultAsync long-polls for the whole
-            // run, which is minutes by design. The token still releases it at shutdown.
+            // No Timeout, unlike the start call: GetResultAsync long-polls for the whole run,
+            // which is minutes by design.
             estimate = await handle.GetResultAsync(
                 rpcOptions: new RpcOptions { CancellationToken = cancellationToken }).ConfigureAwait(false);
         }
         catch (WorkflowFailedException e) when (e.InnerException is TimeoutFailureException)
         {
-            // MATCH THE SHAPE, do not reach for TemporalException.IsCanceledException or a
-            // broad catch. docs/GOTCHAS.md has the measurement: at a CLIENT call site those
-            // helpers quietly give the wrong answer, and a broad catch would also swallow
-            // shutdown, which is not a failure.
-            //
-            // This is the EXPECTED ending for about two-thirds of runs at the shipped config,
-            // so it is counted separately rather than folded into `failed`. A board where the
-            // designed behaviour reads as breakage is worse than no board.
+            // Match the exception shape, not a helper or a broad catch; see docs/GOTCHAS.md,
+            // "`IsCanceledException` does NOT recognise a cancelled workflow at the client".
+            // The expected ending for two-thirds of runs, so counted apart from `failed`.
             Interlocked.Increment(ref timedOut);
             log.LogInformation(
                 "local-activity run hit runTimeout after a {DurationMs}ms burn was asked for; its " +
@@ -153,9 +111,7 @@ internal sealed class LocalActivityDriver(
 
         if (Interlocked.Increment(ref completed) == 1)
         {
-            // First completed run only. This is the line that proves an estimate made it all
-            // the way back to the client, and it carries the two numbers that answer "how fast
-            // is this machine" without opening Grafana.
+            // First run only, carrying the two numbers that say how fast this machine is.
             log.LogInformation(
                 "local-activity: first run returned pi ~ {Pi} from {Iterations} samples in " +
                 "{ElapsedMs}ms ({PerSecond} iterations/s, attempt {Attempt}, isLocal {IsLocal})",
@@ -165,15 +121,8 @@ internal sealed class LocalActivityDriver(
     }
 
     /// <summary>One line, every ten starts and once at shutdown.</summary>
-    /// <remarks>
-    /// CONCATENATED STRING LITERALS, not interpolation: CA2254 requires a compile-time constant
-    /// message and CA1727 requires PascalCase placeholders, both build errors here.
-    /// <para>
-    /// `timedOut` climbing while `failed` stays at zero IS the healthy board for this case, and
-    /// it is the opposite of what the same shape means in the other three drivers. Two-thirds
-    /// of runs are designed to end that way.
-    /// </para>
-    /// </remarks>
+    /// <remarks>`timedOut` climbing while `failed` stays at zero is the healthy board here,
+    /// the opposite of what that shape means in the other three drivers.</remarks>
     private void LogSummary() =>
         log.LogInformation(
             "local-activity: {Started} started, {Skipped} skipped at capacity | {Completed} " +

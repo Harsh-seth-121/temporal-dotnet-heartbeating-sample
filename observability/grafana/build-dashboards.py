@@ -1,91 +1,30 @@
 #!/usr/bin/env python3
 """Generate the hand-authored sandbox dashboards.
 
-Run from anywhere; the output path is resolved against this file, not the cwd.
+Run from anywhere; the output path resolves against this file, not the cwd. The JSON is
+committed, so re-run this only after editing a panel spec below. Grafana's provisioner
+picks the change up on its next 10s rescan.
 
-The output JSON is committed, so you do not need to run this to use the stack.
-Re-run it after editing a panel spec below, then let Grafana's provisioner pick
-the change up (it rescans every 10s).
+Three traps before you edit a panel. Longer versions live in docs/GOTCHAS.md, and
+docs/DASHBOARDS.md, "Proving the boards", holds the probe script that checks every
+expression here against a live stack.
 
-Every PromQL expression here was probed against a live stack before being
-included -- a panel that cannot return data does not belong on a dashboard,
-because next time you cannot tell "no data" from "nothing is wrong".
-The probe script and the stack states each board needs are in
-docs/DASHBOARDS.md under "Proving the boards".
+* Core counters carry no `_total` and Core histograms record integer milliseconds, so SDK
+  latency panels use unit "ms" while server panels stay "s". Two panels put both sides on
+  one axis, "Schedule-to-start: SDK view vs server view" and "Activity schedule-to-start
+  p95, SDK vs server". Both multiply the server series by 1000 and pin a single task_type,
+  since task_schedule_to_start_latency covers task_type="Workflow" and task_type="Activity"
+  in one histogram. Either mistake renders as the dispatch loss those panels exist to find.
 
---------------------------------------------------------------------------
-WHAT CHANGED FROM THE GO ORIGINAL, AND WHY
---------------------------------------------------------------------------
-The .NET SDK is Rust-Core-based and ships its own Prometheus exporter, so the
-metric vocabulary is not Go's tally vocabulary. Left at Core defaults
-(PrometheusOptions.HasCounterTotalSuffix / HasUnitSuffix / UseSecondsForDuration
-all false), which is what temporalio/dashboards' Core board is written against
-and what every other .NET user sees:
+* Core creates a metric on first increment, so a counter that has never fired is absent
+  rather than 0, and PromQL arithmetic with an empty operand yields empty. Every operand
+  here that can be absent carries `or vector(0)`. Standalone targets do not: `sum by (x)
+  (...) or vector(0)` returns a series with no x, which joins nothing and renders a blank
+  legend.
 
-* Counters have NO `_total` suffix.
-      temporal_request_total          -> temporal_request
-      temporal_sticky_cache_hit_total -> temporal_sticky_cache_hit
-
-* Histograms have NO `_seconds` infix and record INTEGER MILLISECONDS.
-      temporal_request_latency_seconds_bucket -> temporal_request_latency_bucket
-  Every SDK latency panel below therefore carries unit "ms", not "s".
-  SERVER panels keep unit "s": the server is still the same Go binary emitting
-  tally metrics, and tally still reports seconds. TWO panels put both sides on
-  one axis, and both multiply the server series by 1000:
-      Signals    "Schedule-to-start: SDK view vs server view"
-      Heartbeat  "Activity schedule-to-start p95, SDK vs server"
-  Getting that conversion wrong yields a 1000x gap that looks exactly like the
-  dispatch loss those panels exist to detect. Both also pin the server side to
-  ONE task_type: task_schedule_to_start_latency is a single histogram covering
-  task_type="Workflow" and task_type="Activity", so summing over it compares a
-  workflow-task SDK series against a workflow+activity server series and calls
-  the difference divergence.
-  Corollary you cannot escape: integer ms means sub-millisecond durations round
-  to 0, and no bucket override recovers them. Fixing that needs
-  UseSecondsForDuration=true, which blanks every panel on the imported
-  core-sdk-otel board. You get one or the other.
-
-* Label VALUES are not sanitized by Core. `heartbeat-task-queue` stays
-  `task_queue="heartbeat-task-queue"`. The SERVER still sanitizes (tally's
-  ValueCharacters: alphanumeric + underscore), so the same queue is
-  `taskqueue="heartbeat_task_queue"` on server metrics. One queue, two
-  spellings, no way to join them. Metric names and label KEYS are still
-  sanitized on both sides.
-
-* `temporal_request_attempt` exists in NO Core SDK. The Go board's "gRPC
-  attempts per logical call" panel has no equivalent, so it was REPLACED with
-  poll outcomes, not faked. See the worker board.
-
-* `temporal_sticky_cache_miss` DOES exist in Core (it does not in Go+tally), so
-  the Signals board computes a REAL hit ratio instead of the "hits per workflow
-  task" approximation the Go original had to ship with an apology attached.
-  This is the one place the port is strictly better than the original.
-
-* Core attaches `service_name="temporal-core-sdk"` to every metric
-  (TelemetryOptions.attach_service_name, default true). This matters far more
-  than it looks. With no `_total` suffix, the worker's series names are now
-  IDENTICAL to the ones the server's own embedded Go SDK workers emit on :8000
-  -- a collision the Go original was structurally incapable of having. `sdk()`
-  below pins service_name on every SDK selector so a board cannot silently pick
-  up the server's internal system workers.
-
-* Core creates a metric on FIRST INCREMENT. A counter that has never fired is
-  absent from /metrics entirely rather than reading 0 -- including counters that
-  exist only under a label value nothing has produced yet, e.g.
-  repro_activity_started{resumed="true"} with fault.failureRate at 0. PromQL
-  turns absence into silence, not into zero: `A + B` and `A / B` with either
-  operand empty yield EMPTY. So every operand of every arithmetic expression
-  below that can be absent carries `or vector(0)`, and the probe script runs
-  each target twice (with and without the fallbacks) so a panel cannot pass on
-  its fallback alone. Standalone targets do NOT get the fallback: `sum by (x)
-  (...) or vector(0)` returns a series with no x, which renders as a blank
-  legend and cannot join anything.
-
-* Core's default histogram buckets are coarse for a laptop sandbox. Six of the
-  latency panels here require PrometheusOptions.HistogramBucketOverrides in the
-  worker/loadgen runtime config; without them they do not read "no data", they
-  read a plausible CONSTANT, which is worse. Each affected panel says so in its
-  description. The exact override block is explained in docs/GOTCHAS.md.
+* Six latency panels need PrometheusOptions.HistogramBucketOverrides in the worker and
+  loadgen config. Without it they read a plausible constant, not "no data". Each affected
+  panel says so in its description.
 """
 
 import json
@@ -93,50 +32,32 @@ import pathlib
 
 DS = {"type": "prometheus", "uid": "sandbox-prometheus"}
 # Anchored to this file: docs/DASHBOARDS.md invokes it as grafana/build-dashboards.py
-# from observability/, and the repo root is now the default cwd, so a cwd-relative
-# path would scatter the JSON into whichever directory you happened to be in.
+# from observability/, so a cwd-relative path would scatter the JSON.
 OUT = pathlib.Path(__file__).resolve().parent / "dashboards/sandbox"
 
-# ---------------------------------------------------------------------------
-# APPLICATION INPUTS. These four strings must match src/ exactly. A typo here
-# produces a silently empty panel, never an error, which is why they are
-# centralized instead of inlined into 80 expressions.
-# ---------------------------------------------------------------------------
+# Application inputs. These must match src/ exactly: a typo produces a silently empty
+# panel, never an error, which is why they are centralized rather than inlined.
 CUSTOM = "repro_"              # prefix on this repo's own metrics. NOT applied by
-                               # MetricPrefix. Core does not prefix custom names,
-                               # so this is a literal part of the metric name.
+                               # MetricPrefix; Core does not prefix custom names.
 TASK_QUEUES = ("repro-task-queue",     # the seed heartbeating case AND FetchWeather
                "repro-la-queue",       # WorkflowLocalActivity, in its own namespace
                "repro-scan-queue")     # WorkflowFileScan, in the DEFAULT namespace.
-                                       # The dashes are deliberate: see the sanitization
-                                       # note in the docstring.
-# Documentation only, in the sense that no expression references these TUPLES: a panel that
-# wants a breakdown groups by the label instead of selecting one value. But three spellings
-# out of them are now PINNED as literals further down -- task_queue on the heartbeat board's
-# two slot expressions and on the file-scan board's saturation panel, and
-# activity_type="ScanFile" on the ScanFile latency panel -- because
-# temporal_worker_task_slots_used carries worker_type but NO activity_type, so a per-case
-# slot reading can only be had from the queue. The queue pins go through MAIN_Q / SCAN_Q
-# below so the two spellings live in one place each. They still have to match src/ exactly:
-# a typo in any of them is a silently empty panel, never an error, which is also why these
-# had to become plural once there were several workflow types and several activity classes.
+                                       # Dashes deliberate; see the docstring.
+# No expression references these tuples. Three spellings out of them are pinned below,
+# through MAIN_Q, SCAN_Q and activity_type="ScanFile": temporal_worker_task_slots_used
+# carries worker_type but no activity_type, so per-case slots come from the queue.
 WORKFLOW_TYPES = ("HeartbeatWorkflow", "SimpleNoActivity", "WorkflowSimpleActivity",
                   "WorkflowLocalActivity", "WorkflowFileScan")
-# [Activity] TRIMS the "Async" suffix, which is why ProcessBatchAsync, FetchWeatherAsync and
-# ScanFileAsync are on the wire as ProcessBatch, FetchWeather and ScanFile. EstimatePi is
-# declared sync and never had one.
+# [Activity] trims the "Async" suffix, so ProcessBatchAsync, FetchWeatherAsync and
+# ScanFileAsync are on the wire as ProcessBatch, FetchWeather and ScanFile.
 ACTIVITY_TYPES = ("ProcessBatch", "FetchWeather", "EstimatePi", "ScanFile")
 
 # Units: s=seconds, ms=milliseconds, percent=0-100, percentunit=0-1,
 # short=plain number, reqps=rate.
 SEC, MS, PCT, RATIO, NUM, RPS = "s", "ms", "percent", "percentunit", "short", "reqps"
-# The file-scan board's three. BYTES is Grafana's IEC scale (KiB/MiB/GiB), which is the
-# vocabulary every magnitude for that case is quoted in: the 500 MB corpus read whole lands
-# on the LOH as 476.8 MiB, not as 500 MB. CPS (counts/sec) carries rows/s and GC
-# collections/s -- those are counts, not requests, so RPS above would mislabel them.
-# BPS (bytes/sec) is deliberately on NO panel: see "Rows/s achieved vs target", where
-# bytes/s is rows/s times a constant mean row length and a second axis of it would say
-# nothing new. It is here as the unit to reach for if you ever plot bytes_read directly.
+# The file-scan board's three. BYTES is Grafana's IEC scale: the 500 MB corpus read whole
+# lands on the LOH as 476.8 MiB. CPS carries rows/s and GC collections/s, counts rather
+# than requests. BPS is on no panel; it is here for anyone plotting bytes_read directly.
 BYTES, BPS, CPS = "bytes", "Bps", "cps"
 
 
@@ -198,32 +119,21 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",),
             "type": "query",
             "datasource": DS,
             # temporal_request, not temporal_request_total: Core does not suffix
-            # counters. This query is also the cheapest way to prove the worker's
-            # exporter is being scraped at all. If the dropdown is empty, the
-            # Prometheus target is down, not the dashboard.
-            # The service_name pin is the same pin sdk() applies, and for the same
-            # reason, but this selector cannot call sdk(), which would pin
-            # namespace="$namespace" to the variable being defined. Unpinned, this
-            # dropdown lists the SERVER's internal namespaces too (_unknown_,
-            # system, temporal_system), because the server's own embedded Go SDK
-            # workers emit a metric with the byte-identical name on :8000. Pick one
-            # of those and every panel on the board goes blank at once.
+            # counters. An empty dropdown means the Prometheus target is down.
+            # service_name is pinned by hand, not through sdk(), which would pin
+            # namespace="$namespace" to the variable being defined; unpinned, the
+            # dropdown also lists the server's internal namespaces, whose embedded
+            # Go SDK workers emit a byte-identical metric name on :8000.
             "query": 'label_values(temporal_request{service_name="temporal-core-sdk"}, namespace)',
             "refresh": 1,
             "includeAll": False,
             "multi": False,
-            # PARAMETERIZED, because this stack now runs two namespaces and the
-            # dropdown is single-select. A board whose panels select
-            # repro-local-activity must OPEN on it: left at "default" every panel
-            # renders blank, and switching the variable to fix that blanks every
-            # panel on the other three boards at once. One board cannot show both,
-            # which is why the local-activity case has a board of its own rather
-            # than panels bolted onto Bug Signals.
+            # Parameterized: the stack runs two namespaces and the dropdown is
+            # single-select, so a board whose panels select repro-local-activity must
+            # open on it. That is why that case has a board rather than panels.
             "current": {"text": namespace_default, "value": namespace_default,
                         "selected": True},
-            # Core does NOT sanitize label values (Go+tally did). A namespace or
-            # task queue with a dash keeps its dash here. The SERVER still
-            # sanitizes, so the same name can be spelled two ways in one TSDB.
+            # Core does not sanitize label values; the server does. docs/GOTCHAS.md.
             "description": "Values are NOT sanitized by the .NET SDK; dashes survive.",
         })
     if "task_queue" in variables:
@@ -247,12 +157,9 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",),
         "version": 1,
         "editable": True,
         "graphTooltip": 1,  # shared crosshair
-        # PARAMETERIZED because the local-activity board needs a wider default. Its
-        # events arrive roughly once every three or four minutes -- a doomed run holds
-        # its concurrency slot for the whole 6m runTimeout -- so on a 30m window
-        # Grafana resolves $__rate_interval to about 5m and every rate() over them is
-        # frequently zero. MEASURED: rate(...[5m]) returned 0 while rate(...[15m])
-        # returned 0.0045 over the same data.
+        # Parameterized because the local-activity board needs a wider default: its events
+        # arrive every three or four minutes, so on a 30m window $__rate_interval resolves
+        # to about 5m. Measured, rate(...[5m]) was 0 where rate(...[15m]) was 0.0045.
         "time": {"from": default_from, "to": "now"},
         "refresh": "10s",
         "timezone": "browser",
@@ -262,15 +169,11 @@ def dashboard(uid, title, desc, panels, tags, variables=("namespace",),
 
 
 def grid(specs):
-    """Lay panels out left to right, wrapping at 24 columns, assigning ids and
-    positions.
+    """Lay panels out left to right, wrapping at 24 columns, assigning ids and positions.
 
-    The Go original placed panels by index parity (x = 0 if i is even else 12),
-    which is only correct when every row is exactly two w=12 panels. It silently
-    misplaced the three w=8 stat panels at the top of the worker board -- Grafana's
-    layout engine floated them back into place, so it looked fine and was not.
-    The heartbeat board has two w=8 triplets and two w=24 panels, so pack the row
-    properly instead.
+    Packs each row rather than placing by index parity, which is only correct when every
+    row is exactly two w=12 panels. The heartbeat board has two w=8 triplets and two w=24
+    panels.
     """
     out, pid, x, y, rowh = [], 1, 0, 0, 0
     for s in specs:
@@ -289,12 +192,10 @@ def grid(specs):
 def sdk(*extra):
     """Label selector for SDK (Core) metrics.
 
-    service_name is NOT optional here. With Core's default naming the worker's series
-    names are byte-identical to the ones the server's own embedded Go SDK workers
-    emit on :8000. namespace alone usually separates them (system workers live in
-    `temporal-system`), but not always, and "usually" is not a property you want in
-    a debugging tool. Core sets service_name="temporal-core-sdk" on EVERY metric it
-    emits, including custom ones, via TelemetryOptions.attach_service_name.
+    service_name is not optional. With Core's default naming the worker's series names are
+    byte-identical to the ones the server's own embedded Go SDK workers emit on :8000, and
+    namespace does not always separate them. Core sets service_name="temporal-core-sdk" on
+    every metric it emits, custom ones included, via TelemetryOptions.attach_service_name.
     """
     return "{" + ",".join(('namespace="$namespace"',
                            'service_name="temporal-core-sdk"') + extra) + "}"
@@ -303,21 +204,15 @@ def sdk(*extra):
 def srv(*extra, ns="default"):
     """Label selector for server metrics, pinned to namespace `ns`.
 
-    The namespace is pinned to a LITERAL, never to $namespace: that variable is populated
-    from SDK series, and server label VALUES are sanitized while SDK ones are not, so the
-    two vocabularies are not interchangeable. `ns` therefore takes the SANITIZED spelling.
-
-    Pass `ns` for any board outside `default`. This sandbox stopped running a single
-    namespace when WorkflowLocalActivity got one of its own, and the failure mode is the
-    silent one: a server panel left on the default pin for that workflow matches nothing,
-    forever, with no error.
-
-    MEASURED. One namespace, spelled two ways in one TSDB:
+    `ns` takes a literal, never $namespace: that variable is populated from SDK series, and
+    server label values are sanitized while SDK ones are not. Pass `ns` for any board
+    outside `default`; a server panel left on the default pin matches nothing, forever,
+    with no error. Measured, one namespace spelled two ways in one TSDB:
 
         :8077  namespace="repro-local-activity"   task_queue="repro-la-queue"
         :8000  namespace="repro_local_activity"   taskqueue="repro_la_queue"
 
-    Note the label KEY differs too (task_queue vs taskqueue). You cannot join them.
+    The label key differs too (task_queue vs taskqueue). You cannot join them.
     """
     return "{" + ",".join(('namespace="%s"' % ns,) + extra) + "}"
 
@@ -325,38 +220,31 @@ def srv(*extra, ns="default"):
 SDK = sdk()          # {namespace="$namespace",service_name="temporal-core-sdk"}
 SRV = srv()          # {namespace="default"}
 
-# The local-activity case's namespace, in BOTH spellings, because every panel on that
-# board needs one or the other and picking the wrong one produces an empty panel.
-# LA_NS_SDK is the board's opening value for $namespace; LA_NS_SRV feeds srv(ns=...).
+# Both spellings, because the SDK keeps the dash and the server sanitizes it. LA_NS_SDK
+# is the board's opening value for $namespace; LA_NS_SRV feeds srv(ns=...).
 LA_NS_SDK = "repro-local-activity"
 LA_NS_SRV = "repro_local_activity"
 LA_SRV = srv(ns=LA_NS_SRV)      # {namespace="repro_local_activity"}
 LA_SRV_WF = srv('workflowType="WorkflowLocalActivity"', ns=LA_NS_SRV)
 FE = '{service_name="frontend"}'
 HI = '{service_name="history"}'
-# task_schedule_to_start_latency is ONE histogram split by task_type, so a panel
-# comparing it against an SDK series has to pin the half that SDK series measures.
-# Summing both halves and calling the difference "divergence" compares apples to
-# apples plus oranges.
+# task_schedule_to_start_latency is one histogram split by task_type, so a panel comparing
+# it against an SDK series has to pin the half that SDK series measures.
 HI_WFT = '{service_name="history",task_type="Workflow"}'
 HI_ACT = '{service_name="history",task_type="Activity"}'
 HB = '{operation="RecordActivityTaskHeartbeat"}'   # documentation only; see sdk(...)
 
-# Task-queue PINS, unlike the TASK_QUEUES tuple above, which nothing references.
-# temporal_worker_task_slots_used carries worker_type but NO activity_type, so "how many
-# slots is THIS case holding" is a question only the task queue can answer. Giving the
-# file-scan case a queue of its own is what makes both pins below possible, and it is why
-# the heartbeat board's two slot expressions can exclude the scan by construction rather
-# than by hoping nothing else heartbeats.
+# Task-queue pins, unlike the TASK_QUEUES tuple above. Only the queue can answer "how many
+# slots is this case holding", so giving the file-scan case its own queue is what lets the
+# heartbeat board's slot expressions exclude the scan by construction.
 MAIN_Q = 'task_queue="repro-task-queue"'   # config.yaml taskQueue: ProcessBatch, FetchWeather
 SCAN_Q = 'task_queue="repro-scan-queue"'   # fileScan.taskQueue: ScanFile, and nothing else
 
-# WorkflowFileScan's metric family, composed from CUSTOM rather than spelled out, for the
-# reason CUSTOM exists at all: the prefix stays in exactly one place.
+# Composed from CUSTOM rather than spelled out, so the prefix stays in one place.
 SCAN = CUSTOM + "file_scan_"
 
 
-# ---------------------------------------------------------------- worker board
+# Worker board.
 worker = grid([
     dict(title="Workflow completions /s", unit=RPS, h=6, w=8,
          desc="SDK view. Should track the server's workflow_success rate on the "
@@ -415,13 +303,9 @@ worker = grid([
          exprs=[('histogram_quantile(0.95, sum by (le, workflow_type) (rate(temporal_workflow_endtoend_latency_bucket%s[$__rate_interval])))' % SDK, "{{workflow_type}}")]),
     dict(title="Task slot saturation", unit=PCT, minval=0,
          desc="used / (used + available). Sustained 100% means add slots or workers.",
-         # No `or vector(0)` on either operand, deliberately. This is the one ratio
-         # on any of these boards that does not need one: the slot gauges are
-         # registered when the worker starts, not on first use, so every worker_type
-         # is present reading 0 from the first scrape (LocalActivityWorker proves it
-         # -- this repo never runs one). A fallback would also be actively wrong
-         # here: `sum by (worker_type) (...) or vector(0)` yields a series with NO
-         # worker_type, which cannot match the other side of the division.
+         # No `or vector(0)`, the one ratio here that needs none: slot gauges register
+         # when the worker starts, not on first use, so every worker_type reads 0 from
+         # the first scrape. A fallback would also drop worker_type and stop matching.
          exprs=[('100 * sum by (worker_type) (temporal_worker_task_slots_used%s) / clamp_min(sum by (worker_type) (temporal_worker_task_slots_used%s) + sum by (worker_type) (temporal_worker_task_slots_available%s), 1)' % (SDK, SDK, SDK), "{{worker_type}}")]),
 
     dict(title="Client RPC rate by operation", unit=RPS,
@@ -474,12 +358,9 @@ worker = grid([
                 ('sum by (task_queue) (rate(temporal_activity_poll_no_task%s[$__rate_interval])) or vector(0)' % SDK, "{{task_queue}} activity poll empty")]),
 ])
 
-# ---------------------------------------------------------------- server board
-# Every expression on this board ports from the Go original BYTE FOR BYTE. The
-# server is the same Go binary emitting the same tally metrics: no _total
-# suffixes, timers in SECONDS, label values sanitized. All 18 metric names were
-# re-verified against temporalio/temporal v1.31.2 common/metrics/metric_defs.go.
-# Only the descriptions changed, where they now need a .NET contrast.
+# Server board. Every expression ports from the Go original byte for byte: same Go binary,
+# same tally metrics, so no _total suffixes, timers in seconds, label values sanitized. All
+# 18 names verified against temporalio/temporal v1.31.2 common/metrics/metric_defs.go.
 server = grid([
     dict(title="Frontend availability", unit=PCT, h=6, w=8, kind="stat",
          desc="'or vector(0)' matters: without it this panel goes blank when "
@@ -492,9 +373,8 @@ server = grid([
     dict(title="Sync-match ratio", unit=RATIO, h=6, w=8, kind="stat",
          desc="1.0 means tasks handed straight to a waiting poller and never "
               "touched the database. Drops when workers fall behind.",
-         # Numerator guarded for the same reason the denominator is clamped: a
-         # server that has only ever matched through the database emits no
-         # poll_success_sync at all, and empty / anything is EMPTY, not 0.
+         # Numerator guarded for the same reason the denominator is clamped: a server
+         # that only matched through the database emits no poll_success_sync at all.
          exprs=[('(sum(rate(poll_success_sync[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(poll_success[$__rate_interval])), 1e-9)', "sync-match")]),
 
     dict(title="Frontend RPS by operation", unit=RPS,
@@ -564,7 +444,7 @@ server = grid([
          exprs=[('histogram_quantile(0.99, sum by (le) (rate(cache_latency_bucket{operation="HistoryCacheGetOrCreate"}[$__rate_interval])))', "p99")]),
 ])
 
-# --------------------------------------------------------------- signals board
+# Signals board.
 signals = grid([
     dict(title="Non-determinism failures (dashboard range)", unit=NUM, h=6, w=8, kind="stat",
          desc="The number to look at first when a repro involves changed "
@@ -626,16 +506,8 @@ signals = grid([
               "Falling toward 0 means workers keep rebuilding state from history "
               "instead of resuming from cache. Look at forced evictions and "
               "MaxCachedWorkflows next.",
-         # Every `or vector(0)` here is load-bearing, not decorative. Core creates
-         # a metric on first increment, so on a worker that has never had a cache
-         # miss temporal_sticky_cache_miss does not exist at all, and in PromQL
-         # `A + B` where B is empty yields EMPTY, not A. Without the fallback the
-         # whole ratio silently vanishes on exactly the healthy worker you would
-         # expect to read 1.0. The HIT term needs it just as much and in both
-         # positions: a worker whose cache has only ever missed (cold start, or
-         # MaxCachedWorkflows=0) has no hit series, and an empty NUMERATOR empties
-         # the division too, blanking the panel on the one worker whose 0.0 you
-         # most wanted to see.
+         # See docs/GOTCHAS.md, "A counter that has never incremented does not exist".
+         # The hit term needs the same guard in both positions, not just the denominator.
          exprs=[('(sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) or vector(0)) / clamp_min((sum(rate(temporal_sticky_cache_hit%s[$__rate_interval])) or vector(0)) + (sum(rate(temporal_sticky_cache_miss%s[$__rate_interval])) or vector(0)), 1e-9)' % (SDK, SDK, SDK), "hit ratio")]),
     dict(title="Sticky cache hits and misses /s", unit=RPS,
          desc="The two series behind the ratio. A miss is a workflow task that "
@@ -656,10 +528,8 @@ signals = grid([
               "proxy, not an exact quantity: toward 1.0 means most tasks are "
               "rebuilding state instead of resuming from cache. Now that a real "
               "hit ratio exists two panels up, treat this as corroboration.",
-         # Replay latency does not exist until the first replay. On a worker whose
-         # sticky cache has never missed, the unguarded numerator empties the whole
-         # ratio and the panel reads "No data" instead of the 0.0 that is the
-         # actual, and good, answer.
+         # Replay latency does not exist until the first replay, so an unguarded
+         # numerator empties the ratio on a worker whose cache never missed.
          exprs=[('(sum(rate(temporal_workflow_task_replay_latency_count%s[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(temporal_workflow_task_execution_latency_count%s[$__rate_interval])), 1e-9)' % (SDK, SDK), "replay/exec")]),
 
     dict(title="Activity retried but recovered /s", unit=RPS,
@@ -695,10 +565,8 @@ signals = grid([
          exprs=[('sum(rate(%sactivity_failed%s[$__rate_interval])) or vector(0)' % (CUSTOM, SDK), "injected failures/s"),
                 ('sum(rate(%sactivity_started%s[$__rate_interval])) or vector(0)' % (CUSTOM, sdk('retried="true"')), "retried attempts/s")]),
 
-    # APPENDED, deliberately, rather than inserted next to the other two Custom panels.
-    # grid() assigns id and gridPos sequentially per board, so inserting mid-list
-    # renumbers and repositions every later panel and turns a small addition into several
-    # hundred lines of churn in signals.json.
+    # Appended, not inserted next to the other Custom panels: grid() assigns id and
+    # gridPos sequentially, so inserting mid-list renumbers every later panel.
     dict(title="Custom: repro simple-activity outcomes /s", unit=RPS, stack=True,
          desc="The WorkflowSimpleActivity case: ONE activity that sleeps, then "
               "fetches the current weather. No heartbeats, plain StartToClose plus "
@@ -749,12 +617,8 @@ signals = grid([
          exprs=[('histogram_quantile(0.95, sum by (le, outcome) (rate(%ssimple_activity_latency_bucket%s[$__rate_interval])))' % (CUSTOM, SDK), "{{outcome}}")]),
 ])
 
-# ------------------------------------------------------------- heartbeat board
-# The board the Go original had no reason to exist. Heartbeating is this repo's
-# seed case, and there is NO dedicated heartbeat metric in any Core SDK, so
-# every panel here is either a proxy (the RecordActivityTaskHeartbeat RPC), a
-# server-side consequence (activity_task_timeout), or something this repo emits
-# itself. Say which, in every description.
+# Heartbeat board. No Core SDK has a dedicated heartbeat metric (docs/GOTCHAS.md), so every
+# panel is a proxy, a server-side consequence, or something this repo emits. Say which.
 heartbeat = grid([
     dict(title="Heartbeat RPCs /s", unit=RPS, h=6, w=8, kind="stat",
          desc="The only built-in heartbeat signal in any Core SDK. Counts "
@@ -862,12 +726,9 @@ heartbeat = grid([
          exprs=[('max(%sheartbeat_call_interval_ms%s) or vector(0)' % (CUSTOM, SDK), "A: configured call interval"),
                 ('max(%sheartbeat_throttle_ms%s) or vector(0)' % (CUSTOM, SDK), "B: Core throttle = min(HeartbeatTimeout*0.8, MaxHeartbeatThrottleInterval)"),
                 ('max(%sheartbeat_timeout_ms%s) or vector(0)' % (CUSTOM, SDK), "C: HeartbeatTimeout (the cliff)"),
-                # No clamp_min here on purpose. clamp_min(rate, 1e-9) never
-                # divides by zero, but that is the bug, not the fix: when
-                # heartbeats stop the guard yields ~1e12 ms and Grafana's
-                # autoscale flattens A, B and C. `and rate > 0` yields NO SERIES
-                # instead. That is the honest answer to "what is the mean gap between
-                # events that did not happen".
+                # No clamp_min on purpose: when heartbeats stop, clamp_min(rate, 1e-9)
+                # yields ~1e12 ms and Grafana's autoscale flattens A, B and C.
+                # `and rate > 0` yields no series, which is the honest answer.
                 ('(1000 * sum(temporal_worker_task_slots_used%s) / sum(rate(temporal_request%s[$__rate_interval]))) and (sum(rate(temporal_request%s[$__rate_interval])) > 0)' % (sdk('worker_type="ActivityWorker"', MAIN_Q), sdk('operation="RecordActivityTaskHeartbeat"'), sdk('operation="RecordActivityTaskHeartbeat"')), "D: observed gap per activity on repro-task-queue (lower bound on B)")]),
 
     dict(title="Heartbeat calls vs heartbeat RPCs /s", unit=RPS,
@@ -965,12 +826,9 @@ heartbeat = grid([
               "In .NET there is no HasHeartbeatDetails helper -- the app checks "
               "ctx.Info.HeartbeatDetails.Count > 0 and tags this counter with the "
               "answer. HeartbeatDetailAtAsync<T>(0) throws if you skip the check.",
-         # Guarding only the denominator was not enough. resumed="true" is a LABEL
-         # VALUE, and Core registers a series on first increment, so with
-         # fault.failureRate 0 nothing ever increments it and the numerator series
-         # does not exist. Empty / anything is EMPTY in PromQL, so the panel read
-         # "No data" in precisely the healthy state whose 0 the description above
-         # promises.
+         # Guarding only the denominator was not enough: resumed="true" is a label value,
+         # so at fault.failureRate 0 the numerator series does not exist at all and the
+         # panel blanks in exactly the healthy state.
          exprs=[('(sum(rate(%sactivity_started%s[$__rate_interval])) or vector(0)) / clamp_min(sum(rate(%sactivity_started%s[$__rate_interval])), 1e-9)' % (CUSTOM, sdk('resumed="true"'), CUSTOM, SDK), "resumed fraction")]),
     dict(title="Checkpoint staleness on resume p95", unit=MS, minval=0,
          desc="How much work gets redone. Measured in the activity as "
@@ -1097,16 +955,11 @@ localactivity = grid([
 ])
 
 
-# -------------------------------------------------------------- file-scan board
-# WorkflowFileScan: one activity streams a generated corpus out of sample_files/,
-# checkpointing a byte offset and a REWOUND accumulator into its heartbeat details, on its
-# own queue and in the DEFAULT namespace. Two questions, in this order, because that is the
-# order you ask them in: does the scan work and what did a resume redo (the lifecycle
-# block), then what is it costing the worker (the pressure block).
-#
-# grid() numbers ids and grid positions sequentially, so panels are APPENDED here, never
-# inserted -- inserting mid-list renumbers and repositions every later panel and turns a
-# one-panel change into several hundred lines of churn in filescan.json.
+# File-scan board. WorkflowFileScan streams a generated corpus out of sample_files/ in one
+# activity, checkpointing a byte offset and a rewound accumulator into its heartbeat
+# details, on its own queue and in the default namespace. Lifecycle panels first, then
+# pressure. grid() numbers ids and positions sequentially, so panels are appended, never
+# inserted.
 filescan = grid([
     dict(title="Row cursor vs resume floor vs corpus ceiling", unit=NUM, minval=0, w=24,
          desc="START HERE. Three untagged gauges, and every drop from the cursor to the "
@@ -1199,9 +1052,8 @@ filescan = grid([
               "NODATA until something resumes: a clean scan records staleness never.",
          exprs=[('histogram_quantile(0.50, sum by (le) (rate(%sstaleness_bucket%s[$__rate_interval])))' % (SCAN, SDK), "p50 staleness"),
                 ('histogram_quantile(0.95, sum by (le) (rate(%sstaleness_bucket%s[$__rate_interval])))' % (SCAN, SDK), "p95 staleness"),
-                # A LITERAL, and the only one on any of these boards. Nothing echoes this
-                # case's throttle as a gauge, and reusing the heartbeat case's gauge would
-                # corrupt that case's panels (see the description).
+                # A literal, the only one on any board: nothing echoes this case's
+                # throttle, and reusing the heartbeat gauge would corrupt that board.
                 ('vector(24000)', "throttle bound = 0.8 x fileScan.heartbeatTimeout (literal)")]),
     dict(title="Rows/s achieved vs target", unit=CPS, minval=0,
          desc="rate() over rows_read, summed across attempts. The pacer holds this at "
@@ -1453,10 +1305,8 @@ BOARDS = [
 OUT.mkdir(parents=True, exist_ok=True)
 total_panels = total_targets = 0
 for uid, title, panels, desc, tags in BOARDS:
-    # The local-activity board is the only one that overrides either default. Its panels
-    # select repro-local-activity, so it must OPEN on it -- the variable is single-select
-    # and a board left on "default" renders every panel blank -- and it must open on a
-    # window wide enough for events that arrive minutes apart. See dashboard().
+    # The local-activity board is the only one overriding either default: its panels
+    # select repro-local-activity and its events arrive minutes apart. See dashboard().
     local_activity = uid == "sandbox-localactivity"
     d = dashboard(uid, title, desc, panels, tags,
                   variables=() if uid == "sandbox-server" else ("namespace",),
@@ -1468,7 +1318,6 @@ for uid, title, panels, desc, tags in BOARDS:
     total_panels += len(panels)
     total_targets += n
     print(f"  wrote {path}  panels={len(panels)}  targets={n}")
-# The target count is the number docs/DASHBOARDS.md claims was probed against a
-# live stack. If you add a panel, this number changes and that claim goes stale.
-# Printing it here is the reminder.
+# docs/DASHBOARDS.md quotes this target count as probed against a live stack, so adding a
+# panel makes that claim stale. Printing it here is the reminder.
 print(f"  TOTAL panels={total_panels} targets={total_targets}")

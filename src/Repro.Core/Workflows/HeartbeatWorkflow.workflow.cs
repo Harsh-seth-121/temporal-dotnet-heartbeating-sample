@@ -8,36 +8,23 @@ using Temporalio.Workflows;
 
 namespace Repro.Core.Workflows;
 
-/// <summary>
-/// The seed case: run one long heartbeating activity and classify how it ended.
-/// </summary>
+/// <summary>The seed case: run one long heartbeating activity and classify how it ended.</summary>
 /// <remarks>
-/// Replace the body with whatever you are reproducing. Two determinism rules this
-/// obeys: use <c>Workflow.UtcNow</c>, never <c>DateTime.UtcNow</c>; and never read
-/// the fault config from workflow code — it is reachable only through the activity
-/// object's constructor, which is why there is no ambient global to reach for.
+/// Replace the body with whatever you are reproducing. Two determinism rules every workflow
+/// here obeys: use <c>Workflow.UtcNow</c>, never <c>DateTime.UtcNow</c>; and read nothing from
+/// config.yaml in workflow code, which is why the fault knobs reach the activity only through
+/// its constructor. See docs/WORKFLOWS.md.
 /// </remarks>
 [Workflow]
 public class HeartbeatWorkflow
 {
     /// <summary>Activity options, built from the values the input carried in.</summary>
     /// <remarks>
-    /// GOTCHA, and this is the one people get backwards. Config is not banned from
-    /// workflow code because it is "mutable process state". It is banned because a
-    /// REPLAY of an old history has to emit byte-identical commands, and a file that
-    /// can be edited between the original execution and the replay cannot promise
-    /// that. Activity options are captured into the history as a
-    /// ScheduleActivityTask command at the moment the activity is scheduled, so they
-    /// only have to be stable FOR ONE EXECUTION — and options that arrive in the
-    /// INPUT are stable by construction, because replay reads back the same bytes it
-    /// wrote. Threading them through the input is the Temporal idiom for a
-    /// configurable timeout; it removes the determinism objection instead of
-    /// arguing with it, and it is what makes <c>activity:</c> in config.yaml live.
-    /// <para>
-    /// A null <c>activity</c> means an input that predates the field. The fallback
-    /// defaults on <see cref="ActivityOptionsInput"/> are the literals this method
-    /// used to hard-code, so those older histories still replay clean.
-    /// </para>
+    /// Activity options are captured into history as a ScheduleActivityTask command, so they
+    /// only have to be stable for one execution, and values carried in the input are stable by
+    /// construction where a value read from config.yaml is not. A null <c>activity</c> is an
+    /// input predating the field; <see cref="ActivityOptionsInput"/>'s defaults are the literals
+    /// this method used to hard-code, so those histories still replay clean.
     /// </remarks>
     internal static ActivityOptions BuildActivityOptions(ActivityOptionsInput? activity)
     {
@@ -48,23 +35,14 @@ public class HeartbeatWorkflow
             StartToCloseTimeout = TimeSpan.FromMilliseconds(a.StartToCloseTimeoutMs),
             ScheduleToCloseTimeout = TimeSpan.FromMilliseconds(a.ScheduleToCloseTimeoutMs),
 
-            // REQUIRED for the activity to receive cancellation at all. The server only
-            // communicates cancellation in the RESPONSE to a heartbeat RPC, so an
-            // activity with no heartbeat timeout and no Heartbeat() calls can never be
-            // cancelled by anything except worker shutdown. ConfigLoader.Validate
-            // rejects a zero or missing activity.heartbeatTimeout for that reason.
+            // Required, or cancellation never reaches the activity: the server delivers it only
+            // in a heartbeat RPC response. ConfigLoader.Validate rejects zero or missing.
             HeartbeatTimeout = TimeSpan.FromMilliseconds(a.HeartbeatTimeoutMs),
 
             RetryPolicy = a.ToRetryPolicy(),
 
-            // Without this the workflow reports cancelled the instant it asks, before
-            // the activity has observed anything, and the whole demo is hollow: you
-            // never see the activity honour the request. WaitCancellationCompleted makes
-            // the workflow wait for the activity to actually finish unwinding.
-            //
-            // Deliberately NOT configurable: every cancellation panel and every
-            // docs/HEARTBEATING.md recipe assumes it, and the two other values turn those
-            // into silently empty panels rather than a different demo.
+            // Makes the workflow wait for the activity to finish unwinding. Not configurable:
+            // every cancellation panel and docs/HEARTBEATING.md recipe assumes it.
             CancellationType = ActivityCancellationType.WaitCancellationCompleted,
         };
     }
@@ -74,9 +52,8 @@ public class HeartbeatWorkflow
     {
         var start = Workflow.UtcNow;
 
-        // Replay-suppressed with no opt-out: ReplaySafeMetricMeter is internal and
-        // Workflow.MetricMeter is the only route to it. Counts here are therefore
-        // "things that happened", not "things that were replayed".
+        // Replay-suppressed with no opt-out, so counts here are things that happened rather
+        // than things that were replayed. Every workflow in this repo relies on that.
         var meter = Workflow.MetricMeter;
 
         var outcome = MetricNames.Outcomes.Completed;
@@ -101,12 +78,10 @@ public class HeartbeatWorkflow
     }
 
     /// <summary>Map an activity failure onto exactly one of the four outcome values.</summary>
-    /// <remarks>
-    /// Order matters. IsCanceledException comes FIRST because cancellation surfaces
-    /// as OperationCanceledException, CanceledFailureException, or nested inside an
-    /// ActivityFailureException depending on where you await — and that helper is
-    /// the only reliable way to recognise all three.
-    /// </remarks>
+    /// <remarks>Order matters. IsCanceledException comes first because cancellation surfaces as
+    /// OperationCanceledException, CanceledFailureException, or nested inside an
+    /// ActivityFailureException depending on where you await, and only that helper recognises
+    /// all three. The other four workflows classify the same way.</remarks>
     private static string Classify(Exception e)
     {
         if (TemporalException.IsCanceledException(e))
@@ -114,15 +89,9 @@ public class HeartbeatWorkflow
             return MetricNames.Outcomes.Canceled;
         }
 
-        // A heartbeat timeout is NOT a generic failure and lumping it in with one
-        // hides the most interesting thing this repo can show you. The chain is
-        // ActivityFailureException -> TimeoutFailureException{TimeoutType.Heartbeat}.
-        //
-        // Reaching here at all takes an attempt that heartbeat-times-out and keeps
-        // doing so until retries are EXHAUSTED, which in practice means
-        // fault.stopHeartbeating. fault.stallPastHeartbeatTimeout only stalls attempt
-        // 1, so attempt 2 completes and the outcome is `completed` — see the fault
-        // comments in HeartbeatActivities.
+        // A heartbeat timeout gets its own outcome rather than landing in failed. Reaching here
+        // takes attempts that heartbeat-time-out until retries are exhausted, in practice
+        // fault.stopHeartbeating; fault.stallPastHeartbeatTimeout stalls only attempt 1.
         if (e is ActivityFailureException
             {
                 InnerException: TimeoutFailureException { TimeoutType: TimeoutType.Heartbeat },
@@ -138,17 +107,15 @@ public class HeartbeatWorkflow
     {
         var tagged = meter.WithTags(new Dictionary<string, object>
         {
-            // namespace / task_queue / workflow_type are already root tags on
-            // Workflow.MetricMeter. Re-adding them would duplicate labels.
+            // namespace, task_queue and workflow_type are already root tags on
+            // Workflow.MetricMeter, so re-adding them here would duplicate labels.
             [MetricNames.Tags.Outcome] = outcome,
         });
 
         tagged.CreateCounter<long>(MetricNames.WorkflowCompleted).Add(1);
 
-        // CreateHistogram<TimeSpan> maps to Core's HistogramDuration kind, so the
-        // value follows UseSecondsForDuration automatically. Recording a long of
-        // milliseconds by hand would hard-code the unit and silently disagree with
-        // every built-in latency metric if that flag ever changed.
+        // CreateHistogram<TimeSpan> maps to Core's HistogramDuration kind, so the unit follows
+        // UseSecondsForDuration. A long of milliseconds would hard-code it.
         tagged.CreateHistogram<TimeSpan>(MetricNames.WorkflowLatency)
             .Record(Workflow.UtcNow - start);
     }

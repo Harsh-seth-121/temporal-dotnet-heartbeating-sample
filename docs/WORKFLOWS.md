@@ -487,7 +487,7 @@ Four of the shapes, so you know what to grep for:
 ```
 scanning <abs>/sample-100mb.txt: <N> rows, <bytes> bytes, from row <R> at offset <O> (attempt <A>, target 6000 rows/s, ~287s)
 row <R>/1724588 (<P>%) offset <O>/99999968 at <rows>/s (<KB>/s); heap <M> MiB, alloc <X> MiB/s, gc <g0>/<g1>/<g2>
-RESUMING at row <R> of 1724588, offset <O>; checkpoint was <ms>ms old, so about <E> rows will be re-read -- that figure is staleness x target rate, an ESTIMATE (attempt <A>)
+RESUMING at row <R> of 1724588, offset <O>; checkpoint was <ms>ms old, so about <E> rows will be re-read; that figure is staleness x target rate, an estimate (attempt <A>)
 scan COMPLETE: 1724588 rows, 99999968 bytes, ended at offset 99999968; indexSum 1487102747166 == expected, wordByteSum 65508200 == expected
 ```
 

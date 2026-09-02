@@ -3,38 +3,22 @@ using Repro.Core.Config;
 
 namespace Repro.Core.Cli;
 
-/// <summary>
-/// Hand-rolled arg parser. Supports both <c>--flag value</c> and <c>--flag=value</c>.
-/// </summary>
+/// <summary>Hand-rolled arg parser, taking <c>--flag value</c> and <c>--flag=value</c>.</summary>
 /// <remarks>
-/// Nineteen flags do not justify System.CommandLine. Note also that samples-dotnet and
-/// omes still pin System.CommandLine 2.0.0-beta4, whose API differs substantially
-/// from the 2.0.11 stable release: copying their AddOption/SetHandler code into a
-/// net10 repo does not compile. Fifty lines here, zero surprises.
-/// <para>
-/// Unknown flags are a hard error, for the same reason unknown YAML keys are: a
-/// silently ignored <c>--concurrancy</c> is a lie about what the process is doing.
-/// </para>
+/// Nineteen flags do not justify System.CommandLine, and samples-dotnet and omes still pin
+/// 2.0.0-beta4, whose AddOption/SetHandler API does not compile against 2.0.11 stable. Unknown
+/// flags are a hard error: a silently ignored <c>--concurrancy</c> lies about what the process
+/// is doing.
 /// </remarks>
 public sealed class Flags
 {
     /// <summary>Flags that take no value. Everything else consumes the next argv entry.</summary>
     /// <remarks>
-    /// <c>--no-simple</c>, <c>--no-simple-activity</c> and <c>--no-local-activity</c> are all
-    /// DISTINCT and matched EXACTLY. The first is a string PREFIX of the second, and the third
-    /// is a near-homograph of it: <c>--no-local-activity</c> turns off the LOCAL activity loop
-    /// and <c>--no-simple-activity</c> the ordinary one, and somebody will reach for the wrong
-    /// one.
-    /// Parse looks up the text before any '=' in these hash sets, never by prefix. So
-    /// <c>--no-simple</c> does NOT turn off the simple-activity loop, and someone will type it
-    /// expecting that. All three belong to every binary, the loadgen included: these sets
-    /// are static, so all four exes share one registration.
-    /// <para>
-    /// Register a switch HERE ONLY. <see cref="Known"/> is DERIVED from this set plus
-    /// <see cref="ValueFlags"/>, which is what makes the two old failures unreachable: a
-    /// switch missing from Known was an unknown-flag hard error in every binary, and a switch
-    /// missing from here was a value flag that quietly ate the next argv entry.
-    /// </para>
+    /// <c>--no-simple</c>, <c>--no-simple-activity</c> and <c>--no-local-activity</c> are matched
+    /// exactly, never by prefix, so <c>--no-simple</c> does not turn off the simple-activity
+    /// loop. Register a switch here only: <see cref="Known"/> is derived from this set plus
+    /// <see cref="ValueFlags"/>, so a switch can be neither an unknown-flag error in one binary
+    /// nor a value flag that eats the next argv entry.
     /// </remarks>
     private static readonly HashSet<string> Switches = new(StringComparer.Ordinal)
     {
@@ -43,7 +27,7 @@ public sealed class Flags
         "--file-scan",
     };
 
-    /// <summary>Flags that CONSUME the next argv entry. Register a value flag here only.</summary>
+    /// <summary>Flags that consume the next argv entry. Register a value flag here only.</summary>
     private static readonly HashSet<string> ValueFlags = new(StringComparer.Ordinal)
     {
         "--config", "--rate", "--concurrency", "--steps", "--step-duration",
@@ -52,10 +36,9 @@ public sealed class Flags
 
     /// <summary>Every recognised flag. Derived, never hand-maintained.</summary>
     /// <remarks>
-    /// The constructor form, NOT <c>[.. ValueFlags, .. Switches]</c>: a collection expression
-    /// targets the parameterless ctor and would silently drop the Ordinal comparer this file
-    /// states everywhere. Both source sets must stay ABOVE this line; reordering throws
-    /// TypeInitializationException on the first Parse rather than yielding a short set.
+    /// The constructor form, not <c>[.. ValueFlags, .. Switches]</c>: a collection expression
+    /// targets the parameterless ctor and drops the Ordinal comparer. Both source sets must stay
+    /// above this line, or the first Parse throws TypeInitializationException.
     /// </remarks>
     private static readonly HashSet<string> Known =
         new(ValueFlags.Concat(Switches), StringComparer.Ordinal);
@@ -78,17 +61,14 @@ public sealed class Flags
                     $"unknown flag \"{name}\". Known: {string.Join(", ", Known.Order(StringComparer.Ordinal))}");
             }
 
-            // GOTCHA: Go's flag package accepts -restart=false, so people type it here
-            // too. This used to store the text and Switch() only tested ContainsKey, so
-            // --restart=false, --restart=0 and --delete-push-group=false all turned the
-            // switch ON, the exact opposite of what was typed, with no output. Rejecting
-            // every =form beats parsing it: there is then one spelling that means on, and
-            // no spelling that quietly means the reverse of what it says.
+            // Go's flag package accepts -restart=false, so people type it here too. Switch()
+            // tests ContainsKey, so an accepted --restart=false would turn the switch on.
+            // Rejecting every = form leaves no spelling that means the reverse of what it says.
             if (eq >= 0 && Switches.Contains(name))
             {
                 throw new ArgumentException(
                     $"{name} is a switch and takes no value (got \"{arg}\"). Write \"{name}\" to turn it on " +
-                    $"and omit it to leave it off. \"{name}=false\" would have turned it ON.");
+                    $"and omit it to leave it off; \"{name}=false\" would have turned it on.");
             }
 
             if (eq >= 0)

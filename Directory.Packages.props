@@ -7,16 +7,13 @@
   <ItemGroup>
     <PackageVersion Include="Temporalio" Version="1.18.0" />
 
-    <!-- Starter ONLY. See src/Repro.Starter/Telemetry/PushMetrics.cs for why these
-         are deliberately not referenced by Repro.Core: PrometheusOptions and
-         CustomMetricMeter are mutually exclusive and throw at runtime, so keeping
-         the bridge unreachable from the worker makes that mistake a compile error
-         in the project where it is made rather than a startup crash. -->
+    <!-- Starter only. PrometheusOptions and CustomMetricMeter are mutually exclusive
+         and throw at runtime, so keeping this bridge unreachable from Repro.Core turns
+         that mistake into a compile error. See src/Repro.Starter/Telemetry/PushMetrics.cs. -->
     <PackageVersion Include="Temporalio.Extensions.DiagnosticSource" Version="1.18.0" />
-    <!-- prometheus-net 8.2.1 (2024-01-03) is the newest release and the project has
-         been dormant since. It has no net10.0 TFM; a net10 app resolves the net7.0
-         asset, which compiles MeterAdapter (it is behind NET6_0_OR_GREATER). Works,
-         but expect no upstream fixes. -->
+    <!-- prometheus-net 8.2.1 (2024-01-03) is the newest release and the project has been
+         dormant since. It has no net10.0 TFM; a net10 app resolves the net7.0 asset, which
+         compiles MeterAdapter (behind NET6_0_OR_GREATER). Expect no upstream fixes. -->
     <PackageVersion Include="prometheus-net" Version="8.2.1" />
 
     <PackageVersion Include="YamlDotNet" Version="18.1.0" />

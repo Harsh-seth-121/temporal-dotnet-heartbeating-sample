@@ -4,15 +4,11 @@
 #
 #   ./scripts/demo-down.sh [--keep-stack] [--volumes] [--force]
 #
-# `docker compose down` on its own is NOT a teardown for this repo: the worker, the
-# loadgen and the starter run on the host, and compose has never heard of them. Left
-# behind, they hold :8077 and :8078 and the next demo-up.sh fails preflight.
-#
-# STANDING RULE: this script signals only what demo-up.sh started (pid file plus an
-# identity check) or what is currently listening on 8077 and 8078 and looks like one of
-# our binaries. Anything else it finds, it reports and leaves alone.
-#
-# `#!/bin/bash` is pinned. See scripts/demo-lib.sh for why, and for the bash 3.2 rules.
+# `docker compose down` alone is not a teardown here: the worker, loadgen and starter run
+# on the host, so left behind they hold :8077 and :8078 and the next demo-up.sh fails
+# preflight. Standing rule: this signals only what demo-up.sh started (pid file plus
+# identity check) or what holds 8077/8078 and looks like ours. Everything else it reports.
+# `#!/bin/bash` is pinned and `set -eu` runs without pipefail; see scripts/demo-lib.sh.
 set -eu
 
 REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd -P)
@@ -51,8 +47,7 @@ while [ "$#" -gt 0 ]; do
         --volumes)    WIPE_VOLUMES=1 ;;
         --force)      FORCE=1 ;;
         -h|--help)    usage; exit 0 ;;
-        # No -v short form: -v conventionally means verbose, and this one is
-        # destructive.
+        # No -v short form: -v conventionally means verbose, and this is destructive.
         *)            usage >&2; demo_die 2 "unknown flag \"$1\"" ;;
     esac
     shift
@@ -70,8 +65,7 @@ go_seconds() {
     local d="$1" mins=0 secs=0
     case "$d" in
         ''|*[!0-9ms]*) printf ''; return 0 ;;
-        # "500ms" would otherwise take the minutes branch below and come out as 500m.
-        # Sub-second grace is meaningless anyway, so the caller's 30s fallback wins.
+        # "500ms" would take the minutes branch below and come out as 500m.
         *ms*) printf ''; return 0 ;;
     esac
     case "$d" in
@@ -92,9 +86,8 @@ config_value() {
         | tr -d '"' || true
 }
 
-# The drain budget is derived, not guessed. docs/GOTCHAS.md has the measured line:
-# "will wait 00:00:30 before cancelling 1 activity instance(s)", and the worker holds
-# :8077 for that whole window PLUS however long the activity takes to unwind.
+# Derived, not guessed: the worker holds :8077 for the whole grace window plus however
+# long the activity then takes to unwind. See docs/GOTCHAS.md.
 GRACE=$(go_seconds "$(config_value gracefulShutdownTimeout)")
 GRACE="${GRACE:-30}"
 DRAIN_TIMEOUT="${DEMO_DRAIN_TIMEOUT:-$((GRACE + 15))}"
@@ -104,12 +97,8 @@ if grep -qE '^[[:space:]]*ignoreCancellation:[[:space:]]*true' "$CONFIG" 2>/dev/
     IGNORE_CANCEL=1
 fi
 
-# ---------------------------------------------------------------------------
-# 1. Report
-# ---------------------------------------------------------------------------
-#
-# down never acts silently. Everything it is about to signal, and everything it
-# decided not to, gets printed first.
+# 1. Report. down never acts silently: everything it is about to signal, and
+# everything it decided not to, is printed first.
 
 demo_phase 1 $PHASES "state"
 
@@ -148,19 +137,10 @@ if [ -n "$(printf '%s' "$STRAY_STARTERS" | tr -d ' ')" ] && [ -z "$STARTER_PID" 
     demo_note "starter pid(s) $STRAY_STARTERS are running but were not started by demo-up.sh, so they are left alone."
 fi
 
-# ---------------------------------------------------------------------------
-# 2. Starter, with SIGINT
-# ---------------------------------------------------------------------------
-#
-# SIGINT, not SIGTERM, and the asymmetry is real: src/Repro.Starter/Program.cs
-# registers only Console.CancelKeyPress. SIGTERM takes .NET's default path, abandons
-# `await using var push`, LOSES the final Pushgateway push and leaves the workflow
-# running. Console.CancelKeyPress is signal-driven rather than tty-driven, so
-# `kill -INT` on a detached process fires it.
-#
-# The starter goes first because it is waiting on a workflow whose activity runs on
-# the worker. Stop the worker first and that cancellation can never complete, so the
-# starter hangs for its whole budget.
+# 2. Starter, with SIGINT. src/Repro.Starter/Program.cs registers only
+# Console.CancelKeyPress, which is signal-driven rather than tty-driven, so `kill -INT` on
+# a detached process fires it; SIGTERM would lose the final Pushgateway push. The starter
+# goes first because its cancellation cannot complete once the worker is gone.
 
 demo_phase 2 $PHASES "starter"
 
@@ -180,13 +160,9 @@ else
     demo_note "a cancelled starter exits 1, because the workflow ends in WorkflowFailedException. That is the expected result here, not a failure."
 fi
 
-# ---------------------------------------------------------------------------
-# 3. Loadgen and worker
-# ---------------------------------------------------------------------------
-#
-# SIGTERM to BOTH, loadgen first within the same instant because it is the only source
-# of new workflows, then ONE shared wait. They poll the same task queue and their
-# grace windows overlap, so waiting in parallel costs one drain, not two.
+# 3. Loadgen and worker. SIGTERM to both, loadgen first because it is the only source of
+# new workflows, then one shared wait: their grace windows overlap, so waiting in parallel
+# costs one drain, not two.
 
 demo_phase 3 $PHASES "loadgen and worker"
 
@@ -221,13 +197,8 @@ else
     fi
 fi
 
-# ---------------------------------------------------------------------------
-# 4. Ports
-# ---------------------------------------------------------------------------
-#
-# A freed port is the real success criterion. A held one is the
-# `Address already in use (os error 48)` that breaks the next up, arriving from the
-# direction nobody is watching.
+# 4. Ports. A freed port is the real success criterion: a held one is the
+# `Address already in use (os error 48)` that breaks the next up.
 
 demo_phase 4 $PHASES "ports"
 
@@ -242,8 +213,8 @@ else
         [ -n "$holders" ] || continue
         for pid in $holders; do
             cmd=$(demo_describe_pid "$pid")
-            # Ours, or the `dotnet run` child docs/GOTCHAS.md warns about, whose parent
-            # we never had a pid for. Both are ours to clean up. Nothing else is.
+            # Ours, or the `dotnet run` child docs/GOTCHAS.md warns about, whose
+            # parent we never had a pid for. Nothing else is ours to clean up.
             if printf '%s' "$cmd" | grep -qE "bin/Debug/net10\.0/(worker|loadgen)|Repro\.(Worker|LoadGen)"; then
                 demo_warn ":$port still held by pid $pid; SIGKILL"
                 printf '    %s\n' "$cmd"
@@ -262,15 +233,12 @@ else
     fi
 fi
 
-# ---------------------------------------------------------------------------
 # 5. Containers
-# ---------------------------------------------------------------------------
 
 demo_phase 5 $PHASES "containers"
 
 if ! demo_docker_up; then
-    # Warn, do not fail. The host processes were the part this script could still fix,
-    # and they are fixed. The containers are already in the desired state.
+    # Warn, do not fail: the host processes are fixed and the containers are already down.
     demo_warn "the docker daemon is not reachable, so the container side is already down."
 elif [ "$KEEP_STACK" -eq 1 ]; then
     demo_info "  --keep-stack: all eight containers left running"
@@ -293,13 +261,8 @@ else
     demo_info "  volumes kept: temporal-pgdata, prometheus-data, grafana-data"
 fi
 
-# ---------------------------------------------------------------------------
-# 6. Cleanup
-# ---------------------------------------------------------------------------
-#
-# Pid files go only for processes confirmed gone. Logs are NEVER deleted here: up
-# truncates them at launch, so the session you just stopped stays readable until the
-# next one and nothing grows unbounded.
+# 6. Cleanup. Pid files go only for processes confirmed gone. Logs are never deleted here:
+# up truncates them at launch, so the session you just stopped stays readable.
 
 demo_phase 6 $PHASES "cleanup"
 

@@ -6,25 +6,19 @@ using Temporalio.Workflows;
 
 namespace Repro.Core.Workflows;
 
-/// <summary>
-/// The message-passing case: no activities at all. It starts, waits, and ends one of
-/// three ways -- a Stop signal, its own MaxDurationMs, or a real cancellation request
-/// from a client.
-/// </summary>
+/// <summary>The message-passing case: no activities. It ends on a Stop signal, on its own
+/// MaxDurationMs, or on a client cancellation request.</summary>
 /// <remarks>
-/// WHY THERE IS NO "cancel myself" PATH. A workflow cannot put itself into CANCELED
-/// status. The server only records that status when a cancellation REQUEST exists;
-/// throwing CanceledFailureException unprompted records Failed, and signalling yourself
-/// is refused by the server outright. So the Stop signal ends the run as Completed with
-/// EndedBy="stopped", and a genuine Canceled comes from the client calling
-/// handle.CancelAsync() -- which lands here as Workflow.CancellationToken firing inside
-/// WaitConditionAsync. See docs/GOTCHAS.md.
+/// There is no "cancel myself" path: a workflow cannot put itself into CANCELED, because the
+/// server records that status only when a cancellation request exists. So Stop ends the run
+/// Completed with EndedBy="stopped", and a real Canceled comes from a client's
+/// handle.CancelAsync(). See docs/GOTCHAS.md and docs/WORKFLOWS.md.
 /// </remarks>
 [Workflow]
 public class SimpleNoActivity
 {
-    // No initializers. CA1805 ("do not initialize unnecessarily") is an ERROR under this
-    // repo's TreatWarningsAsErrors, so `= false` / `= 0` will not compile.
+    // No initializers. CA1805 is an error under this repo's TreatWarningsAsErrors, so
+    // `= false` or `= 0` will not compile.
     private int pokes;
     private int adds;
     private int lastSum;
@@ -39,25 +33,22 @@ public class SimpleNoActivity
         bool stopped;
         try
         {
-            // The cancellationToken argument is UNSET on purpose: it defaults to
-            // Workflow.CancellationToken, so a client's CancelAsync() raises out of this
-            // await with no extra plumbing. That default is the entire cancel path.
+            // The cancellationToken argument is unset on purpose: it defaults to
+            // Workflow.CancellationToken, which is the entire cancel path.
             stopped = await Workflow.WaitConditionAsync(
                 () => stopRequested,
                 TimeSpan.FromMilliseconds(input.MaxDurationMs)).ConfigureAwait(true);
         }
         catch (Exception e) when (TemporalException.IsCanceledException(e))
         {
-            // IsCanceledException, not `catch (OperationCanceledException)`: cancellation
-            // reaches workflow code as OperationCanceledException OR CanceledFailureException
-            // depending on where you await, and this helper is the only reliable test.
+            // IsCanceledException, not `catch (OperationCanceledException)`, for the reason
+            // HeartbeatWorkflow.Classify records.
             Workflow.Logger.LogInformation(
                 "cancel requested after {Pokes} pokes and {Adds} adds", pokes, adds);
             Record(meter, MetricNames.Outcomes.Canceled, start);
 
-            // RETHROW. Swallowing this returns a value, and the server then records
-            // Completed for a run the operator explicitly cancelled. The rethrow is the
-            // only thing that produces a real Canceled status.
+            // Rethrow. Swallowing this returns a value and the server records Completed for
+            // a run the operator cancelled. Only the rethrow produces a real Canceled.
             throw;
         }
 
@@ -71,12 +62,8 @@ public class SimpleNoActivity
     }
 
     /// <summary>The simple signal. Wire name: <c>Poke</c> (the SDK trims the Async suffix).</summary>
-    /// <remarks>
-    /// NOT async, and that is deliberate. `async Task PokeAsync(...) => pokes++;` raises
-    /// CS1998 ("async method lacks await"), which TreatWarningsAsErrors turns into a build
-    /// failure. The SDK validates only the RETURN TYPE of a signal handler, so returning
-    /// Task.CompletedTask from a plain method is fully supported. Do not "fix" this back.
-    /// </remarks>
+    /// <remarks>Non-async on purpose: `async Task PokeAsync(...) => pokes++;` raises CS1998, an
+    /// error here. The SDK validates only a signal handler's return type.</remarks>
     [WorkflowSignal]
     public Task PokeAsync(PokeInput input)
     {
@@ -86,10 +73,8 @@ public class SimpleNoActivity
         return Task.CompletedTask;
     }
 
-    /// <summary>
-    /// Ask the run to end. Wire name: <c>Stop</c>. See the class remarks for why this
-    /// produces Completed rather than Canceled.
-    /// </summary>
+    /// <summary>Ask the run to end. Wire name: <c>Stop</c>. Produces Completed, not
+    /// Canceled; see the class remarks.</summary>
     [WorkflowSignal]
     public Task StopAsync()
     {
@@ -98,26 +83,20 @@ public class SimpleNoActivity
     }
 
     /// <summary>The simple handler: read state, change nothing. Wire name: <c>GetStatus</c>.</summary>
-    /// <remarks>
-    /// Queries are NOT trimmed of an Async suffix the way signals and updates are, and a
-    /// query handler may not return a Task. Naming it GetStatusAsync would give you a
-    /// query literally called "GetStatusAsync" on the wire.
-    /// </remarks>
+    /// <remarks>Queries keep an Async suffix where signals and updates lose it, and may not
+    /// return a Task: GetStatusAsync would be the wire name literally.</remarks>
     [WorkflowQuery]
     public SimpleStatus GetStatus() => new(pokes, adds, lastSum, stopRequested);
 
     /// <summary>Rejects an Add whose sum does not fit in an int, before it reaches history.</summary>
-    /// <remarks>
-    /// A validator is the only way to refuse a message without writing anything to the
-    /// event history: throw here and no WorkflowExecutionUpdateAccepted event is ever
-    /// recorded. It must be void, non-static, and take exactly the handler's parameters.
-    /// It must also be side-effect free, which is why nothing is counted here.
-    /// </remarks>
+    /// <remarks>A validator is the only way to refuse a message without writing to history.
+    /// It must be void, non-static, take exactly the handler's parameters, and be side-effect
+    /// free, so nothing is counted here.</remarks>
     [WorkflowUpdateValidator(nameof(AddAsync))]
     public void ValidateAdd(AddInput input)
     {
-        // CAST FIRST. `(long)(input.A + input.B)` adds two ints in an unchecked context,
-        // wraps, and then widens the already-wrong answer -- the guard would never fire.
+        // Cast first. `(long)(input.A + input.B)` adds two ints unchecked, wraps, then widens
+        // the already-wrong answer, so the guard would never fire.
         var sum = (long)input.A + input.B;
         if (sum is > int.MaxValue or < int.MinValue)
         {
@@ -141,8 +120,7 @@ public class SimpleNoActivity
     private static void CountMessage(string kind) =>
         Workflow.MetricMeter.WithTags(new Dictionary<string, object>
         {
-            // namespace / task_queue / workflow_type are already root tags on
-            // Workflow.MetricMeter. Re-adding them would duplicate labels.
+            // Kind only. See HeartbeatWorkflow.Record for the root tags already present.
             [MetricNames.Tags.Kind] = kind,
         }).CreateCounter<long>(MetricNames.SimpleMessage).Add(1);
 
@@ -156,8 +134,7 @@ public class SimpleNoActivity
 
         tagged.CreateCounter<long>(MetricNames.SimpleCompleted).Add(1);
 
-        // CreateHistogram<TimeSpan> maps to Core's HistogramDuration kind, so the value
-        // follows UseSecondsForDuration automatically.
+        // TimeSpan histogram, so the unit follows UseSecondsForDuration.
         tagged.CreateHistogram<TimeSpan>(MetricNames.SimpleLatency)
             .Record(Workflow.UtcNow - start);
     }

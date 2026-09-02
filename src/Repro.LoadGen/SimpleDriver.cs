@@ -9,23 +9,11 @@ using Temporalio.Exceptions;
 namespace Repro.LoadGen;
 
 /// <summary>
-/// The second loadgen loop: starts SimpleNoActivity runs on a JITTERED interval and
-/// throws chaos at each one: a random mix of signals and updates, a weighted random
-/// ending, deliberately overflowing operands, and a message sent after the run has
-/// already closed.
+/// The second loadgen loop: starts SimpleNoActivity runs on a jittered interval and throws chaos
+/// at each one, being a random mix of signals and updates, a weighted random ending,
+/// deliberately overflowing operands, and a message sent after the run has closed. Pacing and
+/// the shared counters come from <see cref="DriverLoop{TRun}"/>.
 /// </summary>
-/// <remarks>
-/// Everything in here is CLIENT code, so Random.Shared and wall-clock are fine, the same
-/// licence HeartbeatActivities has. Nothing in this file may leak into workflow code.
-/// <para>
-/// NO SemaphoreSlim, unlike the heartbeat loop in Program.cs, and deliberately so.
-/// That loop's <c>using var slots</c> is disposed when the method returns while
-/// fire-and-forget run bodies are still calling slots.Release() in a finally. That is a latent
-/// ObjectDisposedException masked only by the process exiting immediately afterwards. An
-/// Interlocked counter has no disposal semantics at all and expresses "skip the tick at
-/// capacity" just as directly.
-/// </para>
-/// </remarks>
 internal sealed class SimpleDriver(
     ITemporalClient client,
     SimpleConfig simple,
@@ -33,13 +21,12 @@ internal sealed class SimpleDriver(
     ILogger log)
 {
     /// <summary>
-    /// Bounds every unary RPC. ExecuteUpdateAsync against a task queue with NO polling
-    /// worker retries indefinitely, so an unbounded call would hold a slot forever and
-    /// park this process past demo-down.sh's drain budget.
+    /// Bounds every unary RPC. ExecuteUpdateAsync against a task queue with no polling worker
+    /// retries indefinitely, so an unbounded call holds a slot past demo-down.sh's drain budget.
     /// </summary>
     private static readonly TimeSpan RpcTimeout = TimeSpan.FromSeconds(10);
 
-    /// <summary>The tick loop, its capacity accounting, and the started/skipped/interrupted/failed counters.</summary>
+    /// <summary>The shared tick loop and its started/skipped/interrupted/failed counters.</summary>
     private readonly DriverLoop<int> loop = new(simple.Rate, simple.Jitter, simple.Concurrency);
 
     private int stopped;
@@ -68,15 +55,14 @@ internal sealed class SimpleDriver(
             simple.MinMessages, simple.MaxMessages, simple.StopWeight, simple.CancelWeight,
             simple.ExpireWeight, GoDuration.ToGoString(simple.MaxDuration));
 
-        // Every run is bounded by the same configured maximum, so the draw is a constant. The
-        // per-run ENDING is drawn inside OneRunAsync instead, because PickEnding's roll only
-        // matters once the run exists and the counters it feeds are this driver's own.
+        // Every run shares the same configured maximum, so the draw is a constant. The ending
+        // is drawn inside OneRunAsync, where the counters it feeds live.
         await loop.RunAsync(
             () => maxDurationMs,
             OneRunAsync,
 
-            // Reached only by a run that failed for a reason this driver has no per-outcome catch
-            // for; the expected endings are counted in OneRunAsync as stopped/canceled/expired.
+            // Reached only by a failure with no per-outcome catch; the expected endings are
+            // counted in OneRunAsync.
             (_, e) => log.LogWarning("simple run failed: {Message}", e.Message),
             LogSummary,
             cancellationToken).ConfigureAwait(false);
@@ -104,9 +90,6 @@ internal sealed class SimpleDriver(
             (SimpleNoActivity wf) => wf.RunAsync(new SimpleInput(maxDurationMs)),
             new WorkflowOptions(id: $"repro-simple-{Guid.NewGuid():N}", taskQueue: taskQueue)
             {
-                // The start call needs the same bound as every other unary RPC below. An
-                // unresponsive frontend here would hold a capacity slot forever and park
-                // the process past demo-down.sh's 45s drain budget.
                 Rpc = rpc,
             }).ConfigureAwait(false);
 
@@ -122,8 +105,8 @@ internal sealed class SimpleDriver(
                 break;
 
             case Ending.Cancel:
-                // The ONLY path that produces a server status of Canceled. The workflow
-                // cannot do this to itself.
+                // The only path that produces a server status of Canceled. See docs/GOTCHAS.md,
+                // "A workflow cannot cancel ITSELF into `CANCELED` status".
                 await handle.CancelAsync(
                     new WorkflowCancelOptions { Rpc = rpc }).ConfigureAwait(false);
                 break;
@@ -134,9 +117,8 @@ internal sealed class SimpleDriver(
 
         try
         {
-            // NO Timeout on this one: GetResultAsync long-polls for the whole run, and an
-            // RpcTimeout here would abort a perfectly healthy wait. The cancellation token
-            // still releases it at shutdown.
+            // No Timeout on this one: GetResultAsync long-polls for the whole run. The
+            // cancellation token still releases it at shutdown.
             var result = await handle.GetResultAsync(
                 rpcOptions: new RpcOptions { CancellationToken = cancellationToken })
                 .ConfigureAwait(false);
@@ -152,21 +134,11 @@ internal sealed class SimpleDriver(
         }
         catch (WorkflowFailedException e) when (e.InnerException is CanceledFailureException)
         {
-            // EXPECTED for Ending.Cancel, and the exact shape matters twice over.
-            //
-            // MEASURED, and the opposite of what you would reach for: a cancelled run
-            // arrives at a CLIENT as WorkflowFailedException{InnerException:
-            // CanceledFailureException}, and TemporalException.IsCanceledException returns
-            // FALSE for it. That helper covers .NET cancellation plus a cancellation nested
-            // in an ACTIVITY or CHILD WORKFLOW failure, which is why it is right inside
-            // SimpleNoActivity and wrong here. Using it at this call site classified every
-            // deliberately cancelled run as a failure, with the counter reading
-            // "0 canceled ... 2 failed" and no other symptom.
-            //
-            // Matching the shape rather than catching broadly also keeps SHUTDOWN out of
-            // this bucket: when our own token cancels GetResultAsync we get an
-            // OperationCanceledException, which is not a cancelled workflow and must not be
-            // counted as one.
+            // Expected for Ending.Cancel. A cancelled run reaches a client as
+            // WorkflowFailedException{InnerException: CanceledFailureException}; see
+            // docs/GOTCHAS.md, "`IsCanceledException` does NOT recognise a cancelled workflow at
+            // the client". Matching the shape also keeps shutdown, an
+            // OperationCanceledException, out of this bucket.
             Interlocked.Increment(ref canceled);
         }
 
@@ -201,9 +173,8 @@ internal sealed class SimpleDriver(
     private async Task SendAddAsync(
         WorkflowHandle<SimpleNoActivity, SimpleResult> handle, RpcOptions rpc, int index)
     {
-        // CHAOS: with probability overflowRate, hand the update a pair whose sum does not
-        // fit in an int. The workflow's validator refuses it, and a refused update writes
-        // NOTHING to the event history.
+        // Chaos: with probability overflowRate, hand the update a pair whose sum does not fit in
+        // an int. The validator refuses it, and a refused update writes nothing to history.
         var overflow = Random.Shared.NextDouble() < simple.OverflowRate;
         var a = overflow ? int.MaxValue : Random.Shared.Next(-1_000_000, 1_000_000);
         var b = overflow ? int.MaxValue : Random.Shared.Next(-1_000_000, 1_000_000);
@@ -216,9 +187,8 @@ internal sealed class SimpleDriver(
 
             Interlocked.Increment(ref updates);
 
-            // A cheap end-to-end assertion on the update round trip: payload converter in,
-            // handler, payload converter out. `(long)a + b` because a plain `a + b` in the
-            // comparison would wrap in exactly the case worth catching.
+            // A cheap assertion on the update round trip. `(long)a + b` because a plain `a + b`
+            // would wrap in the case worth catching.
             if (sum != (long)a + b)
             {
                 log.LogWarning("update {Index} returned {Sum} for {A} + {B}", index, sum, a, b);
@@ -238,9 +208,8 @@ internal sealed class SimpleDriver(
             return;
         }
 
-        // CHAOS: the run is definitely CLOSED here, because GetResultAsync already returned or
-        // threw. Signalling a closed workflow is an RpcException with StatusCode.NotFound,
-        // not a crash.
+        // Chaos: the run is closed here, since GetResultAsync already returned or threw, and
+        // signalling a closed workflow is an RpcException with StatusCode.NotFound.
         try
         {
             await handle.SignalAsync(
@@ -255,11 +224,7 @@ internal sealed class SimpleDriver(
         }
     }
 
-    /// <remarks>
-    /// The template is a concatenation of string LITERALS, which is a compile-time constant.
-    /// CA2254 rejects an interpolated template and CA1727 rejects lowercase placeholders, and
-    /// both are errors in this repo.
-    /// </remarks>
+    /// <summary>One line, every ten starts and once at shutdown.</summary>
     private void LogSummary() =>
         log.LogInformation(
             "simple: {Started} started, {Skipped} skipped at capacity | {Stopped} stopped, " +
