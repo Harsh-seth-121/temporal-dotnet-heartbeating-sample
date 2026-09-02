@@ -10,19 +10,7 @@
 
 Line 1 is the row count. Every row is a 10-digit zero-padded index, a space, then seven
 words from words-1024.txt in brackets. Words may repeat WITHIN a row; no two rows are
-identical and no two share a seven-word tuple, a guarantee rather than a probability. See
-_tuple_bits.
-
-THREE THINGS THAT LOOK LIKE MISTAKES AND ARE NOT
-1. `dependencies = []` is deliberate. This is stdlib-only, and what uv buys is INTERPRETER
-   SELECTION, worth about 25% of total runtime on a box that only has 3.14. uv takes the
-   NEWEST version in the pin, so 3.13 in practice. No uv.lock until there is one to lock.
-2. `<3.14` is a PERFORMANCE bound, not a compatibility one. Apple silicon Mac, 1M rows:
-   3.11 2.39s, 3.13 2.51s, 3.12 2.60s, 3.14 3.15s. A uv-managed 3.14 and a Homebrew 3.14.7
-   agree, so the version regressed rather than one build. Do not widen the range. Run
-   --bench to re-derive these numbers on your own machine.
-3. 3.11 is an enforced FLOOR. gen-samples.sh falls back to PATH `python3` when uv is
-   absent, on macOS /usr/bin/python3 3.9.6; check_interpreter turns that into exit 3.
+identical and no two share a seven-word tuple, a guarantee rather than a probability. S
 """
 
 import argparse
@@ -51,8 +39,7 @@ ROW_RE = re.compile(rb"^[0-9]{10} \[[a-z]+(?: [a-z]+){6}\]$")
 
 # --- the bijection ---------------------------------------------------------
 # WORD_COUNT must be a power of two and BITS_PER_WORD its log2. 1024**7 == 2**70, so a
-# bijection on 70 bits IS a bijection on the space of seven-word tuples. A non-power-of-two
-# list silently voids that, which is why the loader treats a wrong-length list as fatal.
+# bijection on 70 bits IS a bijection on the space of seven-word tuples.
 WORD_COUNT = 1024
 BITS_PER_WORD = 10
 WORD_MASK = WORD_COUNT - 1
@@ -78,11 +65,10 @@ BENCH_ROWS = 1000000
 # DEFAULT_SEED, KNOWN_TARGET)))). Indices, not words, so a custom --words list cannot fail
 # it; what it pins is the arithmetic. Change this constant and every sha256 in MANIFEST.txt
 # and the 1.15 GB on disk describe something else, so regenerate rather than re-record.
-KNOWN_TARGET = 200000000
+KNOWN_TARGET = 200_000_000
 KNOWN_ROW1_INDICES = (159, 181, 495, 262, 518, 393, 413)
 # Enough rows to cross the 10/100/1000 odometer boundaries inside generate_body, which
-# is where an inlined hot loop is most likely to disagree with the reference. Costs
-# about 5 ms, so --selftest pays nothing for it.
+# is where an inlined hot loop is most likely to disagree with the reference.
 REFERENCE_ROWS = 2000
 
 SCRIPT_DIR = Path(__file__).absolute().parent
@@ -96,9 +82,9 @@ class Exit(IntEnum):
         member.label = label
         return member
 
-    OK = 0, "ok"
-    USAGE = 2, "usage"
-    NO_INTERPRETER = 3, "no interpreter"
+    OK = 0,
+    USAGE = 2,
+    NO_INTERPRETER = 3,
     BAD_WORDS = 4, "bad word list"
     EXISTS = 5, "output exists without --force"
     VERIFY = 6, "verify failed"
