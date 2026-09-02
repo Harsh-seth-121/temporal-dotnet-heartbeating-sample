@@ -55,16 +55,7 @@ public class HeartbeatWorkflow
             // rejects a zero or missing activity.heartbeatTimeout for that reason.
             HeartbeatTimeout = TimeSpan.FromMilliseconds(a.HeartbeatTimeoutMs),
 
-            RetryPolicy = new RetryPolicy
-            {
-                InitialInterval = TimeSpan.FromMilliseconds(a.RetryInitialIntervalMs),
-
-                // float, not double — Temporalio.Common.RetryPolicy takes a float and
-                // config.yaml's 2.0 is parsed as a double.
-                BackoffCoefficient = (float)a.RetryBackoffCoefficient,
-                MaximumInterval = TimeSpan.FromMilliseconds(a.RetryMaximumIntervalMs),
-                MaximumAttempts = a.RetryMaximumAttempts,
-            },
+            RetryPolicy = a.ToRetryPolicy(),
 
             // Without this the workflow reports cancelled the instant it asks, before
             // the activity has observed anything, and the whole demo is hollow: you

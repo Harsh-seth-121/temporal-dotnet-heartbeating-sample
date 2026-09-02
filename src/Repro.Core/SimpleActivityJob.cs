@@ -87,7 +87,7 @@ public record SimpleActivityOptionsInput(
     int RetryInitialIntervalMs = 1_000,
     double RetryBackoffCoefficient = 2.0,
     int RetryMaximumIntervalMs = 10_000,
-    int RetryMaximumAttempts = 3)
+    int RetryMaximumAttempts = 3) : IRetryInput
 {
     /// <inheritdoc cref="SimpleActivityInput.From"/>
     public static SimpleActivityOptionsInput From(SimpleActivityConfig simpleActivity)

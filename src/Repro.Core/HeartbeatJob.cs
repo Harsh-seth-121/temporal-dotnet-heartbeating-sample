@@ -51,7 +51,7 @@ public record ActivityOptionsInput(
     int RetryInitialIntervalMs = 1_000,
     double RetryBackoffCoefficient = 2.0,
     int RetryMaximumIntervalMs = 10_000,
-    int RetryMaximumAttempts = 5)
+    int RetryMaximumAttempts = 5) : IRetryInput
 {
     /// <summary>Project config.yaml's <c>activity:</c> block onto the wire shape.</summary>
     /// <remarks>

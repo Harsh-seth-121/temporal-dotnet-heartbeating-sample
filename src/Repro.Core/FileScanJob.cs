@@ -134,7 +134,7 @@ public record FileScanOptionsInput(
     int RetryInitialIntervalMs = 1_000,
     double RetryBackoffCoefficient = 2.0,
     int RetryMaximumIntervalMs = 10_000,
-    int RetryMaximumAttempts = 10)
+    int RetryMaximumAttempts = 10) : IRetryInput
 {
     /// <inheritdoc cref="FileScanInput.From"/>
     public static FileScanOptionsInput From(FileScanConfig fileScan)
