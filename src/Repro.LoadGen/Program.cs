@@ -59,27 +59,11 @@ var options = new TemporalWorkerOptions(config.TaskQueue)
     // so a new activity CLASS needs its own. The two classes must not declare an activity
     // of the same name. A duplicate throws at registration, before the worker polls.
     .AddAllActivities(new WeatherActivities(config.SimpleActivity));
-options.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
-if (config.Worker.MaxCachedWorkflows > 0)
-{
-    options.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
-}
-
-options.MaxHeartbeatThrottleInterval = config.Worker.MaxHeartbeatThrottleInterval;
-options.DefaultHeartbeatThrottleInterval = config.Worker.DefaultHeartbeatThrottleInterval;
-
-// All six worker: knobs, same as Repro.Worker. These two were missing, so the :8078
-// worker kept the SDK defaults (100 / 100) whatever config.yaml said and the
-// slot-saturation panels could only ever be driven from the :8077 worker.
-if (config.Worker.MaxConcurrentActivities > 0)
-{
-    options.MaxConcurrentActivities = config.Worker.MaxConcurrentActivities;
-}
-
-if (config.Worker.MaxConcurrentWorkflowTasks > 0)
-{
-    options.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
-}
+// All six worker: knobs, same as Repro.Worker, and shared rather than copied precisely because
+// of what happened here: the two slot knobs were missing from this worker, so :8078 kept the SDK
+// defaults (100 / 100) whatever config.yaml said and the slot-saturation panels could only ever
+// be driven from the :8077 worker. WorkerKnobs is where that scar is recorded.
+WorkerKnobs.Apply(options, config.Worker);
 
 using var shutdown = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
@@ -226,31 +210,10 @@ if (fileScanOn)
         // that line names the SDK default instead of the window this process is using.
         .AddAllActivities(new FileScanActivities(config.Fault, config.Worker));
 
-    // The same knobs Repro.Worker sets on its scan worker, by hand in both places rather than
-    // shared through Repro.Core the way LocalActivityWorkerOptions is -- these two differ in the
-    // client they bind, so there is no single For(config) to call. If a third copy appears,
-    // extract it then, and read LocalActivityWorkerOptions first for what drift costs.
-    //
-    // MaxHeartbeatThrottleInterval is load-bearing rather than tidy: it is the ceiling in
-    // min(0.8 x heartbeatTimeout, this), which IS the heartbeat throttle, which is exactly how
-    // many rows a kill -9 destroys the record of.
-    scanOptions.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
-    scanOptions.MaxHeartbeatThrottleInterval = config.Worker.MaxHeartbeatThrottleInterval;
-    scanOptions.DefaultHeartbeatThrottleInterval = config.Worker.DefaultHeartbeatThrottleInterval;
-    if (config.Worker.MaxCachedWorkflows > 0)
-    {
-        scanOptions.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
-    }
-
-    if (config.Worker.MaxConcurrentActivities > 0)
-    {
-        scanOptions.MaxConcurrentActivities = config.Worker.MaxConcurrentActivities;
-    }
-
-    if (config.Worker.MaxConcurrentWorkflowTasks > 0)
-    {
-        scanOptions.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
-    }
+    // The same knobs Repro.Worker sets on its scan worker, now from one home. This worker binds
+    // its own "loadgen-scan" client for identity, which the knobs never cared about: the client
+    // is a TemporalWorker constructor argument, not an option.
+    WorkerKnobs.Apply(scanOptions, config.Worker);
 
     scanWorker = new TemporalWorker(scanClient, scanOptions);
     scanWorkerTask = scanWorker.ExecuteAsync(shutdown.Token);

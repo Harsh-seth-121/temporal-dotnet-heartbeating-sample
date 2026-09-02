@@ -55,26 +55,10 @@ var options = new TemporalWorkerOptions(config.TaskQueue)
     // of the same name. A duplicate throws at registration, before the worker polls.
     .AddAllActivities(new WeatherActivities(config.SimpleActivity));
 
-// The SDK default is TimeSpan.Zero. Zero grace plus a minute-long heartbeating
-// activity is the hang this repo demonstrates on purpose (fault.ignoreCancellation);
-// leaving it at the default by accident is how you suffer it instead.
-options.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
-if (config.Worker.MaxCachedWorkflows > 0)
-{
-    options.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
-}
-
-options.MaxHeartbeatThrottleInterval = config.Worker.MaxHeartbeatThrottleInterval;
-options.DefaultHeartbeatThrottleInterval = config.Worker.DefaultHeartbeatThrottleInterval;
-if (config.Worker.MaxConcurrentActivities > 0)
-{
-    options.MaxConcurrentActivities = config.Worker.MaxConcurrentActivities;
-}
-
-if (config.Worker.MaxConcurrentWorkflowTasks > 0)
-{
-    options.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
-}
+// All six worker: knobs, including the grace period this repo's ignoreCancellation hang
+// depends on and the heartbeat throttle the file-scan numbers depend on. WorkerKnobs holds
+// them, and the reasons, for all four workers in this repo.
+WorkerKnobs.Apply(options, config.Worker);
 
 using var shutdown = new CancellationTokenSource();
 
@@ -116,34 +100,11 @@ var scanOptions = new TemporalWorkerOptions(config.FileScan.TaskQueue)
     // default instead of the window this process is actually using.
     .AddAllActivities(new FileScanActivities(config.Fault, config.Worker));
 
-// The same knobs as the main worker, set here BY HAND rather than shared through Repro.Core the
-// way LocalActivityWorkerOptions is: that file exists because Repro.Worker and Repro.LoadGen
-// build the same options for the same namespace, and the two copies had already drifted. This
-// pair cannot be pulled out the same way while the two processes' scan workers differ in the
-// CLIENT they bind (this one reuses the process client, the loadgen builds a "loadgen-scan" one
-// for its identity), so if a third copy ever appears, extract it then.
-//
-// MaxHeartbeatThrottleInterval is the one knob that is load-bearing rather than tidy: it is the
-// ceiling in min(0.8 x heartbeatTimeout, this), which IS the heartbeat throttle, which is
-// exactly how many rows a kill -9 destroys the record of. Leave it on the SDK default and every
-// number in this case's docs is wrong.
-scanOptions.GracefulShutdownTimeout = config.Worker.GracefulShutdownTimeout;
-scanOptions.MaxHeartbeatThrottleInterval = config.Worker.MaxHeartbeatThrottleInterval;
-scanOptions.DefaultHeartbeatThrottleInterval = config.Worker.DefaultHeartbeatThrottleInterval;
-if (config.Worker.MaxCachedWorkflows > 0)
-{
-    scanOptions.MaxCachedWorkflows = config.Worker.MaxCachedWorkflows;
-}
-
-if (config.Worker.MaxConcurrentActivities > 0)
-{
-    scanOptions.MaxConcurrentActivities = config.Worker.MaxConcurrentActivities;
-}
-
-if (config.Worker.MaxConcurrentWorkflowTasks > 0)
-{
-    scanOptions.MaxConcurrentWorkflowTasks = config.Worker.MaxConcurrentWorkflowTasks;
-}
+// The same knobs as the main worker, from the same place. The CLIENT still differs between this
+// scan worker and the loadgen's -- this one reuses the process client, the loadgen builds a
+// "loadgen-scan" one for its identity -- but a client is a TemporalWorker constructor argument,
+// not an option, so it never stood in the way of sharing the knobs.
+WorkerKnobs.Apply(scanOptions, config.Worker);
 
 // NOT gated on fileScan.enabled and NOT on the corpus existing. `enabled` and --no-file-scan
 // turn off the loadgen's driver LOOP, not this process's ability to run a scan somebody starts
